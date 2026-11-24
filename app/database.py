@@ -24,6 +24,27 @@ def admin_document(settings):
     }
 
 
+async def _fetch_all_documents(collection, query: dict | None = None, projection: dict | None = None) -> list[dict]:
+    """Read all documents from a collection without a hard 10,000-record truncation cap."""
+    find_fn = getattr(collection, 'find', None)
+    if find_fn is None:
+        return []
+    cursor = find_fn(query or {}, projection or {'_id': 0})
+    to_list_fn = getattr(cursor, 'to_list', None)
+    if to_list_fn is not None:
+        res = to_list_fn(length=None)
+        if asyncio.iscoroutine(res):
+            docs = await res
+            return [d for d in docs if isinstance(d, dict)] if isinstance(docs, list) else []
+    if hasattr(cursor, '__aiter__'):
+        docs = []
+        async for item in cursor:
+            if isinstance(item, dict):
+                docs.append(item)
+        return docs
+    return []
+
+
 async def run_controlled_migration(db, *, dry_run: bool = True) -> dict:
     """
     Controlled, explicit migration from legacy `accounts` into `accounts_v2`.
@@ -43,34 +64,14 @@ async def run_controlled_migration(db, *, dry_run: bool = True) -> dict:
         'conflict_records': [],
     }
 
-    find_fn = getattr(db.accounts, 'find', None)
-    if find_fn is None:
-        return report
-    cursor = find_fn({}, {'_id': 0})
-    to_list_fn = getattr(cursor, 'to_list', None)
-    if to_list_fn is None:
-        return report
-    res = to_list_fn(length=10000)
-    if not asyncio.iscoroutine(res):
-        return report
-    legacy_docs = await res
-    if not isinstance(legacy_docs, list):
-        return report
-
+    legacy_docs = await _fetch_all_documents(getattr(db, 'accounts', None), {}, {'_id': 0})
     report['total_legacy'] = len(legacy_docs)
 
     v2_map: dict[str, dict] = {}
-    v2_find = getattr(db.accounts_v2, 'find', None)
-    if v2_find is not None:
-        v2_cur = v2_find({}, {'_id': 0})
-        if hasattr(v2_cur, 'to_list'):
-            v2_res = v2_cur.to_list(length=10000)
-            if asyncio.iscoroutine(v2_res):
-                v2_list = await v2_res
-                if isinstance(v2_list, list):
-                    for item in v2_list:
-                        if isinstance(item, dict) and isinstance(item.get('locket_id'), str):
-                            v2_map[item['locket_id']] = item
+    v2_list = await _fetch_all_documents(getattr(db, 'accounts_v2', None), {}, {'_id': 0})
+    for item in v2_list:
+        if isinstance(item.get('locket_id'), str):
+            v2_map[item['locket_id']] = item
 
     seen_ids: set[str] = set()
     for idx, doc in enumerate(legacy_docs):
@@ -175,6 +176,8 @@ async def lifespan(app: FastAPI):
     try:
         await client.admin.command('ping')
         db = client[settings.mongodb_database]
+        app.state.mongo_client = client
+        app.state.db = db
         app.state.accounts = db.accounts
         app.state.admins = db.admins
         app.state.sessions = db.sessions
@@ -198,6 +201,8 @@ async def lifespan(app: FastAPI):
 
         for col_name, idx_spec, idx_kwargs in [
             ('accounts_v2', 'locket_id', {'unique': True}),
+            ('accounts_v2', 'username', {'sparse': True}),
+            ('accounts_v2', 'firebase_uid', {'sparse': True}),
             ('devices', 'device_id', {'unique': True}),
             ('devices', 'token_hash', {'unique': True}),
             ('entitlements', [('account_id', 1), ('entitlement_key', 1)], {'unique': True}),

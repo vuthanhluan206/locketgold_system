@@ -14,10 +14,17 @@ from .config import get_settings
 from .models import subscriber_response
 from .routers.management import download_profile
 from .security import token_digest
+from .services.entitlement_service import find_canonical_account
+from .services.lab_inspector_service import redact_headers
 
 router = APIRouter(prefix="/proxy", tags=["Locket Proxy"])
 
 UPSTREAM_TARGET = "https://api.locketcamera.com"
+FORBIDDEN_THIRD_PARTY_HOSTS = {
+    "api.revenuecat.com",
+    "buy.itunes.apple.com",
+    "sandbox.itunes.apple.com",
+}
 
 HOP_HEADERS = {
     'connection', 'keep-alive', 'proxy-authenticate', 'proxy-authorization',
@@ -86,7 +93,19 @@ async def download_proxy_profile(request: Request):
 
 @router.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH", "OPTIONS"])
 async def dynamic_reverse_proxy(request: Request, path: str):
-    url = UPSTREAM_TARGET + "/" + quote(path, safe="/:@!$&'()*+,;=-._~")
+    settings = get_settings()
+    if not getattr(settings, 'enable_research_proxy', False):
+        raise HTTPException(
+            403,
+            'Research proxy module is disabled by default in production (set ENABLE_RESEARCH_PROXY=true only in isolated Lab).',
+        )
+    configured_upstream = (getattr(settings, 'research_proxy_upstream', '') or UPSTREAM_TARGET).rstrip('/')
+    from urllib.parse import urlparse
+    parsed_upstream = urlparse(configured_upstream)
+    if (parsed_upstream.hostname or '').lower() in FORBIDDEN_THIRD_PARTY_HOSTS:
+        raise HTTPException(403, 'Proxying third-party payment or receipt verification hosts is strictly prohibited.')
+
+    url = configured_upstream + "/" + quote(path, safe="/:@!$&'()*+,;=-._~")
     query_params = str(request.url.query)
     if query_params:
         url += f"?{query_params}"
@@ -95,7 +114,7 @@ async def dynamic_reverse_proxy(request: Request, path: str):
     for key in list(headers):
         if key in {'host', 'cookie', 'forwarded', 'accept-encoding'} or key.startswith(('x-forwarded-', 'cf-')):
             del headers[key]
-    headers['Host'] = 'api.locketcamera.com'
+    headers['Host'] = parsed_upstream.hostname or 'api.locketcamera.com'
     headers['Accept-Encoding'] = 'identity'
 
     method = request.method
@@ -191,22 +210,9 @@ async def dynamic_reverse_proxy(request: Request, path: str):
                     if accounts_col is None and accounts_v2_col is None:
                         raise HTTPException(503, 'Database unavailable')
                     if candidate_id:
-                        if accounts_col is not None:
-                            account_record = await accounts_col.find_one(
-                                {"locket_id": candidate_id}, {"_id": 0}
-                            )
-                        if accounts_v2_col is not None:
-                            v2_doc = await accounts_v2_col.find_one(
-                                {"locket_id": candidate_id}, {"_id": 0}
-                            )
-                            if isinstance(v2_doc, dict):
-                                if isinstance(account_record, dict):
-                                    merged = {**v2_doc}
-                                    if 'expires_date' in account_record:
-                                        merged['expires_date'] = account_record['expires_date']
-                                    account_record = merged
-                                else:
-                                    account_record = v2_doc
+                        account_record = await find_canonical_account(
+                            request, candidate_id, accounts_col=accounts_col
+                        )
 
                     now = datetime.now(timezone.utc)
                     sub_payload = subscriber_response(candidate_id or "locket_user", account_record, now)

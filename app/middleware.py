@@ -14,6 +14,27 @@ MAX_BODY = 8192
 MAX_PROXY_BODY = 50 * 1024 * 1024
 
 
+def is_trusted_proxy_peer(scope) -> bool:
+    peer = scope['client'][0] if scope.get('client') else ''
+    if not peer:
+        return False
+    try:
+        address = ip_address(peer)
+        return any(address in ip_network(cidr) for cidr in get_settings().trusted_proxy_cidrs)
+    except ValueError:
+        return False
+
+
+def effective_https(scope, headers: Headers) -> bool:
+    if scope.get('scheme') == 'https':
+        return True
+    if is_trusted_proxy_peer(scope):
+        proto = headers.get('x-forwarded-proto', '').split(',')[0].strip().lower()
+        if proto == 'https':
+            return True
+    return False
+
+
 def client_ip(scope) -> str:
     peer = scope['client'][0] if scope.get('client') else 'unknown'
     try:
@@ -81,9 +102,10 @@ class SecurityMiddleware:
         nonce = secrets.token_urlsafe(24)
         scope.setdefault('state', {})['csp_nonce'] = nonce
         headers = Headers(scope=scope)
-        https = scope['scheme'] == 'https'
+        https = effective_https(scope, headers)
         path = scope.get('path', '')
         is_proxy = path == '/proxy' or path.startswith('/proxy/')
+        is_health_probe = path in {'/api/health', '/api/ready'}
 
         async def secured_send(message):
             if message['type'] == 'http.response.start':
@@ -97,7 +119,9 @@ class SecurityMiddleware:
             )
             await response(scope, receive, secured_send)
 
-        if self.settings.require_https and not https:
+        peer_host = scope['client'][0] if scope.get('client') else ''
+        is_loopback_probe = is_health_probe and peer_host in {'127.0.0.1', '::1', 'localhost'}
+        if self.settings.require_https and not https and not is_loopback_probe:
             return await reject(400, 'HTTPS is required')
         ip = client_ip(scope)
         if not self.limiter.allow((ip, 'all'), 120):

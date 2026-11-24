@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import re
 from ..models import (
     AccountOutput,
     EntitlementStatus,
@@ -6,6 +7,137 @@ from ..models import (
     normalize_expiry,
     subscriber_response,
 )
+
+FIREBASE_UID_RE = re.compile(r'^[A-Za-z0-9]{28}$')
+
+# Trusted server-side verification sources that cannot be forged by raw Admin form input
+SERVER_TRUSTED_UID_SOURCES = {
+    'verified_subscriber_traffic',
+    'firebase_admin_sdk',
+    'cryptographic_id_token',
+}
+
+
+def merge_canonical_and_legacy_account(doc_v2: dict | None, doc_v1: dict | None) -> dict | None:
+    """
+    Canonical Account Merger (Single Source of Truth = `accounts_v2`, with legacy `accounts` fallback).
+    Strict Precedence Rules:
+    1. If only one document exists (`doc_v2` or `doc_v1`), return a copy of that document.
+    2. Status Precedence:
+       - If EITHER `doc_v2` or `doc_v1` is explicitly `'revoked'` (or `revoked_at` is set or `is_active is False`),
+         the merged status is `'revoked'` (fail-closed revocation).
+       - Else if `doc_v2` has `status == 'pending'`, the merged status is `'pending'`.
+    3. Expiry Date Precedence (`accounts_v2` Canonical Authority):
+       - When `doc_v2` exists and has a valid `expires_date`, `doc_v2['expires_date']` is ALWAYS authoritative.
+         An older or different `expires_date` in legacy `doc_v1` MUST NEVER overwrite `doc_v2['expires_date']`.
+       - Legacy `doc_v1['expires_date']` is used ONLY as a fallback when `doc_v2` has no valid `expires_date`.
+    """
+    if doc_v2 is None and doc_v1 is None:
+        return None
+    if doc_v2 is not None and doc_v1 is None:
+        return doc_v2.copy()
+    if doc_v1 is not None and doc_v2 is None:
+        return doc_v1.copy()
+
+    assert isinstance(doc_v2, dict) and isinstance(doc_v1, dict)
+    # Start with legacy fields, then overlay canonical accounts_v2 fields so v2 always wins
+    merged = {**doc_v1, **doc_v2}
+
+    v2_status = str(doc_v2.get('status') or '').lower()
+    v1_status = str(doc_v1.get('status') or '').lower()
+    if v2_status == 'revoked' or doc_v2.get('revoked_at') is not None or doc_v2.get('is_active') is False:
+        merged['status'] = 'revoked'
+        merged['revoked_at'] = doc_v2.get('revoked_at')
+        merged['revoke_reason'] = doc_v2.get('revoke_reason')
+    elif v1_status == 'revoked' or doc_v1.get('revoked_at') is not None or doc_v1.get('is_active') is False:
+        merged['status'] = 'revoked'
+        merged['revoked_at'] = doc_v1.get('revoked_at')
+        merged['revoke_reason'] = doc_v1.get('revoke_reason')
+    elif v2_status == 'pending':
+        merged['status'] = 'pending'
+
+    # Canonical Expiry Precedence: doc_v2['expires_date'] is authoritative whenever valid
+    v2_raw_exp = doc_v2.get('expires_date') if 'expires_date' in doc_v2 else (
+        doc_v2.get('expires_at') or doc_v2.get('gold_expires_at')
+    )
+    v2_expiry = None
+    if v2_raw_exp is not None:
+        try:
+            v2_expiry = normalize_expiry(v2_raw_exp)
+        except (ValueError, TypeError):
+            v2_expiry = None
+
+    if v2_expiry is not None:
+        merged['expires_date'] = v2_expiry
+    elif 'expires_date' in doc_v1 and doc_v1['expires_date'] is not None:
+        merged['expires_date'] = doc_v1['expires_date']
+
+    return merged
+
+
+def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, str, str]:
+    """
+    Inspect a database account record and determine its honest UID & verification state:
+    Returns `(firebase_uid, uid_verified, verification_status, verification_method, verification_source)`.
+    Security Invariant:
+    - Never marks a 28-char string as `verified_uid` based on regex length or admin-submitted metadata.
+    - Requires `_server_uid_proof == True` AND `verification_source in SERVER_TRUSTED_UID_SOURCES`
+      alongside `verification_status == 'verified_uid'` and `verification_method == 'trusted_proof'`.
+    - Otherwise, any 28-char UID string is classified honestly as `unverified_uid` (`uid_verified=False`).
+    """
+    lid = str(record.get('locket_id') or record.get('account_id') or '')
+    explicit_uid = record.get('firebase_uid') or record.get('verified_uid')
+    candidate_uid = None
+    if isinstance(explicit_uid, str) and FIREBASE_UID_RE.fullmatch(explicit_uid):
+        candidate_uid = explicit_uid
+    elif FIREBASE_UID_RE.fullmatch(lid):
+        candidate_uid = lid
+
+    rec_status = record.get('verification_status')
+    rec_method = record.get('verification_method')
+    rec_source = record.get('verification_source')
+    has_server_proof = record.get('_server_uid_proof') is True
+
+    if (
+        candidate_uid is not None
+        and has_server_proof
+        and rec_status == 'verified_uid'
+        and rec_method == 'trusted_proof'
+        and rec_source in SERVER_TRUSTED_UID_SOURCES
+    ):
+        return (
+            candidate_uid,
+            True,
+            'verified_uid',
+            'trusted_proof',
+            str(rec_source),
+        )
+
+    if candidate_uid is not None:
+        return (
+            candidate_uid,
+            False,
+            'unverified_uid',
+            'format_only_uid',
+            'admin_manual_input' if not has_server_proof else str(rec_source or 'db_stored_unverified_uid'),
+        )
+
+    if record.get('username') or rec_status == 'unverified_handle':
+        return (
+            None,
+            False,
+            'unverified_handle',
+            'link_handle_only',
+            str(rec_source or 'db_username_only'),
+        )
+
+    return (
+        None,
+        False,
+        rec_status if rec_status in {'unverified_uid', 'unverified_handle', 'manual_lab_id'} else 'manual_lab_id',
+        rec_method if rec_method in {'format_only_uid', 'link_handle_only', 'admin_manual_override'} else 'admin_manual_override',
+        str(rec_source or 'admin_direct_input'),
+    )
 
 
 def format_account_record(record: dict, now: datetime | None = None) -> dict:
@@ -19,14 +151,17 @@ def format_account_record(record: dict, now: datetime | None = None) -> dict:
         except (ValueError, TypeError):
             expiry = datetime.fromtimestamp(0, tz=timezone.utc)
 
+    fb_uid, _, ver_status, ver_method, ver_source = extract_verified_uid_metadata(record)
     return {
         'locket_id': str(record.get('locket_id') or record.get('account_id') or ''),
         'expires_date': expiry,
         'status': status,
         'username': record.get('username'),
+        'firebase_uid': fb_uid,
         'source_link': record.get('source_link'),
-        'verification_status': record.get('verification_status') or 'manual_lab_id',
-        'verification_method': record.get('verification_method') or 'admin_manual_override',
+        'verification_status': ver_status,
+        'verification_method': ver_method,
+        'verification_source': ver_source,
         'max_devices': int(record.get('max_devices') or 2),
         'revoked_at': record.get('revoked_at'),
         'revoke_reason': record.get('revoke_reason'),
@@ -35,31 +170,41 @@ def format_account_record(record: dict, now: datetime | None = None) -> dict:
     }
 
 
-async def find_canonical_account(request, account_id: str) -> dict | None:
+async def find_canonical_account(request, account_id: str, accounts_col=None) -> dict | None:
     """
-    Look up an account across accounts_v2 and legacy accounts collection.
-    If an account exists in both, accounts_v2 carries the authoritative revocation/status metadata,
-    while legacy accounts is checked to ensure consistency.
+    Look up an account across canonical `accounts_v2` and legacy `accounts` collection
+    by `locket_id`, `username`, or `firebase_uid`.
+    Never swallows PyMongoError — database failures propagate and fail closed with HTTP 503.
     """
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    accounts = getattr(request.app.state, 'accounts', None)
+    accounts = accounts_col if accounts_col is not None else getattr(request.app.state, 'accounts', None)
 
     doc_v2 = None
-    if accounts_v2 is not None:
-        res = await accounts_v2.find_one({'locket_id': account_id}, {'_id': 0})
+    if accounts_v2 is not None and hasattr(accounts_v2, 'find_one'):
+        res = accounts_v2.find_one({'locket_id': account_id}, {'_id': 0})
+        if hasattr(res, '__await__'):
+            res = await res
         if isinstance(res, dict):
             doc_v2 = res
+        else:
+            for field in ('username', 'firebase_uid'):
+                try:
+                    res_alt = accounts_v2.find_one({field: account_id}, {'_id': 0})
+                    if hasattr(res_alt, '__await__'):
+                        res_alt = await res_alt
+                    if isinstance(res_alt, dict):
+                        doc_v2 = res_alt
+                        break
+                except KeyError:
+                    continue
 
     doc_v1 = None
-    if accounts is not None:
-        res = await accounts.find_one({'locket_id': account_id}, {'_id': 0})
+    if accounts is not None and hasattr(accounts, 'find_one'):
+        target_v1_id = doc_v2.get('locket_id', account_id) if isinstance(doc_v2, dict) else account_id
+        res = accounts.find_one({'locket_id': target_v1_id}, {'_id': 0})
+        if hasattr(res, '__await__'):
+            res = await res
         if isinstance(res, dict):
             doc_v1 = res
 
-    if doc_v2 and doc_v1:
-        merged = {**doc_v2}
-        # If legacy test fixture mutated accounts.expires_date directly, reflect it unless revoked
-        if 'expires_date' in doc_v1:
-            merged['expires_date'] = doc_v1['expires_date']
-        return merged
-    return doc_v2 or doc_v1
+    return merge_canonical_and_legacy_account(doc_v2, doc_v1)
