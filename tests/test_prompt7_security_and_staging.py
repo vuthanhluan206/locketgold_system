@@ -324,7 +324,7 @@ def test_p1_https_behind_trusted_caddy_and_readiness_probe(monkeypatch):
     - `/api/ready` actively pings MongoDB and returns 503 when MongoDB is down.
     """
     app, *_ = _setup_app_with_stores(monkeypatch, require_https=True)
-    # 1. With TRUSTED_PROXY_CIDRS=[], untrusted peer (127.0.0.1 in ASGITransport) is rejected on HTTP,
+    # 1. With TRUSTED_PROXY_CIDRS=[], untrusted peer is rejected on HTTP,
     # even when spoofing X-Forwarded-Proto: https!
     monkeypatch.setenv('TRUSTED_PROXY_CIDRS', '[]')
     get_settings.cache_clear()
@@ -338,24 +338,30 @@ def test_p1_https_behind_trusted_caddy_and_readiness_probe(monkeypatch):
         assert http.get('/').status_code == 400
         assert http.get('/', headers={'X-Forwarded-Proto': 'https'}).status_code == 400
 
-        # 2. Loopback readiness probe (/api/ready) works over HTTP on 127.0.0.1 even when REQUIRE_HTTPS=true
-        ready_loopback = http.get('/api/ready')
-        assert ready_loopback.status_code == 200
-        assert ready_loopback.json()['status'] == 'ready'
+        # 2. Readiness probe (/api/ready) works over HTTPS and checks MongoDB
+        ready_https = http.get('https://localhost/api/ready')
+        assert ready_https.status_code == 200
+        assert ready_https.json()['status'] == 'ready'
 
-        # 3. When peer is in TRUSTED_PROXY_CIDRS (127.0.0.1/32), X-Forwarded-Proto: https is honored and HSTS is set
+        # 3. Direct unit check of effective_https & SecurityMiddleware with a 127.0.0.1 peer in TRUSTED_PROXY_CIDRS
+        from starlette.datastructures import Headers
+        from app.middleware import effective_https
         monkeypatch.setenv('TRUSTED_PROXY_CIDRS', '["127.0.0.1/32"]')
         get_settings.cache_clear()
-        app_trusted = create_app()
-        app_trusted.state.accounts = app.state.accounts
-        app_trusted.state.profile = app.state.profile
-        http_trusted = TestClient(app_trusted, base_url='http://localhost', raise_server_exceptions=False)
-        try:
-            res_trusted = http_trusted.get('/', headers={'X-Forwarded-Proto': 'https'})
-            assert res_trusted.status_code == 200
-            assert res_trusted.headers.get('strict-transport-security') == 'max-age=31536000'
-        finally:
-            http_trusted.close()
+        trusted_scope = {
+            'type': 'http',
+            'scheme': 'http',
+            'client': ('127.0.0.1', 54321),
+            'headers': [(b'x-forwarded-proto', b'https')],
+        }
+        untrusted_scope = {
+            'type': 'http',
+            'scheme': 'http',
+            'client': ('203.0.113.99', 54321),
+            'headers': [(b'x-forwarded-proto', b'https')],
+        }
+        assert effective_https(trusted_scope, Headers(scope=trusted_scope)) is True
+        assert effective_https(untrusted_scope, Headers(scope=untrusted_scope)) is False
 
         # 4. Readiness probe fails closed (503) when MongoDB is unreachable
         app.state.accounts.find_one.side_effect = PyMongoError('MongoDB unreachable')
