@@ -2,8 +2,9 @@
 Controlled MongoDB Migration, Backup & Safe Rollback Utility for `locket_manager`.
 Supports:
   --dry-run                Inspect counts, schema validity, and conflicts without writing
-  --backup <file.json>     Export non-destructive JSON snapshot with SHA-256 integrity hash
-  --apply                  Migrate legacy `accounts` into `accounts_v2` (requires --backup or --skip-backup)
+  --backup <file.json>     Export non-destructive JSON snapshot with SHA-256 integrity hash (no 10k truncation)
+  --verify-backup <file>   Verify backup file existence, non-empty size, record counts, and SHA-256 hash on host disk
+  --apply                  Migrate legacy `accounts` into `accounts_v2`
   --rollback <file.json>   Restore `accounts_v2` from a backup snapshot file
   --mode partial|full      Rollback mode: 'partial' (default, non-destructive upsert) or 'full' (exact collection state)
   --confirm-destructive    Required when running `--rollback <file> --mode full` if newer records will be removed
@@ -17,7 +18,7 @@ from pathlib import Path
 from typing import Literal
 from pymongo import AsyncMongoClient
 from app.config import get_settings
-from app.database import run_controlled_migration
+from app.database import _fetch_all_documents, run_controlled_migration
 from app.models import normalize_expiry
 
 
@@ -50,20 +51,56 @@ def verify_snapshot_integrity(snapshot: dict) -> bool:
             raise ValueError(
                 f'Snapshot SHA-256 integrity check failed! Expected {expected_hash}, got {actual_hash}'
             )
+    expected_v1_count = snapshot.get('accounts_count')
+    expected_v2_count = snapshot.get('accounts_v2_count')
+    if expected_v1_count is not None and len(accounts) != expected_v1_count:
+        raise ValueError(
+            f'Snapshot accounts count mismatch! Expected {expected_v1_count}, got {len(accounts)}'
+        )
+    if expected_v2_count is not None and len(accounts_v2) != expected_v2_count:
+        raise ValueError(
+            f'Snapshot accounts_v2 count mismatch! Expected {expected_v2_count}, got {len(accounts_v2)}'
+        )
     return True
 
 
+def verify_backup_file_on_disk(backup_path: str | Path) -> dict:
+    """
+    Verify that a backup snapshot file exists on persistent disk (not lost inside an ephemeral --rm container),
+    is non-empty, valid JSON, and passes SHA-256 + record count integrity checks.
+    """
+    path = Path(backup_path).resolve()
+    if not path.exists() or not path.is_file():
+        raise FileNotFoundError(f'Backup file does not exist on disk: {path}')
+    size_bytes = path.stat().st_size
+    if size_bytes == 0:
+        raise ValueError(f'Backup file is empty (0 bytes): {path}')
+    snapshot = json.loads(path.read_text(encoding='utf-8'))
+    verify_snapshot_integrity(snapshot)
+    return {
+        'path': str(path),
+        'size_bytes': size_bytes,
+        'exported_at': snapshot.get('exported_at'),
+        'snapshot_sha256': snapshot.get('snapshot_sha256'),
+        'accounts_count': len(snapshot.get('accounts', [])),
+        'accounts_v2_count': len(snapshot.get('accounts_v2', [])),
+        'verified': True,
+    }
+
+
 async def export_backup_to_dict(db) -> dict:
-    acc_cur = db.accounts.find({}, {'_id': 0})
-    acc_list = await acc_cur.to_list(length=10000) if hasattr(acc_cur, 'to_list') else []
-    v2_cur = db.accounts_v2.find({}, {'_id': 0})
-    v2_list = await v2_cur.to_list(length=10000) if hasattr(v2_cur, 'to_list') else []
-    clean_v1 = [d.copy() for d in acc_list if isinstance(d, dict)] if isinstance(acc_list, list) else []
-    clean_v2 = [d.copy() for d in v2_list if isinstance(d, dict)] if isinstance(v2_list, list) else []
+    """Export all documents from `accounts` and `accounts_v2` without any 10,000-record truncation cap."""
+    acc_list = await _fetch_all_documents(getattr(db, 'accounts', None), {}, {'_id': 0})
+    v2_list = await _fetch_all_documents(getattr(db, 'accounts_v2', None), {}, {'_id': 0})
+    clean_v1 = [d.copy() for d in acc_list if isinstance(d, dict)]
+    clean_v2 = [d.copy() for d in v2_list if isinstance(d, dict)]
     digest = compute_snapshot_sha256(clean_v1, clean_v2)
     return {
         'exported_at': datetime.now(timezone.utc).isoformat(),
         'schema_version': 2,
+        'scope': 'collection_snapshot_accounts_and_accounts_v2',
+        'accounts_count': len(clean_v1),
+        'accounts_v2_count': len(clean_v2),
         'snapshot_sha256': digest,
         'accounts': clean_v1,
         'accounts_v2': clean_v2,
@@ -83,16 +120,16 @@ async def preview_rollback(
         for rec in records
         if isinstance(rec, dict) and isinstance(rec.get('locket_id'), str) and rec['locket_id']
     }
-    v2_cur = db.accounts_v2.find({}, {'_id': 0})
-    current_v2 = await v2_cur.to_list(length=10000) if hasattr(v2_cur, 'to_list') else []
+    current_v2 = await _fetch_all_documents(getattr(db, 'accounts_v2', None), {}, {'_id': 0})
     current_ids = {
         rec['locket_id']
-        for rec in (current_v2 if isinstance(current_v2, list) else [])
+        for rec in current_v2
         if isinstance(rec, dict) and isinstance(rec.get('locket_id'), str) and rec['locket_id']
     }
     extra_ids = sorted(current_ids - snapshot_ids)
     return {
         'mode': mode,
+        'rollback_scope': 'collection_accounts_v2',
         'snapshot_records_count': len(snapshot_ids),
         'current_records_count': len(current_ids),
         'to_upsert_count': len(snapshot_ids),
@@ -109,13 +146,14 @@ async def restore_rollback_from_dict(
     confirm_destructive: bool = False,
 ) -> dict:
     """
-    Restore `accounts_v2` from a backup snapshot dictionary.
+    Restore `accounts_v2` collection from a backup snapshot dictionary.
+    Note: This performs a collection-level rollback on `accounts_v2` (leaving `admins`, `sessions`,
+    `audit`, and legacy `accounts` untouched), as opposed to a full database-wide mongorestore.
     - `mode='partial'` (default): Non-destructively upserts records present in the snapshot.
       Does NOT delete newer records created after the snapshot.
-    - `mode='full'`: Restores the exact collection state at snapshot time by upserting
+    - `mode='full'`: Restores the exact `accounts_v2` collection state at snapshot time by upserting
       snapshot records AND removing records created after the snapshot. Requires
       `confirm_destructive=True` whenever records exist that would be deleted.
-    Returns a detailed summary dict (and supports integer conversion via `restored_count` key).
     """
     if mode not in {'partial', 'full'}:
         raise ValueError("Invalid rollback mode: must be 'partial' or 'full'")
@@ -149,6 +187,7 @@ async def restore_rollback_from_dict(
 
     return {
         'mode': mode,
+        'rollback_scope': 'collection_accounts_v2',
         'restored_count': restored,
         'deleted_count': deleted,
         'deleted_ids': extra_ids if mode == 'full' else [],
@@ -156,24 +195,22 @@ async def restore_rollback_from_dict(
 
 
 async def verify_post_migration(db) -> dict:
-    """Verify post-migration consistency between `accounts` and `accounts_v2`."""
-    acc_cur = db.accounts.find({}, {'_id': 0})
-    acc_list = await acc_cur.to_list(length=10000) if hasattr(acc_cur, 'to_list') else []
-    v2_cur = db.accounts_v2.find({}, {'_id': 0})
-    v2_list = await v2_cur.to_list(length=10000) if hasattr(v2_cur, 'to_list') else []
+    """Verify post-migration consistency between `accounts` and `accounts_v2` without truncation."""
+    acc_list = await _fetch_all_documents(getattr(db, 'accounts', None), {}, {'_id': 0})
+    v2_list = await _fetch_all_documents(getattr(db, 'accounts_v2', None), {}, {'_id': 0})
     v2_ids = {
         d.get('locket_id')
-        for d in (v2_list if isinstance(v2_list, list) else [])
+        for d in v2_list
         if isinstance(d, dict) and d.get('locket_id')
     }
     missing_in_v2 = []
-    for doc in (acc_list if isinstance(acc_list, list) else []):
+    for doc in acc_list:
         if isinstance(doc, dict) and isinstance(doc.get('locket_id'), str):
             lid = doc['locket_id'].strip()
             if lid and lid not in v2_ids:
                 missing_in_v2.append(lid)
     return {
-        'legacy_count': len(acc_list) if isinstance(acc_list, list) else 0,
+        'legacy_count': len(acc_list),
         'v2_count': len(v2_ids),
         'missing_in_v2': missing_in_v2,
         'verified': len(missing_in_v2) == 0,
@@ -183,10 +220,16 @@ async def verify_post_migration(db) -> dict:
 async def run_migration_cli(
     dry_run: bool = False,
     backup_path: str | None = None,
+    verify_backup_path: str | None = None,
     rollback_path: str | None = None,
     rollback_mode: Literal['partial', 'full'] = 'partial',
     confirm_destructive: bool = False,
 ):
+    if verify_backup_path:
+        info = verify_backup_file_on_disk(verify_backup_path)
+        print(f"Backup verification PASSED: {json.dumps(info)}")
+        return info
+
     settings = get_settings()
     client = AsyncMongoClient(
         settings.mongodb_uri.get_secret_value(),
@@ -202,15 +245,20 @@ async def run_migration_cli(
         print(f"Legacy accounts count: {legacy_count} | accounts_v2 count before: {v2_count_before}")
 
         if backup_path:
+            out_file = Path(backup_path).resolve()
+            out_file.parent.mkdir(parents=True, exist_ok=True)
             snap = await export_backup_to_dict(db)
-            Path(backup_path).write_text(json.dumps(snap, indent=2, default=_json_default), encoding='utf-8')
+            out_file.write_text(json.dumps(snap, indent=2, default=_json_default), encoding='utf-8')
+            verified_disk = verify_backup_file_on_disk(out_file)
             print(
-                f"Backup written to {backup_path} "
-                f"({len(snap['accounts'])} v1, {len(snap['accounts_v2'])} v2, sha256={snap['snapshot_sha256'][:16]}...)."
+                f"Backup written and verified on disk at {verified_disk['path']} "
+                f"({verified_disk['accounts_count']} v1, {verified_disk['accounts_v2_count']} v2, "
+                f"sha256={verified_disk['snapshot_sha256'][:16]}...)."
             )
 
         if rollback_path:
-            snap = json.loads(Path(rollback_path).read_text(encoding='utf-8'))
+            verified_disk = verify_backup_file_on_disk(rollback_path)
+            snap = json.loads(Path(verified_disk['path']).read_text(encoding='utf-8'))
             preview = await preview_rollback(db, snap, mode=rollback_mode)
             print(f"Rollback preview: {json.dumps(preview)}")
             if dry_run:
@@ -246,7 +294,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser(description='Migrate legacy accounts to accounts_v2 with backup & rollback.')
     parser.add_argument('--dry-run', action='store_true', help='Inspect counts and conflicts without writing')
     parser.add_argument('--apply', action='store_true', help='Apply controlled idempotent migration')
-    parser.add_argument('--backup', default=None, help='Path to write JSON backup snapshot before migration')
+    parser.add_argument('--backup', default=None, help='Path on persistent host/mounted volume to write JSON snapshot')
+    parser.add_argument('--verify-backup', default=None, help='Verify an existing backup JSON file on disk')
     parser.add_argument('--rollback', default=None, help='Path to JSON backup snapshot to restore')
     parser.add_argument(
         '--mode',
@@ -260,11 +309,12 @@ if __name__ == '__main__':
         help='Confirm deleting post-snapshot records when running --rollback with --mode full',
     )
     args = parser.parse_args()
-    is_dry_run = args.dry_run or not (args.apply or args.rollback)
+    is_dry_run = args.dry_run or not (args.apply or args.rollback or args.verify_backup)
     asyncio.run(
         run_migration_cli(
             dry_run=is_dry_run,
             backup_path=args.backup,
+            verify_backup_path=args.verify_backup,
             rollback_path=args.rollback,
             rollback_mode=args.mode,
             confirm_destructive=args.confirm_destructive,
