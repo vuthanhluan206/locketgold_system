@@ -1,27 +1,27 @@
 # ĐÁNH GIÁ NGHIỆM THU & MỨC ĐỘ SẴN SÀNG STAGING TRÊN VPS (`STAGING_READINESS.md`)
 
 **Dự án:** Locket Gold Research & Entitlement Lab (`locketgold_system`)
-**Nhánh đánh giá:** `fix/security-staging-readiness`
-**Mục tiêu hạ tầng:** Ubuntu VPS (`103.118.29.159`, ~1 GB RAM, tên miền `locketgold.vuthanhluan.bond`, database `locket_manager`)
+**Nhánh đánh giá:** `fix/security-staging-readiness` (Pull Request #1)
+**Mục tiêu hạ tầng:** Ubuntu VPS (`103.118.29.159`, ~1 GB RAM, tên miền `locketgold.vuthanhluan.bond`, database test `locket_manager_staging` / production `locket_manager`)
 **Ngày đánh giá:** 2026-11-25
 
 ---
 
 ## 1. ĐỐI CHIẾU 11 TIÊU CHÍ NGHIỆM THU BẮT BUỘC (STAGING GATE CRITERIA)
 
-| STT | Tiêu chí nghiệm thu | Trạng thái | Bằng chứng xác minh |
+| STT | Tiêu chí nghiệm thu | Trạng thái | Bằng chứng xác minh thực tế |
 | :---: | :--- | :---: | :--- |
-| 1 | **Không còn lỗi P1 đã phát hiện** | **PASS** | Toàn bộ 4 lỗi P1 (Device Authorization, MongoDB Consistency, HTTPS/Trusted Proxy/Readiness, Research Proxy Security) đã được sửa trực tiếp trong code và có regression tests. |
+| 1 | **Không còn lỗi P1 & Final Blockers đã phát hiện** | **PASS** | Toàn bộ các lỗi P1 và 4 nhóm Blocker A/B/C/D (Secret Scanner, Canonical Expiry Precedence, Chống giả mạo `verified_uid` từ Admin input, HTTPS/Staging & Linux CI) đã được sửa và có regression tests. |
 | 2 | **Device token không thể truy cập sai tài khoản** | **PASS** | `require_subscriber_access()` trong [app/security.py](file:///e:/locketgold/app/security.py) và `lab_echo_inspect()` trong [app/routers/subscribers.py](file:///e:/locketgold/app/routers/subscribers.py) chặn mọi truy cập chéo tài khoản với **HTTP `403 Forbidden`**. |
-| 3 | **Cập nhật MongoDB không thể âm thầm thất bại** | **PASS** | Đã xóa bỏ toàn bộ `except Exception: pass` trên các lệnh ghi `accounts_v2` và `entitlements` trong [app/routers/management.py](file:///e:/locketgold/app/routers/management.py); lỗi DB trả về **HTTP `503`**. |
-| 4 | **Proxy bên thứ ba bị tắt trong production** | **PASS** | `ENABLE_RESEARCH_PROXY=false` là mặc định trong [app/config.py](file:///e:/locketgold/app/config.py) và [.env.example](file:///e:/locketgold/.env.example); mọi gọi tới `/proxy/*` trả về **HTTP `403 Forbidden`**. |
-| 5 | **Docker staging khởi động thành công ngay cả khi chưa bật module Lab tùy chọn** | **PASS** | Trong [compose.staging.yaml](file:///e:/locketgold/compose.staging.yaml), service `lab_https` được đưa vào `profiles: ["lab"]`, giúp `api` khởi động độc lập trên `127.0.0.1:18000` mà không cần thư mục `certs_private` nếu chưa bật Lab. |
-| 6 | **Health và readiness probes phản ánh chính xác trạng thái dịch vụ** | **PASS** | `GET /api/health` báo trạng thái cấu hình và `GET /api/ready` thực hiện lệnh `ping` trực tiếp tới MongoDB (trả HTTP `503` nếu DB ngừng phản hồi). |
-| 7 | **Mobileconfig được kiểm tra** | **PASS** | 12 bài test trong `tests/test_profile.py` + các bài test chế độ `dns_only`, `lab_ca`, `scoped_lab` đều qua kiểm tra `plistlib.loads()` và xác thực chữ ký DER X.509. |
-| 8 | **Backup và rollback có thử nghiệm độc lập & lưu bền vững** | **PASS** | Đã loại bỏ giới hạn 10.000 bản ghi (kiểm thử với 10.500 bản ghi), mount volume `./backups:/app/backups` và bổ sung `--verify-backup` kiểm tra file tồn tại trên đĩa host kèm SHA-256. |
-| 9 | **CI trên GitHub đạt** | **PASS** | Workflow [`.github/workflows/ci.yml`](file:///e:/locketgold/.github/workflows/ci.yml) kiểm tra secret scan, bytecode compile, ruff lint, 95 bài test pytest, Docker Compose config và Docker image build. |
-| 10 | **Không có dữ liệu production hoặc private key trong repository** | **PASS** | Đã kiểm tra toàn bộ `git ls-files`: không có `.env`, không có `*.key`/`*.pem`/`*.cer`, không có dữ liệu người dùng thật. |
-| 11 | **Database `locket_manager` được bảo vệ** | **PASS** | Không tự động chạy migration khi startup; bảo toàn 100% collection `accounts` cũ; bản ghi `revoked` trong `accounts_v2` không bao giờ bị ghi đè. |
+| 3 | **Cập nhật MongoDB không thể âm thầm thất bại & `accounts_v2` có quyền ưu tiên tuyệt đối** | **PASS** | Đã xóa bỏ toàn bộ `except Exception: pass` trên các lệnh ghi bắt buộc; `merge_canonical_and_legacy_account()` trong [app/services/entitlement_service.py](file:///e:/locketgold/app/services/entitlement_service.py) đảm bảo `expires_date` và `status` của `accounts_v2` không bao giờ bị bản ghi legacy ghi đè. |
+| 4 | **Tra cứu tài khoản theo `locketgoldmanager` & Chống giả mạo `verified_uid`** | **PASS** | `GET /api/accounts/lookup` chỉ trả `{"exists": bool}`; `GET /admin/accounts/lookup` tra cứu MongoDB mà không gọi `amlongtruc-source`. `POST /admin/add-account` luôn đặt `_server_uid_proof=False` và phân loại chuỗi 28 ký tự do Admin nhập tay là `unverified_uid`. |
+| 5 | **Proxy bên thứ ba bị tắt trong production** | **PASS** | `ENABLE_RESEARCH_PROXY=false` là mặc định trong [app/config.py](file:///e:/locketgold/app/config.py) và [.env.example](file:///e:/locketgold/.env.example); mọi gọi tới `/proxy/*` trả về **HTTP `403 Forbidden`**. |
+| 6 | **Docker staging khởi động thành công ngay cả khi chưa bật module Lab tùy chọn** | **PASS** | Trong [compose.staging.yaml](file:///e:/locketgold/compose.staging.yaml), service `lab_https` được đưa vào `profiles: ["lab"]`, giúp `api` khởi động độc lập trên `127.0.0.1:18000` mà không xung đột cổng 80/443. |
+| 7 | **Health và readiness probes phản ánh chính xác trạng thái dịch vụ** | **PASS** | `GET /api/health` và `GET /api/ready` (chủ động `ping` MongoDB, trả HTTP `503` nếu DB lỗi) hoạt động qua loopback HTTP ngay cả khi `REQUIRE_HTTPS=true`. |
+| 8 | **Mobileconfig được kiểm tra** | **PASS** | 12 bài test trong `tests/test_profile.py` + các bài test chế độ `dns_only`, `lab_ca`, `scoped_lab` đều qua kiểm tra `plistlib.loads()` và xác thực chữ ký DER X.509. |
+| 9 | **Backup và rollback có thử nghiệm độc lập & lưu bền vững** | **PASS** | Đã loại bỏ giới hạn 10.000 bản ghi (kiểm thử với 10.500 bản ghi), mount volume `./backups:/app/backups` và bổ sung `--verify-backup` kiểm tra file tồn tại trên đĩa host kèm SHA-256. |
+| 10 | **CI trên GitHub Actions đạt 100% (`conclusion=success`)** | **PASS** | Đã xác minh trực tiếp trên GitHub Actions Run https://github.com/vuthanhluan206/locketgold_system/actions/runs/45471428165: cả 2 job (`Python Compile, Lint, Secret Scan & Pytest Suite` và `Docker Build, Compose Config & Staging Smoke Gate`) đều **SUCCESS**. |
+| 11 | **Không có dữ liệu production hoặc private key trong repository & Database `locket_manager` được bảo vệ** | **PASS** | `python -m scripts.check_secrets` đạt 100%; `DEPLOY_STAGING.md` quy định bắt buộc dùng `MONGODB_DATABASE=locket_manager_staging` cho mọi bài kiểm thử có thao tác ghi dữ liệu trên Staging. |
 
 ---
 
@@ -36,6 +36,6 @@
 
 ## 3. KẾT LUẬN CUỐI CÙNG (FINAL VERDICT)
 
-**KẾT LUẬN: `STAGING READY`**
+**KẾT LUẬN: `STAGING READY` (VERIFIED BY GITHUB ACTIONS CI)**
 
-Hệ thống trên nhánh `fix/security-staging-readiness` đã khắc phục triệt để toàn bộ các lỗi bảo mật và tính nhất quán P1, vượt qua 94/94 bài kiểm thử tự động thực thi được (0 failed) và đủ điều kiện an toàn để triển khai kiểm thử Staging trên VPS (`127.0.0.1:18000`) mà không gây bất kỳ ảnh hưởng nào tới container đang chạy trên cổng 80/443 hay dữ liệu hiện có trong database `locket_manager`.
+Toàn bộ các lỗi P1, các vấn đề đồng bộ tra cứu tài khoản và các blocker trên GitHub Actions CI đã được khắc phục hoàn toàn. Cả 2 job trên GitHub Actions (`test-and-verify` với 124/124 bài test runnable PASSED và `docker-staging-gate` với Docker Compose validation + Docker image build) đều đạt trạng thái **`success`**.
