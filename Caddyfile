@@ -10,7 +10,7 @@ locketgold.vuthanhluan.bond {
 	reverse_proxy api:8000 {
 		header_up Host {host}
 		header_up X-Forwarded-Proto {scheme}
-		health_uri /api/health
+		health_uri /api/ready
 		health_interval 30s
 		health_timeout 5s
 	}

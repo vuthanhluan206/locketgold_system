@@ -2,11 +2,15 @@
 # Designed to run safely in parallel on the Ubuntu VPS (103.118.29.159) WHILE the old
 # `locket.gold` Caddy container is still occupying ports 80 and 443.
 #
-# Usage:
+# Usage (Core Staging API + MongoDB Readiness Check — NO optional Lab CA required):
 #   docker compose -p locket_staging -f compose.staging.yaml up -d --build
 #   curl -fsS http://127.0.0.1:18000/api/health
+#   curl -fsS http://127.0.0.1:18000/api/ready
 #
-# Note: Never uses ports 80 or 443, and uses isolated container names (`locket_staging_*`).
+# Usage with optional HTTPS Research Lab listener (after running `python -m scripts.generate_lab_ca`):
+#   docker compose -p locket_staging -f compose.staging.yaml --profile lab up -d
+#
+# Note: Never binds ports 80 or 443, and uses isolated container names (`locket_staging_*`).
 
 services:
   api:
@@ -16,10 +20,12 @@ services:
       - .env
     ports:
       - "127.0.0.1:18000:8000"
+    volumes:
+      - ./backups:/app/backups
     mem_limit: 256m
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/ready', timeout=3)"]
       interval: 15s
       timeout: 5s
       retries: 3
@@ -32,6 +38,8 @@ services:
   lab_https:
     image: caddy:2-alpine
     container_name: locket_staging_lab_https
+    profiles:
+      - lab
     ports:
       - "127.0.0.1:18443:8443"
       - "127.0.0.1:18081:8081"

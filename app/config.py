@@ -49,6 +49,8 @@ class Settings(BaseSettings):
     vercel_project_production_url: str = ''
     vercel_branch_url: str = ''
     require_https: bool = False
+    enable_research_proxy: bool = False
+    research_proxy_upstream: str = 'http://127.0.0.1:8081'
     session_ttl_seconds: int = Field(default=3600, ge=300, le=86400)
     subscriber_api_token: SecretStr | None = None
     turnstile_site_key: str = Field(default='', pattern=r'^[A-Za-z0-9_-]*$', max_length=256)
@@ -144,6 +146,17 @@ class Settings(BaseSettings):
             items = [str(d).strip() for d in value if str(d).strip()]
         else:
             raise ValueError('LAB_SCOPED_DOMAINS must be a list of domain names')
+        forbidden = {
+            'api.revenuecat.com',
+            'revenuecat.com',
+            'buy.itunes.apple.com',
+            'sandbox.itunes.apple.com',
+            'api.locketcamera.com',
+        }
+        for d in items:
+            clean = d.lower()
+            if clean in forbidden or any(clean.endswith('.' + fb) for fb in forbidden):
+                raise ValueError(f"Third-party domain '{d}' is prohibited in LAB_SCOPED_DOMAINS")
         return items
 
     @field_validator('subscriber_api_token')

@@ -15,6 +15,7 @@ __pycache__/
 *.rar
 certs_private/
 certs_public/
+backups/
 cotloicualocketgold.txt
 locket_gold_mitm_server*.js
 SOURCE.md
