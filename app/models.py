@@ -71,9 +71,11 @@ class AccountInput(BaseModel):
     locket_id: AccountId
     expires_date: AwareDatetime
     username: str | None = Field(default=None, max_length=64, pattern=r'^[A-Za-z0-9_.\-]*$')
+    firebase_uid: str | None = Field(default=None, pattern=r'^[A-Za-z0-9]{28}$')
     source_link: str | None = Field(default=None, max_length=256)
     verification_status: VerificationStatus = 'manual_lab_id'
     verification_method: VerificationMethod = 'admin_manual_override'
+    verification_source: str = Field(default='admin_direct_input', max_length=128)
     status: Literal['active', 'pending', 'revoked'] = 'active'
     max_devices: int = Field(default=2, ge=1, le=10)
     notes: str | None = Field(default=None, max_length=256)
@@ -96,14 +98,37 @@ class AccountOutput(BaseModel):
     expires_date: AwareDatetime
     status: EntitlementStatus = 'active'
     username: str | None = None
+    firebase_uid: str | None = None
     source_link: str | None = None
     verification_status: VerificationStatus = 'manual_lab_id'
     verification_method: VerificationMethod = 'admin_manual_override'
+    verification_source: str = 'admin_direct_input'
     max_devices: int = 2
     revoked_at: AwareDatetime | None = None
     revoke_reason: str | None = None
     notes: str | None = None
     updated_at: AwareDatetime | None = None
+
+
+class PublicLookupOutput(BaseModel):
+    exists: bool
+
+
+class AdminAccountLookupOutput(BaseModel):
+    exists: bool
+    normalized_query: str
+    input_kind: Literal['firebase_uid', 'locket_link', 'handle', 'custom_id']
+    username: str | None = None
+    internal_identifier: str | None = None
+    firebase_uid: str | None = None
+    uid_verified: bool = False
+    verification_status: VerificationStatus = 'unverified_handle'
+    verification_method: VerificationMethod = 'link_handle_only'
+    verification_source: str = 'format_inspection_only'
+    entitlement_status: EntitlementStatus | None = None
+    expires_date: AwareDatetime | None = None
+    updated_at: AwareDatetime | None = None
+    message: str
 
 
 class LinkVerifyInput(BaseModel):
@@ -117,6 +142,12 @@ class LinkVerifyOutput(BaseModel):
     extracted_identifier: str | None = None
     extracted_username: str | None = None
     normalized_link: str | None = None
+    exists_in_db: bool = False
+    resolved_identifier: str | None = None
+    resolved_firebase_uid: str | None = None
+    entitlement_status: EntitlementStatus | None = None
+    expires_date: AwareDatetime | None = None
+    updated_at: AwareDatetime | None = None
     uid_verified: bool = False
     verification_status: VerificationStatus = 'unverified_handle'
     verification_method: VerificationMethod = 'link_handle_only'

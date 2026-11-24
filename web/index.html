@@ -857,10 +857,13 @@
           event.preventDefault();
           $('verifyLinkBtn').disabled = true;
           try {
-            const res = await api('/admin/verify-link', { method: 'POST', body: JSON.stringify({ raw_input: $('rawLinkInput').value }) });
-            $('verifyResultMsg').textContent = '[' + res.verification_status.toUpperCase() + '] ' + res.message + (res.extracted_identifier ? ' -> Identifier: ' + res.extracted_identifier : '');
-            if (res.extracted_identifier) {
-              $('accountId').value = res.extracted_identifier;
+            const rawVal = $('rawLinkInput').value.trim();
+            const res = await api('/admin/accounts/lookup?query=' + encodeURIComponent(rawVal));
+            const dbTag = res.exists ? 'FOUND IN MONGODB' : 'NOT IN MONGODB';
+            const uidInfo = res.firebase_uid ? (' | UID: ' + res.firebase_uid + (res.uid_verified ? ' (VERIFIED)' : ' (UNVERIFIED)')) : '';
+            $('verifyResultMsg').textContent = '[' + dbTag + ' · ' + res.verification_status.toUpperCase() + '] ' + res.message + uidInfo;
+            if (res.internal_identifier || res.normalized_query) {
+              $('accountId').value = res.internal_identifier || res.normalized_query;
             }
           } catch (error) {
             $('verifyResultMsg').textContent = error.message;

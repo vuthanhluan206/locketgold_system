@@ -201,6 +201,8 @@ async def lifespan(app: FastAPI):
 
         for col_name, idx_spec, idx_kwargs in [
             ('accounts_v2', 'locket_id', {'unique': True}),
+            ('accounts_v2', 'username', {'sparse': True}),
+            ('accounts_v2', 'firebase_uid', {'sparse': True}),
             ('devices', 'device_id', {'unique': True}),
             ('devices', 'token_hash', {'unique': True}),
             ('entitlements', [('account_id', 1), ('entitlement_key', 1)], {'unique': True}),

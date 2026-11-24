@@ -15,6 +15,7 @@ Lệnh thực thi:
 
 | Hạng mục kiểm thử | Tổng số | PASSED | SKIPPED | FAILED | Trạng thái |
 | :--- | :---: | :---: | :---: | :---: | :---: |
+| `tests/test_account_lookup.py` (**12 kịch bản Account Lookup & UUID Resolution từ `locketgoldmanager`**) | 27 | 27 | 0 | 0 | **PASS** |
 | `tests/test_admin_protection.py` (Turnstile, Rate Limit, Trusted Proxy IP) | 16 | 16 | 0 | 0 | **PASS** |
 | `tests/test_app.py` (Auth, Sessions, CSP, Input Validation, Fail-Closed, HTTPS) | 25 | 25 | 0 | 0 | **PASS** |
 | `tests/test_auth_entrypoint.py` (Turnstile pre-login check) | 1 | 1 | 0 | 0 | **PASS** |
@@ -27,7 +28,7 @@ Lệnh thực thi:
 | `tests/test_prompt6_production_readiness.py` (Legacy env vars, Staging ports, Controlled Migration) | 6 | 6 | 0 | 0 | **PASS** |
 | `tests/test_prompt7_security_and_staging.py` (**P1 Device Auth, P1 DB Consistency, P1 HTTPS/Ready, P1 Proxy Gate, CA CLI, 10.5k Backup**) | 7 | 7 | 0 | 0 | **PASS** |
 | `tests/test_proxy.py` (Research Proxy isolation, header stripping, redirect block) | 10 | 10 | 0 | 0 | **PASS** |
-| **TỔNG CỘNG** | **95** | **94** | **1** | **0** | **94 PASSED / 1 SKIPPED / 0 FAILED** |
+| **TỔNG CỘNG** | **122** | **121** | **1** | **0** | **121 PASSED / 1 SKIPPED / 0 FAILED** |
 
 ---
 

@@ -13,10 +13,12 @@ from ..models import (
     AccountInput,
     AccountOutput,
     ActivateAccountInput,
+    AdminAccountLookupOutput,
     DeviceCreateInput,
     DeviceOutput,
     LinkVerifyInput,
     LinkVerifyOutput,
+    PublicLookupOutput,
     RevokeAccountInput,
     TestResultInput,
     compute_entitlement_status,
@@ -26,11 +28,12 @@ from ..security import require_admin
 from ..config import get_settings
 from ..services.device_service import enroll_device, verify_device_token
 from ..services.entitlement_service import (
+    extract_verified_uid_metadata,
     find_canonical_account,
     format_account_record,
     merge_canonical_and_legacy_account,
 )
-from ..services.identity_service import verify_account_link_or_identifier
+from ..services.identity_service import normalize_lookup_query, verify_account_link_or_identifier
 from ..services.pki_service import (
     generate_lab_leaf_certificate,
     generate_lab_root_ca,
@@ -84,6 +87,36 @@ async def home(request: Request):
 @router.get('/robots.txt', include_in_schema=False)
 async def robots_txt():
     return PlainTextResponse("User-agent: *\nDisallow: /")
+
+
+@router.get('/api/accounts/lookup', response_model=PublicLookupOutput)
+async def lookup_account(
+    request: Request,
+    accounts: Accounts,
+    query: str = Query(min_length=1, max_length=512),
+):
+    """
+    Public account lookup endpoint modeled directly on `locketgoldmanager`.
+    Accepts a Locket username, @username, or Locket URL (locket.cam / locketcamera.com).
+    Returns ONLY `{"exists": true/false}` — never leaks UUID, tokens, expiry, or device details.
+    """
+    try:
+        account_id, _ = normalize_lookup_query(query)
+    except ValueError as exc:
+        raise HTTPException(422, 'Vui lòng nhập username hoặc link Locket hợp lệ.') from exc
+
+    account = await accounts.find_one({'locket_id': account_id}, {'_id': 1})
+    if account is None:
+        accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
+        if accounts_v2 is not None and hasattr(accounts_v2, 'find_one'):
+            for field in ('locket_id', 'username', 'firebase_uid'):
+                res = accounts_v2.find_one({field: account_id}, {'_id': 1})
+                if hasattr(res, '__await__'):
+                    res = await res
+                if isinstance(res, dict):
+                    account = res
+                    break
+    return {'exists': account is not None}
 
 
 @router.get('/api/health')
@@ -236,13 +269,137 @@ async def admin_login_custom(admin_slug: str, request: Request):
 admin_router = APIRouter(prefix='/admin', dependencies=[Depends(require_admin)])
 
 
+@admin_router.get('/accounts/lookup', response_model=AdminAccountLookupOutput)
+async def admin_lookup_account_endpoint(
+    request: Request,
+    accounts: Accounts,
+    admin: Annotated[dict, Depends(require_admin)],
+    query: str = Query(min_length=1, max_length=512),
+):
+    """
+    Authenticated Admin Account & UUID Lookup API.
+    Normalizes username / @username / Locket share link, queries MongoDB (`accounts_v2` & `accounts`),
+    and returns full diagnostic metadata (username, internal_identifier, firebase_uid if verified/present,
+    verification_status, verification_method, verification_source, entitlement_status, updated_at).
+    Never depends on external `amlongtruc-source` APIs and never guesses UUIDs.
+    """
+    try:
+        normalized_id, input_kind = normalize_lookup_query(query)
+    except ValueError as exc:
+        raise HTTPException(422, 'Vui lòng nhập username hoặc link Locket hợp lệ.') from exc
+
+    base_verify = verify_account_link_or_identifier(query)
+    record = await find_canonical_account(request, normalized_id, accounts_col=accounts)
+    now = datetime.now(timezone.utc)
+
+    if record is None:
+        await record_audit(
+            request,
+            admin,
+            'ADMIN_ACCOUNT_LOOKUP',
+            normalized_id,
+            {'exists': False, 'input_kind': input_kind},
+        )
+        return AdminAccountLookupOutput(
+            exists=False,
+            normalized_query=normalized_id,
+            input_kind=input_kind,
+            username=base_verify.extracted_username,
+            internal_identifier=None,
+            firebase_uid=base_verify.extracted_identifier if input_kind == 'firebase_uid' else None,
+            uid_verified=False,
+            verification_status=base_verify.verification_status,
+            verification_method=base_verify.verification_method,
+            verification_source=base_verify.verification_source,
+            entitlement_status=None,
+            expires_date=None,
+            updated_at=None,
+            message=f'Chưa có tài khoản "{normalized_id}" trong MongoDB (locket_manager).',
+        )
+
+    formatted = format_account_record(record, now)
+    fb_uid, uid_ver, ver_status, ver_method, ver_source = extract_verified_uid_metadata(record)
+    internal_id = formatted['locket_id']
+    username = formatted.get('username') or (internal_id if not fb_uid else base_verify.extracted_username)
+
+    if uid_ver and fb_uid:
+        msg = (
+            f'Đã tìm thấy tài khoản trong MongoDB (ID: {internal_id}) kèm Firebase UID đã xác minh '
+            f'({fb_uid}, nguồn: {ver_source}, trạng thái thuê bao: {formatted["status"]}).'
+        )
+    elif fb_uid:
+        msg = (
+            f'Đã tìm thấy tài khoản trong MongoDB (ID: {internal_id}) có định dạng UID 28 ký tự ({fb_uid}) '
+            f'nhưng chưa có bằng chứng xác minh độc lập (trạng thái: {ver_status}, thuê bao: {formatted["status"]}).'
+        )
+    else:
+        msg = (
+            f'Đã tìm thấy tài khoản trong MongoDB theo username/handle "{internal_id}" '
+            f'(chưa có Firebase UID đã xác minh — trạng thái: unverified_handle, thuê bao: {formatted["status"]}).'
+        )
+
+    await record_audit(
+        request,
+        admin,
+        'ADMIN_ACCOUNT_LOOKUP',
+        internal_id,
+        {'exists': True, 'verification_status': ver_status, 'uid_verified': uid_ver},
+    )
+    return AdminAccountLookupOutput(
+        exists=True,
+        normalized_query=normalized_id,
+        input_kind=input_kind,
+        username=username,
+        internal_identifier=internal_id,
+        firebase_uid=fb_uid,
+        uid_verified=uid_ver,
+        verification_status=ver_status,
+        verification_method=ver_method,
+        verification_source=ver_source,
+        entitlement_status=formatted['status'],
+        expires_date=formatted['expires_date'],
+        updated_at=formatted.get('updated_at'),
+        message=msg,
+    )
+
+
 @admin_router.post('/verify-link', response_model=LinkVerifyOutput)
 async def verify_link_endpoint(
     data: LinkVerifyInput,
     request: Request,
+    accounts: Accounts,
     admin: Annotated[dict, Depends(require_admin)],
 ):
     result = verify_account_link_or_identifier(data.raw_input)
+    if result.valid_format and result.extracted_identifier:
+        record = await find_canonical_account(request, result.extracted_identifier, accounts_col=accounts)
+        if record is not None:
+            now = datetime.now(timezone.utc)
+            formatted = format_account_record(record, now)
+            fb_uid, uid_ver, ver_status, ver_method, ver_source = extract_verified_uid_metadata(record)
+            result.exists_in_db = True
+            result.resolved_identifier = formatted['locket_id']
+            result.resolved_firebase_uid = fb_uid
+            result.entitlement_status = formatted['status']
+            result.expires_date = formatted['expires_date']
+            result.updated_at = formatted.get('updated_at')
+            result.uid_verified = uid_ver
+            result.verification_status = ver_status
+            result.verification_method = ver_method
+            result.verification_source = ver_source
+            if uid_ver and fb_uid:
+                result.message = (
+                    f'Đã tìm thấy trong MongoDB: tài khoản "{formatted["locket_id"]}" có Firebase UID đã xác minh '
+                    f'({fb_uid}, nguồn: {ver_source}, trạng thái: {formatted["status"]}).'
+                )
+            else:
+                result.message = (
+                    f'Đã tìm thấy trong MongoDB: tài khoản "{formatted["locket_id"]}" '
+                    f'(trạng thái xác minh: {ver_status}, thuê bao: {formatted["status"]}).'
+                )
+        else:
+            result.message = f'{result.message} (Chưa có bản ghi trong MongoDB locket_manager).'
+
     await record_audit(
         request,
         admin,
@@ -250,6 +407,7 @@ async def verify_link_endpoint(
         result.extracted_identifier or data.raw_input[:32],
         {
             'input_kind': result.input_kind,
+            'exists_in_db': result.exists_in_db,
             'verification_status': result.verification_status,
             'verification_source': result.verification_source,
         },
@@ -283,9 +441,11 @@ async def upsert_account(
         'account_id': data.locket_id,
         'locket_id': data.locket_id,
         'username': data.username,
+        'firebase_uid': data.firebase_uid,
         'source_link': data.source_link,
         'verification_status': data.verification_status,
         'verification_method': data.verification_method,
+        'verification_source': data.verification_source,
         'status': data.status,
         'product_identifier': 'com.locket.gold.yearly',
         'expires_date': data.expires_date,
