@@ -7,6 +7,7 @@ from fastapi.responses import JSONResponse
 from ..database import get_accounts
 from ..models import AccountId, compute_entitlement_status, subscriber_response
 from ..security import require_subscriber_access
+from ..services.entitlement_service import find_canonical_account
 from ..services.lab_inspector_service import redact_headers, redact_payload
 
 router = APIRouter(tags=["Subscribers"])
@@ -28,18 +29,7 @@ async def _resolve_account_and_build_response(
     inspect_source: str = 'v1_subscribers',
 ) -> JSONResponse:
     started = time.perf_counter()
-    account = await accounts.find_one({'locket_id': account_id}, {'_id': 0})
-    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    if accounts_v2 is not None:
-        v2_doc = await accounts_v2.find_one({'locket_id': account_id}, {'_id': 0})
-        if isinstance(v2_doc, dict):
-            if isinstance(account, dict):
-                merged = {**v2_doc}
-                if 'expires_date' in account:
-                    merged['expires_date'] = account['expires_date']
-                account = merged
-            else:
-                account = v2_doc
+    account = await find_canonical_account(request, account_id, accounts_col=accounts)
 
     now = datetime.now(timezone.utc)
     status, _ = compute_entitlement_status(account if isinstance(account, dict) else None, now)
@@ -114,9 +104,15 @@ async def lab_echo_inspect(request: Request):
         except Exception:
             parsed_body = {'raw_length': len(raw_body)}
 
+    device_doc = getattr(request.state, 'device_doc', None)
+    if getattr(request.state, 'caller_kind', None) == 'device_token' and isinstance(device_doc, dict):
+        body_account_id = parsed_body.get('locket_id') if isinstance(parsed_body, dict) else None
+        if body_account_id and body_account_id != device_doc.get('locket_id'):
+            from fastapi import HTTPException
+            raise HTTPException(403, 'Device token is not authorized to inspect another account')
+
     redacted_req_headers = redact_headers(dict(request.headers))
     redacted_req_body = redact_payload(parsed_body)
-    device_doc = getattr(request.state, 'device_doc', None)
 
     resp_payload = {
         'request_id': req_id,

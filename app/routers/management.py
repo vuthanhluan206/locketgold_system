@@ -25,7 +25,11 @@ from ..profile import build_profile, load_validated_root_ca
 from ..security import require_admin
 from ..config import get_settings
 from ..services.device_service import enroll_device, verify_device_token
-from ..services.entitlement_service import format_account_record
+from ..services.entitlement_service import (
+    find_canonical_account,
+    format_account_record,
+    merge_canonical_and_legacy_account,
+)
 from ..services.identity_service import verify_account_link_or_identifier
 from ..services.pki_service import (
     generate_lab_leaf_certificate,
@@ -103,6 +107,36 @@ async def health_check(request: Request):
         'profile_ready': profile_ready,
         'root_ca_loaded': ca_loaded,
         'root_ca_sha256': ca_fp,
+    }
+
+
+@router.get('/api/ready')
+async def readiness_check(request: Request):
+    """Readiness probe that actively verifies MongoDB connectivity before reporting ready."""
+    settings = get_settings()
+    mongo_client = getattr(request.app.state, 'mongo_client', None)
+    accounts = getattr(request.app.state, 'accounts', None)
+    try:
+        if mongo_client is not None and hasattr(mongo_client, 'admin'):
+            res = mongo_client.admin.command('ping')
+            if hasattr(res, '__await__'):
+                await res
+        elif accounts is not None and hasattr(accounts, 'find_one'):
+            res = accounts.find_one({'locket_id': '__readiness_probe__'}, {'_id': 0})
+            if hasattr(res, '__await__'):
+                await res
+        else:
+            raise HTTPException(503, 'Database connection not initialized')
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(503, 'Database readiness probe failed') from exc
+
+    return {
+        'status': 'ready',
+        'database': settings.mongodb_database,
+        'mongodb_connected': True,
+        'profile_ready': bool(getattr(request.app.state, 'profile', None)),
     }
 
 
@@ -208,13 +242,17 @@ async def verify_link_endpoint(
     request: Request,
     admin: Annotated[dict, Depends(require_admin)],
 ):
-    result = verify_account_link_or_identifier(data.raw_input, trusted_proof=data.trusted_proof)
+    result = verify_account_link_or_identifier(data.raw_input)
     await record_audit(
         request,
         admin,
         'IDENTITY_VERIFY',
         result.extracted_identifier or data.raw_input[:32],
-        {'input_kind': result.input_kind, 'verification_status': result.verification_status},
+        {
+            'input_kind': result.input_kind,
+            'verification_status': result.verification_status,
+            'verification_source': result.verification_source,
+        },
     )
     return result
 
@@ -227,14 +265,19 @@ async def upsert_account(
     admin: Annotated[dict, Depends(require_admin)],
 ):
     now = datetime.now(timezone.utc)
-    # 1. Maintain exact legacy document in `accounts` collection for 100% backward compatibility
-    legacy_doc = {'locket_id': data.locket_id, 'expires_date': data.expires_date}
+    # 1. Maintain legacy document in `accounts` collection for backward compatibility (including status)
+    legacy_doc = {
+        'locket_id': data.locket_id,
+        'expires_date': data.expires_date,
+        'status': data.status,
+        'revoked_at': now if data.status == 'revoked' else None,
+    }
     try:
         await accounts.update_one({'locket_id': data.locket_id}, {'$set': legacy_doc}, upsert=True)
     except DuplicateKeyError:
         await accounts.update_one({'locket_id': data.locket_id}, {'$set': legacy_doc})
 
-    # 2. Write canonical v2 record to `accounts_v2` and `entitlements` if available
+    # 2. Write canonical v2 record to `accounts_v2` and `entitlements` (NEVER swallow write failures!)
     v2_doc = {
         'schema_version': 2,
         'account_id': data.locket_id,
@@ -255,40 +298,34 @@ async def upsert_account(
     }
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
-        try:
-            res = accounts_v2.update_one(
-                {'locket_id': data.locket_id},
-                {'$set': v2_doc, '$setOnInsert': {'created_at': now, 'purchase_date': now}},
-                upsert=True,
-            )
-            if hasattr(res, '__await__'):
-                await res
-        except Exception:
-            pass
+        res = accounts_v2.update_one(
+            {'locket_id': data.locket_id},
+            {'$set': v2_doc, '$setOnInsert': {'created_at': now, 'purchase_date': now}},
+            upsert=True,
+        )
+        if hasattr(res, '__await__'):
+            await res
 
     entitlements = getattr(request.app.state, 'entitlements', None)
     if entitlements is not None and hasattr(entitlements, 'update_one'):
-        try:
-            res = entitlements.update_one(
-                {'account_id': data.locket_id, 'entitlement_key': 'Gold'},
-                {
-                    '$set': {
-                        'account_id': data.locket_id,
-                        'entitlement_key': 'Gold',
-                        'product_identifier': 'com.locket.gold.yearly',
-                        'status': data.status,
-                        'expires_date': data.expires_date,
-                        'revoked_at': v2_doc['revoked_at'],
-                        'updated_at': now,
-                    },
-                    '$setOnInsert': {'purchase_date': now},
+        res = entitlements.update_one(
+            {'account_id': data.locket_id, 'entitlement_key': 'Gold'},
+            {
+                '$set': {
+                    'account_id': data.locket_id,
+                    'entitlement_key': 'Gold',
+                    'product_identifier': 'com.locket.gold.yearly',
+                    'status': data.status,
+                    'expires_date': data.expires_date,
+                    'revoked_at': v2_doc['revoked_at'],
+                    'updated_at': now,
                 },
-                upsert=True,
-            )
-            if hasattr(res, '__await__'):
-                await res
-        except Exception:
-            pass
+                '$setOnInsert': {'purchase_date': now},
+            },
+            upsert=True,
+        )
+        if hasattr(res, '__await__'):
+            await res
 
     await record_audit(
         request,
@@ -308,33 +345,41 @@ async def list_accounts(
     limit: int = Query(50, ge=1, le=100),
 ):
     now = datetime.now(timezone.utc)
-    rows = await accounts.find({}, {'_id': 0}).sort('locket_id', 1).skip(skip).limit(limit).to_list(length=limit)
+    v1_rows = await accounts.find({}, {'_id': 0}).sort('locket_id', 1).skip(0).limit(skip + limit).to_list(length=skip + limit)
+    v1_map = {
+        r['locket_id']: r
+        for r in (v1_rows if isinstance(v1_rows, list) else [])
+        if isinstance(r, dict) and isinstance(r.get('locket_id'), str)
+    }
 
-    # Enrich with v2 metadata if present
     v2_map = {}
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    if accounts_v2 is not None and hasattr(accounts_v2, 'find') and rows:
-        try:
-            ids = [r['locket_id'] for r in rows if isinstance(r, dict) and 'locket_id' in r]
-            v2_cursor = accounts_v2.find({'locket_id': {'$in': ids}}, {'_id': 0})
-            if hasattr(v2_cursor, 'to_list'):
-                v2_list = await v2_cursor.to_list(length=len(ids))
+    if accounts_v2 is not None and hasattr(accounts_v2, 'find'):
+        v2_cursor = accounts_v2.find({}, {'_id': 0})
+        if hasattr(v2_cursor, 'sort'):
+            v2_cursor = v2_cursor.sort('locket_id', 1)
+        if hasattr(v2_cursor, 'skip'):
+            v2_cursor = v2_cursor.skip(0)
+        if hasattr(v2_cursor, 'limit'):
+            v2_cursor = v2_cursor.limit(skip + limit)
+        if hasattr(v2_cursor, 'to_list'):
+            v2_res = v2_cursor.to_list(length=skip + limit)
+            if hasattr(v2_res, '__await__'):
+                v2_list = await v2_res
                 if isinstance(v2_list, list):
-                    v2_map = {item['locket_id']: item for item in v2_list if isinstance(item, dict) and 'locket_id' in item}
-        except Exception:
-            v2_map = {}
+                    v2_map = {
+                        item['locket_id']: item
+                        for item in v2_list
+                        if isinstance(item, dict) and isinstance(item.get('locket_id'), str)
+                    }
 
+    all_ids = sorted(set(v1_map.keys()) | set(v2_map.keys()))
+    page_ids = all_ids[skip: skip + limit]
     result = []
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
-        lid = row.get('locket_id')
-        merged = {**v2_map.get(lid, {}), **row}
-        if lid in v2_map and v2_map[lid].get('status') in {'revoked', 'pending'}:
-            merged['status'] = v2_map[lid]['status']
-            merged['revoked_at'] = v2_map[lid].get('revoked_at')
-            merged['revoke_reason'] = v2_map[lid].get('revoke_reason')
-        result.append(format_account_record(merged, now))
+    for lid in page_ids:
+        merged = merge_canonical_and_legacy_account(v2_map.get(lid), v1_map.get(lid))
+        if merged is not None:
+            result.append(format_account_record(merged, now))
     return result
 
 
@@ -346,44 +391,67 @@ async def revoke_account(
     accounts: Accounts,
     admin: Annotated[dict, Depends(require_admin)],
 ):
-    existing = await accounts.find_one({'locket_id': account_id}, {'_id': 0})
-    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    if existing is None and accounts_v2 is not None:
-        existing = await accounts_v2.find_one({'locket_id': account_id}, {'_id': 0})
+    existing = await find_canonical_account(request, account_id, accounts_col=accounts)
     if existing is None:
         raise HTTPException(404, 'Account not found')
 
     now = datetime.now(timezone.utc)
     past_expiry = datetime(1970, 1, 1, 0, 0, 0, tzinfo=timezone.utc)
-    # Also set status='revoked' in legacy accounts and accounts_v2 so both paths fail closed immediately
+    eff_expiry = existing.get('expires_date') or past_expiry
+
+    # Update canonical accounts_v2, legacy accounts, and entitlements (never swallow errors!)
     await accounts.update_one(
         {'locket_id': account_id},
         {'$set': {'status': 'revoked', 'revoked_at': now, 'revoke_reason': data.reason}},
     )
+    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
-        try:
-            res = accounts_v2.update_one(
-                {'locket_id': account_id},
-                {
-                    '$set': {
-                        'status': 'revoked',
-                        'revoked_at': now,
-                        'revoke_reason': data.reason,
-                        'updated_at': now,
-                        'updated_by': admin.get('email', 'superadmin'),
-                    }
-                },
-                upsert=True,
-            )
-            if hasattr(res, '__await__'):
-                await res
-        except Exception:
-            pass
+        res = accounts_v2.update_one(
+            {'locket_id': account_id},
+            {
+                '$set': {
+                    'locket_id': account_id,
+                    'account_id': account_id,
+                    'status': 'revoked',
+                    'expires_date': eff_expiry,
+                    'revoked_at': now,
+                    'revoke_reason': data.reason,
+                    'updated_at': now,
+                    'updated_by': admin.get('email', 'superadmin'),
+                }
+            },
+            upsert=True,
+        )
+        if hasattr(res, '__await__'):
+            await res
+
+    entitlements = getattr(request.app.state, 'entitlements', None)
+    if entitlements is not None and hasattr(entitlements, 'update_one'):
+        res = entitlements.update_one(
+            {'account_id': account_id, 'entitlement_key': 'Gold'},
+            {
+                '$set': {
+                    'account_id': account_id,
+                    'entitlement_key': 'Gold',
+                    'status': 'revoked',
+                    'revoked_at': now,
+                    'updated_at': now,
+                }
+            },
+            upsert=True,
+        )
+        if hasattr(res, '__await__'):
+            await res
 
     await record_audit(request, admin, 'ENTITLEMENT_REVOKE', account_id, {'reason': data.reason})
-    updated = {**existing, 'locket_id': account_id, 'status': 'revoked', 'revoked_at': now, 'revoke_reason': data.reason}
-    if 'expires_date' not in updated:
-        updated['expires_date'] = past_expiry
+    updated = {
+        **existing,
+        'locket_id': account_id,
+        'expires_date': eff_expiry,
+        'status': 'revoked',
+        'revoked_at': now,
+        'revoke_reason': data.reason,
+    }
     return format_account_record(updated, now)
 
 
@@ -395,10 +463,7 @@ async def activate_account(
     accounts: Accounts,
     admin: Annotated[dict, Depends(require_admin)],
 ):
-    existing = await accounts.find_one({'locket_id': account_id}, {'_id': 0})
-    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    if existing is None and accounts_v2 is not None:
-        existing = await accounts_v2.find_one({'locket_id': account_id}, {'_id': 0})
+    existing = await find_canonical_account(request, account_id, accounts_col=accounts)
     if existing is None:
         raise HTTPException(404, 'Account not found')
 
@@ -411,26 +476,45 @@ async def activate_account(
         {'locket_id': account_id},
         {'$set': {'expires_date': new_expiry, 'status': 'active', 'revoked_at': None, 'revoke_reason': None}},
     )
+    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
-        try:
-            res = accounts_v2.update_one(
-                {'locket_id': account_id},
-                {
-                    '$set': {
-                        'status': 'active',
-                        'expires_date': new_expiry,
-                        'revoked_at': None,
-                        'revoke_reason': None,
-                        'updated_at': now,
-                        'updated_by': admin.get('email', 'superadmin'),
-                    }
-                },
-                upsert=True,
-            )
-            if hasattr(res, '__await__'):
-                await res
-        except Exception:
-            pass
+        res = accounts_v2.update_one(
+            {'locket_id': account_id},
+            {
+                '$set': {
+                    'locket_id': account_id,
+                    'account_id': account_id,
+                    'status': 'active',
+                    'expires_date': new_expiry,
+                    'revoked_at': None,
+                    'revoke_reason': None,
+                    'updated_at': now,
+                    'updated_by': admin.get('email', 'superadmin'),
+                }
+            },
+            upsert=True,
+        )
+        if hasattr(res, '__await__'):
+            await res
+
+    entitlements = getattr(request.app.state, 'entitlements', None)
+    if entitlements is not None and hasattr(entitlements, 'update_one'):
+        res = entitlements.update_one(
+            {'account_id': account_id, 'entitlement_key': 'Gold'},
+            {
+                '$set': {
+                    'account_id': account_id,
+                    'entitlement_key': 'Gold',
+                    'status': 'active',
+                    'expires_date': new_expiry,
+                    'revoked_at': None,
+                    'updated_at': now,
+                }
+            },
+            upsert=True,
+        )
+        if hasattr(res, '__await__'):
+            await res
 
     await record_audit(request, admin, 'ENTITLEMENT_ACTIVATE', account_id, {'expires_date': new_expiry.isoformat()})
     updated = {**existing, 'locket_id': account_id, 'expires_date': new_expiry, 'status': 'active', 'revoked_at': None}
@@ -444,16 +528,23 @@ async def delete_account(
     accounts: Accounts,
     admin: Annotated[dict, Depends(require_admin)],
 ):
-    result = await accounts.delete_one({'locket_id': account_id})
+    result_v1 = await accounts.delete_one({'locket_id': account_id})
+    deleted_v1 = getattr(result_v1, 'deleted_count', 0) or 0
+    deleted_v2 = 0
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     if accounts_v2 is not None and hasattr(accounts_v2, 'delete_one'):
-        try:
-            res = accounts_v2.delete_one({'locket_id': account_id})
-            if hasattr(res, '__await__'):
-                await res
-        except Exception:
-            pass
-    if not result.deleted_count:
+        res_v2 = accounts_v2.delete_one({'locket_id': account_id})
+        if hasattr(res_v2, '__await__'):
+            res_v2 = await res_v2
+        deleted_v2 = getattr(res_v2, 'deleted_count', 0) or 0
+
+    entitlements = getattr(request.app.state, 'entitlements', None)
+    if entitlements is not None and hasattr(entitlements, 'delete_many'):
+        res_ent = entitlements.delete_many({'account_id': account_id})
+        if hasattr(res_ent, '__await__'):
+            await res_ent
+
+    if not deleted_v1 and not deleted_v2:
         raise HTTPException(404, 'Account not found')
     await record_audit(request, admin, 'ACCOUNT_DELETE', account_id)
     return Response(status_code=204)
