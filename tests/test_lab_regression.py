@@ -103,11 +103,12 @@ def test_identity_service_zero_guessing_policy():
     assert res_uid.verification_status == 'unverified_uid'
     assert res_uid.verification_method == 'format_only_uid'
 
-    # 2b. Direct 28-character Firebase UID WITH explicit trusted proof -> verified_uid
-    res_uid_trusted = verify_account_link_or_identifier(uid, trusted_proof=True)
+    # 2b. Direct 28-character Firebase UID WITH explicit server-side verified_provider_source -> verified_uid
+    res_uid_trusted = verify_account_link_or_identifier(uid, verified_provider_source='firebase_admin_sdk')
     assert res_uid_trusted.uid_verified is True
     assert res_uid_trusted.verification_status == 'verified_uid'
     assert res_uid_trusted.verification_method == 'trusted_proof'
+    assert res_uid_trusted.verification_source == 'firebase_admin_sdk'
 
     # 3. Link from non-Locket domain -> rejected
     res_bad = verify_account_link_or_identifier('https://evil.example.com/luongcamnhung')

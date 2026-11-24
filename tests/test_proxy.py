@@ -22,6 +22,7 @@ def proxy(monkeypatch):
         'MONGODB_URI': 'mongodb://localhost', 'ALLOWED_HOSTS': '["testserver"]',
         'REQUIRE_HTTPS': 'false', 'NEXTDNS_ID': 'abc123', 'ROOT_CA_PATH': '', 'ROOT_CA_PEM': '',
         'ADMIN_PATH': '/secret-test', 'TURNSTILE_SITE_KEY': '', 'TURNSTILE_SECRET_KEY': '',
+        'ENABLE_RESEARCH_PROXY': 'true', 'RESEARCH_PROXY_UPSTREAM': 'https://mock.lab.vuthanhluan.bond',
     }.items():
         monkeypatch.setenv(name, value)
     get_settings.cache_clear()
@@ -112,7 +113,7 @@ def test_proxy_uses_admin_account_expiry_and_preserves_other_entitlements(proxy)
     assert 'Other' in subscriber['entitlements']
     app.state.accounts.find_one.assert_awaited_once_with({'locket_id': 'alice'}, {'_id': 0})
     headers = transport.call_args.args[2]
-    assert headers['Host'] == 'api.locketcamera.com'
+    assert headers['Host'] == 'mock.lab.vuthanhluan.bond'
     assert 'cookie' not in headers and 'x-forwarded-host' not in headers
     app.state.accounts.find_one.return_value['expires_date'] = expiry - timedelta(days=20)
     assert 'Gold' not in http.get('/proxy/v1/subscribers/alice', headers={'Authorization': 'Bearer upstream-token'}).json()['subscriber']['entitlements']
