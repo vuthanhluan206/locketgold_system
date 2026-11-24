@@ -1,11 +1,15 @@
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+import asyncio
 import hashlib
 import logging
+import re
 from cryptography.exceptions import InvalidSignature, UnsupportedAlgorithm
 from cryptography import x509
 from fastapi import FastAPI, Request
 from pymongo import AsyncMongoClient
 from .config import get_settings
+from .models import ACCOUNT_ID_REGEX, compute_entitlement_status, normalize_expiry
 from .profile import build_profile
 
 logger = logging.getLogger(__name__)
@@ -13,8 +17,142 @@ logger = logging.getLogger(__name__)
 
 def admin_document(settings):
     password_hash = settings.superadmin_password_hash.get_secret_value()
-    return {'email': settings.superadmin_email, 'password_hash': password_hash,
-            'auth_version': hashlib.sha256(password_hash.encode('ascii')).hexdigest()}
+    return {
+        'email': settings.superadmin_email,
+        'password_hash': password_hash,
+        'auth_version': hashlib.sha256(password_hash.encode('ascii')).hexdigest(),
+    }
+
+
+async def run_controlled_migration(db, *, dry_run: bool = True) -> dict:
+    """
+    Controlled, explicit migration from legacy `accounts` into `accounts_v2`.
+    NEVER runs automatically during FastAPI application startup.
+    Reports detailed counts: inserted, skipped, invalid, conflict, and details list.
+    """
+    now = datetime.now(timezone.utc)
+    report = {
+        'dry_run': dry_run,
+        'timestamp': now.isoformat(),
+        'total_legacy': 0,
+        'inserted': 0,
+        'skipped': 0,
+        'invalid': 0,
+        'conflict': 0,
+        'invalid_records': [],
+        'conflict_records': [],
+    }
+
+    find_fn = getattr(db.accounts, 'find', None)
+    if find_fn is None:
+        return report
+    cursor = find_fn({}, {'_id': 0})
+    to_list_fn = getattr(cursor, 'to_list', None)
+    if to_list_fn is None:
+        return report
+    res = to_list_fn(length=10000)
+    if not asyncio.iscoroutine(res):
+        return report
+    legacy_docs = await res
+    if not isinstance(legacy_docs, list):
+        return report
+
+    report['total_legacy'] = len(legacy_docs)
+
+    v2_map: dict[str, dict] = {}
+    v2_find = getattr(db.accounts_v2, 'find', None)
+    if v2_find is not None:
+        v2_cur = v2_find({}, {'_id': 0})
+        if hasattr(v2_cur, 'to_list'):
+            v2_res = v2_cur.to_list(length=10000)
+            if asyncio.iscoroutine(v2_res):
+                v2_list = await v2_res
+                if isinstance(v2_list, list):
+                    for item in v2_list:
+                        if isinstance(item, dict) and isinstance(item.get('locket_id'), str):
+                            v2_map[item['locket_id']] = item
+
+    seen_ids: set[str] = set()
+    for idx, doc in enumerate(legacy_docs):
+        if not isinstance(doc, dict):
+            report['invalid'] += 1
+            report['invalid_records'].append({'index': idx, 'reason': 'Not a BSON dictionary'})
+            continue
+        lid = doc.get('locket_id') or doc.get('account_id') or doc.get('uid')
+        if not isinstance(lid, str) or not re.fullmatch(ACCOUNT_ID_REGEX, lid):
+            report['invalid'] += 1
+            report['invalid_records'].append({'index': idx, 'locket_id': str(lid), 'reason': 'Missing or invalid locket_id'})
+            continue
+        if lid in seen_ids:
+            report['conflict'] += 1
+            report['conflict_records'].append({'locket_id': lid, 'reason': 'Duplicate locket_id in legacy collection'})
+            continue
+        seen_ids.add(lid)
+
+        raw_exp = doc.get('expires_date') if 'expires_date' in doc else (
+            doc.get('expires_at') or doc.get('gold_expires_at')
+        )
+        try:
+            expiry = normalize_expiry(raw_exp)
+        except Exception:
+            report['invalid'] += 1
+            report['invalid_records'].append({'locket_id': lid, 'reason': 'Missing or unparseable expiry date'})
+            continue
+
+        status, _ = compute_entitlement_status({'locket_id': lid, 'expires_date': expiry, 'status': doc.get('status'), 'is_active': doc.get('is_active')}, now)
+        mapped_status = 'revoked' if status == 'revoked' else ('active' if status == 'active' else 'expired')
+
+        if lid in v2_map:
+            existing_v2 = v2_map[lid]
+            try:
+                v2_exp = normalize_expiry(existing_v2.get('expires_date'))
+            except Exception:
+                v2_exp = None
+            if v2_exp == expiry and existing_v2.get('status') == mapped_status:
+                report['skipped'] += 1
+            else:
+                # Never overwrite newer or diverged v2 data
+                report['conflict'] += 1
+                report['conflict_records'].append({
+                    'locket_id': lid,
+                    'reason': 'Existing accounts_v2 record has different expiry or status; preserved v2 record',
+                })
+            continue
+
+        new_v2_doc = {
+            'schema_version': 2,
+            'account_id': lid,
+            'locket_id': lid,
+            'username': doc.get('username'),
+            'source_link': doc.get('source_link'),
+            'verification_status': doc.get('verification_status', 'manual_lab_id'),
+            'verification_method': doc.get('verification_method', 'admin_manual_override'),
+            'status': mapped_status,
+            'product_identifier': 'com.locket.gold.yearly',
+            'purchase_date': now,
+            'expires_date': expiry,
+            'revoked_at': now if mapped_status == 'revoked' else None,
+            'revoke_reason': 'Migrated revoked state' if mapped_status == 'revoked' else None,
+            'max_devices': int(doc.get('max_devices') or 2),
+            'notes': 'Migrated from legacy accounts collection',
+            'created_at': now,
+            'updated_at': now,
+        }
+        if not dry_run:
+            await db.accounts_v2.update_one(
+                {'locket_id': lid},
+                {'$setOnInsert': new_v2_doc},
+                upsert=True,
+            )
+        report['inserted'] += 1
+
+    return report
+
+
+async def sync_legacy_accounts_to_v2(db) -> int:
+    """Backward-compatible helper for explicit CLI migration calls."""
+    rep = await run_controlled_migration(db, dry_run=False)
+    return rep['inserted']
 
 
 @asynccontextmanager
@@ -26,9 +164,13 @@ async def lifespan(app: FastAPI):
     except (ValueError, OSError, x509.ExtensionNotFound, InvalidSignature, UnsupportedAlgorithm) as exc:
         logger.error('PROFILE_CONFIG_INVALID: %s; profile download disabled', type(exc).__name__)
     client = AsyncMongoClient(
-        settings.mongodb_uri.get_secret_value(), tz_aware=True,
-        serverSelectionTimeoutMS=5000, connectTimeoutMS=5000,
-        socketTimeoutMS=5000, timeoutMS=5000, maxPoolSize=20,
+        settings.mongodb_uri.get_secret_value(),
+        tz_aware=True,
+        serverSelectionTimeoutMS=5000,
+        connectTimeoutMS=5000,
+        socketTimeoutMS=5000,
+        timeoutMS=5000,
+        maxPoolSize=20,
     )
     try:
         await client.admin.command('ping')
@@ -45,9 +187,39 @@ async def lifespan(app: FastAPI):
         await db.login_limits.create_index('expires_at', expireAfterSeconds=0)
         await db.viewers_history.create_index([('token', 1), ('viewed_at', -1)])
 
-        await db.admins.update_one({'_id': 'superadmin'}, {
-            '$setOnInsert': admin_document(settings),
-        }, upsert=True)
+        # New v2 collections for Research Lab
+        app.state.accounts_v2 = getattr(db, 'accounts_v2', None)
+        app.state.devices = getattr(db, 'devices', None)
+        app.state.entitlements = getattr(db, 'entitlements', None)
+        app.state.audit = getattr(db, 'audit', None)
+        app.state.lab_requests = getattr(db, 'lab_requests', None)
+        app.state.test_results = getattr(db, 'test_results', None)
+        app.state.profile_versions = getattr(db, 'profile_versions', None)
+
+        for col_name, idx_spec, idx_kwargs in [
+            ('accounts_v2', 'locket_id', {'unique': True}),
+            ('devices', 'device_id', {'unique': True}),
+            ('devices', 'token_hash', {'unique': True}),
+            ('entitlements', [('account_id', 1), ('entitlement_key', 1)], {'unique': True}),
+            ('audit', [('timestamp', -1)], {}),
+            ('lab_requests', 'timestamp', {'expireAfterSeconds': 604800}),
+        ]:
+            col = getattr(db, col_name, None)
+            if col is not None and hasattr(col, 'create_index'):
+                try:
+                    res = col.create_index(idx_spec, **idx_kwargs)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception:
+                    pass
+
+        await db.admins.update_one(
+            {'_id': 'superadmin'},
+            {'$setOnInsert': admin_document(settings)},
+            upsert=True,
+        )
+        # NOTE: Startup does NOT automatically mutate or migrate `accounts` to `accounts_v2`.
+        # Migration is strictly controlled via `python -m scripts.migrate_db`.
         yield
     finally:
         await client.close()

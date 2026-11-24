@@ -9,6 +9,7 @@ from fastapi import Depends, HTTPException, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from .config import get_settings
 from .middleware import client_ip
+from .services.device_service import verify_device_token
 
 bearer = HTTPBearer(auto_error=False)
 
@@ -21,29 +22,44 @@ async def require_subscriber_access(
     request: Request,
     credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer)],
 ):
-    unauthorized = HTTPException(401, "Invalid or missing subscriber API token", headers={"WWW-Authenticate": "Bearer"})
+    unauthorized = HTTPException(
+        401,
+        "Invalid or missing subscriber API token",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
     if credentials is None:
         raise unauthorized
 
+    raw_cred = credentials.credentials
     settings = get_settings()
     configured = settings.subscriber_api_token
     if configured is not None and secrets.compare_digest(
-        credentials.credentials.encode("utf-8"),
+        raw_cred.encode("utf-8"),
         configured.get_secret_value().encode("ascii"),
     ):
+        request.state.caller_kind = "service_token"
         return
 
-    if re.fullmatch(r"[A-Za-z0-9_-]{64}", credentials.credentials):
+    # Support enrolled Lab Device tokens (lkg_dev_*)
+    if raw_cred.startswith("lkg_dev_"):
+        device_doc = await verify_device_token(request, raw_cred)
+        if device_doc is not None:
+            request.state.caller_kind = "device_token"
+            request.state.device_doc = device_doc
+            return
+
+    if re.fullmatch(r"[A-Za-z0-9_-]{64}", raw_cred):
         sessions = getattr(request.app.state, "sessions", None)
         admins = getattr(request.app.state, "admins", None)
         if sessions is not None and admins is not None:
             session = await sessions.find_one({
-                "_id": token_digest(credentials.credentials),
+                "_id": token_digest(raw_cred),
                 "expires_at": {"$gt": datetime.now(timezone.utc)},
             })
             if session is not None and session.get("admin_id") == "superadmin":
                 admin = await admins.find_one({"_id": session["admin_id"]})
                 if admin is not None and admin.get("auth_version") == session.get("auth_version"):
+                    request.state.caller_kind = "admin_session"
                     return
 
     raise unauthorized

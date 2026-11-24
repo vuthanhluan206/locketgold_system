@@ -1,23 +1,49 @@
 import json
+import os
 import re
 from functools import lru_cache
 from ipaddress import ip_network
-from pydantic import Field, SecretStr, field_validator, model_validator
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from typing import Annotated, Any
+from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
+from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from .passwords import validate_password_hash
 
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore', hide_input_in_errors=True)
-    superadmin_email: str = Field(min_length=3, max_length=254, pattern=r'^[^\s@]+@[^\s@]+\.[^\s@]+$')
-    superadmin_password_hash: SecretStr
-    mongodb_uri: SecretStr
+    superadmin_email: str = Field(
+        min_length=3,
+        max_length=254,
+        pattern=r'^[^\s@]+@[^\s@]+\.[^\s@]+$',
+        validation_alias=AliasChoices('superadmin_email', 'SUPERADMIN_EMAIL', 'admin_email', 'ADMIN_EMAIL'),
+    )
+    superadmin_password_hash: SecretStr = Field(
+        validation_alias=AliasChoices(
+            'superadmin_password_hash',
+            'SUPERADMIN_PASSWORD_HASH',
+            'admin_password_hash',
+            'ADMIN_PASSWORD_HASH',
+        )
+    )
+    mongodb_uri: SecretStr = Field(
+        validation_alias=AliasChoices('mongodb_uri', 'MONGODB_URI', 'mongo_uri', 'MONGO_URI')
+    )
     mongodb_database: str = 'locket_manager'
     nextdns_id: str = Field(default='', pattern=r'^([a-fA-F0-9]{6})?$')
     root_ca_path: str = ''
     root_ca_pem: str = Field(default='', max_length=65536, repr=False)
+    lab_domain: str = Field(default='locketgold.vuthanhluan.bond', max_length=253)
+    lab_scoped_domains: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: [
+            'mock.lab.vuthanhluan.bond',
+            'sub.lab.vuthanhluan.bond',
+            'locketgold.vuthanhluan.bond',
+        ]
+    )
     admin_path: str = Field(default='/admin', pattern=r'^/[A-Za-z0-9_-]{1,64}$')
-    allowed_hosts: list[str] = ['localhost', '127.0.0.1', '[::1]']
+    allowed_hosts: Annotated[list[str], NoDecode] = Field(
+        default_factory=lambda: ['localhost', '127.0.0.1', '[::1]']
+    )
     vercel: str = ''
     vercel_url: str = ''
     vercel_project_production_url: str = ''
@@ -28,7 +54,40 @@ class Settings(BaseSettings):
     turnstile_site_key: str = Field(default='', pattern=r'^[A-Za-z0-9_-]*$', max_length=256)
     turnstile_secret_key: SecretStr = SecretStr('')
     turnstile_hostname: str = ''
-    trusted_proxy_cidrs: list[str] = []
+    trusted_proxy_cidrs: Annotated[list[str], NoDecode] = Field(default_factory=list)
+
+    @model_validator(mode='before')
+    @classmethod
+    def check_legacy_admin_conflicts(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+
+        def _get_ci(keys: tuple[str, ...]):
+            for k in keys:
+                if k in data and data[k] not in (None, ''):
+                    return data[k]
+                env_val = os.environ.get(k)
+                if env_val not in (None, ''):
+                    return env_val
+            return None
+
+        sup_email = _get_ci(('superadmin_email', 'SUPERADMIN_EMAIL'))
+        leg_email = _get_ci(('admin_email', 'ADMIN_EMAIL'))
+        if sup_email and leg_email and str(sup_email).strip().lower() != str(leg_email).strip().lower():
+            raise ValueError(
+                'Conflicting environment variables: SUPERADMIN_EMAIL and ADMIN_EMAIL differ; unify them in .env'
+            )
+
+        def _unwrap(val):
+            return val.get_secret_value() if isinstance(val, SecretStr) else str(val)
+
+        sup_hash = _get_ci(('superadmin_password_hash', 'SUPERADMIN_PASSWORD_HASH'))
+        leg_hash = _get_ci(('admin_password_hash', 'ADMIN_PASSWORD_HASH'))
+        if sup_hash and leg_hash and _unwrap(sup_hash).strip() != _unwrap(leg_hash).strip():
+            raise ValueError(
+                'Conflicting environment variables: SUPERADMIN_PASSWORD_HASH and ADMIN_PASSWORD_HASH differ'
+            )
+        return data
 
     @field_validator('admin_path')
     @classmethod
@@ -46,18 +105,46 @@ class Settings(BaseSettings):
                         raise ValueError('Vercel system URL must be an exact vercel.app hostname')
                     if host.lower() not in self.allowed_hosts:
                         self.allowed_hosts.append(host.lower())
-            # Vercel may select a custom domain here; custom domains remain explicitly configured.
             host = self.vercel_project_production_url.lower()
             if re.fullmatch(r'[a-z0-9-]+(?:\.[a-z0-9-]+)*\.vercel\.app', host) and host not in self.allowed_hosts:
                 self.allowed_hosts.append(host)
         return self
 
-    @field_validator('trusted_proxy_cidrs')
+    @field_validator('trusted_proxy_cidrs', mode='before')
     @classmethod
-    def validate_proxy_cidrs(cls, value: list[str]) -> list[str]:
-        for network in value:
+    def validate_proxy_cidrs(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                cidrs = []
+            elif raw.startswith('['):
+                cidrs = json.loads(raw)
+            else:
+                cidrs = [c.strip() for c in raw.split(',') if c.strip()]
+        elif isinstance(value, list):
+            cidrs = [str(c).strip() for c in value if str(c).strip()]
+        else:
+            raise ValueError('TRUSTED_PROXY_CIDRS must be a list of CIDRs')
+        for network in cidrs:
             ip_network(network)
-        return value
+        return cidrs
+
+    @field_validator('lab_scoped_domains', mode='before')
+    @classmethod
+    def validate_scoped_domains(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return []
+            if raw.startswith('['):
+                items = json.loads(raw)
+            else:
+                items = [d.strip() for d in raw.split(',') if d.strip()]
+        elif isinstance(value, list):
+            items = [str(d).strip() for d in value if str(d).strip()]
+        else:
+            raise ValueError('LAB_SCOPED_DOMAINS must be a list of domain names')
+        return items
 
     @field_validator('subscriber_api_token')
     @classmethod
@@ -88,11 +175,14 @@ class Settings(BaseSettings):
 
     @field_validator('allowed_hosts', mode='before')
     @classmethod
-    def validate_hosts(cls, value):
+    def validate_hosts(cls, value: Any) -> list[str]:
         if isinstance(value, str):
             raw = value.strip()
             if raw.startswith('['):
-                hosts = json.loads(raw)
+                try:
+                    hosts = json.loads(raw)
+                except json.JSONDecodeError as exc:
+                    raise ValueError('Invalid JSON array in ALLOWED_HOSTS') from exc
             else:
                 hosts = [h.strip() for h in raw.split(',') if h.strip()]
         elif isinstance(value, list):

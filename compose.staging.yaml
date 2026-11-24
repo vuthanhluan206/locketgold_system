@@ -1,0 +1,55 @@
+# Zero-Conflict Staging Docker Compose (`compose.staging.yaml`)
+# Designed to run safely in parallel on the Ubuntu VPS (103.118.29.159) WHILE the old
+# `locket.gold` Caddy container is still occupying ports 80 and 443.
+#
+# Usage:
+#   docker compose -p locket_staging -f compose.staging.yaml up -d --build
+#   curl -fsS http://127.0.0.1:18000/api/health
+#
+# Note: Never uses ports 80 or 443, and uses isolated container names (`locket_staging_*`).
+
+services:
+  api:
+    build: .
+    container_name: locket_staging_api
+    env_file:
+      - .env
+    ports:
+      - "127.0.0.1:18000:8000"
+    mem_limit: 256m
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/api/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+  lab_https:
+    image: caddy:2-alpine
+    container_name: locket_staging_lab_https
+    ports:
+      - "127.0.0.1:18443:8443"
+      - "127.0.0.1:18081:8081"
+    volumes:
+      - ./Caddyfile.lab:/etc/caddy/Caddyfile:ro
+      - ./certs_private:/etc/caddy/certs:ro
+      - staging_lab_caddy_data:/data
+      - staging_lab_caddy_config:/config
+    depends_on:
+      - api
+    mem_limit: 64m
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  staging_lab_caddy_data:
+  staging_lab_caddy_config:

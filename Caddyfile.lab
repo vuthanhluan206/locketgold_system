@@ -1,0 +1,21 @@
+{
+	auto_https off
+	admin off
+}
+
+https://mock.lab.vuthanhluan.bond:8443, https://sub.lab.vuthanhluan.bond:8443, https://locketgold.vuthanhluan.bond:8443 {
+	tls /etc/caddy/certs/lab_leaf.pem /etc/caddy/certs/lab_leaf.key
+
+	reverse_proxy api:8000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto https
+		header_up X-Lab-Listener "https-8443"
+	}
+}
+
+http://127.0.0.1:8081, http://localhost:8081 {
+	reverse_proxy api:8000 {
+		header_up Host {host}
+		header_up X-Lab-Listener "http-8081"
+	}
+}

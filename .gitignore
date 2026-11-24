@@ -12,6 +12,11 @@ __pycache__/
 *.pfx
 *.log
 *.zip
+*.rar
+certs_private/
+certs_public/
+cotloicualocketgold.txt
+locket_gold_mitm_server*.js
 SOURCE.md
 rootCA.key
 generate_root_ca.py

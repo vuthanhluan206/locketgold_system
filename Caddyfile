@@ -1,0 +1,17 @@
+{
+	servers {
+		protocols h1 h2
+	}
+}
+
+locketgold.vuthanhluan.bond {
+	encode zstd gzip
+
+	reverse_proxy api:8000 {
+		header_up Host {host}
+		header_up X-Forwarded-Proto {scheme}
+		health_uri /api/health
+		health_interval 30s
+		health_timeout 5s
+	}
+}

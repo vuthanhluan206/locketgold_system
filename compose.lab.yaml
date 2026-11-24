@@ -1,0 +1,32 @@
+# Supplemental Docker Compose overlay for the HTTPS Research Lab (`compose.lab.yaml`)
+# Usage alongside the primary compose.yaml (or standalone without conflicting with ports 80/443):
+#   docker compose -f compose.yaml -f compose.lab.yaml up -d
+#
+# Binds a dedicated HTTPS Research Lab listener on localhost/127.0.0.1:8443 (and optional 8081 HTTP)
+# using certificates signed by the Research Lab Root CA, never touching ports 80 or 443 of the main Caddy instance.
+
+services:
+  lab_https:
+    image: caddy:2-alpine
+    container_name: locket_lab_https_sandbox
+    ports:
+      - "127.0.0.1:8443:8443"
+      - "127.0.0.1:8081:8081"
+    volumes:
+      - ./Caddyfile.lab:/etc/caddy/Caddyfile:ro
+      - ./certs_private:/etc/caddy/certs:ro
+      - lab_caddy_data:/data
+      - lab_caddy_config:/config
+    depends_on:
+      - api
+    mem_limit: 64m
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  lab_caddy_data:
+  lab_caddy_config:
