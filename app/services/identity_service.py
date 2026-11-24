@@ -7,22 +7,28 @@ HANDLE_PATTERN = re.compile(r'^[A-Za-z0-9_.\-]{3,36}$')
 ACCOUNT_ID_PATTERN = re.compile(r'^[A-Za-z0-9_$:@.\-]{1,128}$')
 
 
-def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = False) -> LinkVerifyOutput:
+def verify_account_link_or_identifier(
+    raw_input: str,
+    *,
+    verified_provider_source: str | None = None,
+) -> LinkVerifyOutput:
     """
     Validate a Locket share link, @handle, or direct identifier/UID.
     Strictly enforces Zero-Guessing Policy:
-    - A public share link (https://locket.cam/<username>) contains a username/handle,
-      NOT a cryptographically verified internal Firebase UID.
-    - A 28-character alphanumeric string matches the Firebase UID format, but string length/regex
-      alone does NOT prove account ownership. Unless `trusted_proof=True` is supplied from a
-      verified cryptographic/external source, it is classified honestly as `unverified_uid`
-      (`uid_verified=False`, `verification_method='format_only_uid'`).
+    - Never accepts a client-supplied boolean as proof of verification.
+    - Distinguishes username (@handle / share link), custom identifier, 28-char UUID format,
+      and externally verified identity (`verified_provider_source` supplied only by a trusted
+      server-side identity verifier, never from raw user request bodies).
+    - When no trusted external verification provider is configured, returns an unverified status
+      (`unverified_uid`, `unverified_handle`, or `manual_lab_id`) while recording both
+      `verification_method` and `verification_source`.
     """
     cleaned = raw_input.strip()
     if not cleaned:
         return LinkVerifyOutput(
             valid_format=False,
             input_kind='invalid',
+            verification_source='none',
             message='Đầu vào trống. Vui lòng nhập link locket.cam/... hoặc UID.',
         )
 
@@ -35,6 +41,7 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
             return LinkVerifyOutput(
                 valid_format=False,
                 input_kind='invalid',
+                verification_source='url_parser',
                 message='Định dạng URL không hợp lệ.',
             )
         host = (parsed.hostname or '').lower()
@@ -42,6 +49,7 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
             return LinkVerifyOutput(
                 valid_format=False,
                 input_kind='invalid',
+                verification_source='url_host_check',
                 message='Chỉ chấp nhận tên miền hợp lệ của Locket (locket.cam hoặc locket.camera).',
             )
         segments = [seg for seg in (parsed.path or '').split('/') if seg]
@@ -49,11 +57,12 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
             return LinkVerifyOutput(
                 valid_format=False,
                 input_kind='invalid',
+                verification_source='url_path_check',
                 message='Link Locket không chứa username hoặc mã định danh ở đường dẫn.',
             )
         candidate = segments[-1].lstrip('@').strip()
         if FIREBASE_UID_PATTERN.fullmatch(candidate):
-            if trusted_proof:
+            if verified_provider_source:
                 return LinkVerifyOutput(
                     valid_format=True,
                     input_kind='firebase_uid',
@@ -63,7 +72,8 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
                     uid_verified=True,
                     verification_status='verified_uid',
                     verification_method='trusted_proof',
-                    message='Đã trích xuất và xác thực UID chuẩn 28 ký tự từ bằng chứng tin cậy (verified_uid).',
+                    verification_source=verified_provider_source,
+                    message='Đã trích xuất và xác thực UID chuẩn 28 ký tự từ nguồn xác minh độc lập (verified_uid).',
                 )
             return LinkVerifyOutput(
                 valid_format=True,
@@ -74,6 +84,7 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
                 uid_verified=False,
                 verification_status='unverified_uid',
                 verification_method='format_only_uid',
+                verification_source='regex_28char_url_segment',
                 message=(
                     'Đã trích xuất chuỗi 28 ký tự khớp định dạng Firebase UID từ đường dẫn, '
                     'nhưng độ dài chuỗi không chứng minh quyền sở hữu tài khoản thực tế (trạng thái: unverified_uid).'
@@ -89,6 +100,7 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
                 uid_verified=False,
                 verification_status='unverified_handle',
                 verification_method='link_handle_only',
+                verification_source='public_share_link_path',
                 message=(
                     f'Link hợp lệ (username: @{candidate}), nhưng link chia sẻ công khai chỉ chứa '
                     'username chứ KHÔNG cung cấp Firebase UID nội bộ có thể xác minh độc lập. '
@@ -98,6 +110,7 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
         return LinkVerifyOutput(
             valid_format=False,
             input_kind='invalid',
+            verification_source='url_path_check',
             message='Ký tự định danh trong link không hợp lệ.',
         )
 
@@ -114,6 +127,7 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
                 uid_verified=False,
                 verification_status='unverified_handle',
                 verification_method='link_handle_only',
+                verification_source='explicit_handle_input',
                 message=(
                     f'Đã nhận diện handle @{handle}. Lưu ý: Handle không phải là UID nội bộ '
                     '(trạng thái: unverified_handle).'
@@ -122,12 +136,13 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
         return LinkVerifyOutput(
             valid_format=False,
             input_kind='invalid',
+            verification_source='explicit_handle_input',
             message='Handle @username không đúng định dạng.',
         )
 
     # 3. Check if input is a 28-char alphanumeric Firebase UID format
     if FIREBASE_UID_PATTERN.fullmatch(cleaned):
-        if trusted_proof:
+        if verified_provider_source:
             return LinkVerifyOutput(
                 valid_format=True,
                 input_kind='firebase_uid',
@@ -137,7 +152,8 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
                 uid_verified=True,
                 verification_status='verified_uid',
                 verification_method='trusted_proof',
-                message='Định danh khớp chuẩn Firebase Auth UID (28 ký tự) và có bằng chứng xác thực (verified_uid).',
+                verification_source=verified_provider_source,
+                message='Định danh khớp chuẩn Firebase Auth UID (28 ký tự) và được xác minh bởi nguồn độc lập (verified_uid).',
             )
         return LinkVerifyOutput(
             valid_format=True,
@@ -148,9 +164,10 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
             uid_verified=False,
             verification_status='unverified_uid',
             verification_method='format_only_uid',
+            verification_source='regex_28char_format_only',
             message=(
                 'Định danh khớp định dạng 28 ký tự alphanumeric của Firebase UID, nhưng chưa có '
-                'xác thực quyền sở hữu từ nguồn tin cậy bên ngoài (trạng thái: unverified_uid).'
+                'nguồn xác minh độc lập bên ngoài (trạng thái: unverified_uid).'
             ),
         )
 
@@ -165,11 +182,13 @@ def verify_account_link_or_identifier(raw_input: str, *, trusted_proof: bool = F
             uid_verified=False,
             verification_status='manual_lab_id',
             verification_method='admin_manual_override',
+            verification_source='admin_direct_input',
             message='Định danh hợp lệ cho tài khoản thử nghiệm trong Lab (manual_lab_id).',
         )
 
     return LinkVerifyOutput(
         valid_format=False,
         input_kind='invalid',
+        verification_source='format_inspection_only',
         message='Định danh chứa ký tự không được phép hoặc vượt quá 128 ký tự.',
     )

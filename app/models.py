@@ -109,7 +109,6 @@ class AccountOutput(BaseModel):
 class LinkVerifyInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     raw_input: str = Field(min_length=1, max_length=256)
-    trusted_proof: bool = False
 
 
 class LinkVerifyOutput(BaseModel):
@@ -121,6 +120,7 @@ class LinkVerifyOutput(BaseModel):
     uid_verified: bool = False
     verification_status: VerificationStatus = 'unverified_handle'
     verification_method: VerificationMethod = 'link_handle_only'
+    verification_source: str = 'format_inspection_only'
     message: str
 
 

@@ -44,6 +44,13 @@ async def require_subscriber_access(
     if raw_cred.startswith("lkg_dev_"):
         device_doc = await verify_device_token(request, raw_cred)
         if device_doc is not None:
+            target_account_id = request.path_params.get("account_id")
+            bound_account_id = device_doc.get("locket_id")
+            if target_account_id is not None and bound_account_id != target_account_id:
+                raise HTTPException(
+                    403,
+                    "Device token is not authorized to access this account",
+                )
             request.state.caller_kind = "device_token"
             request.state.device_doc = device_doc
             return
