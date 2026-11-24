@@ -493,3 +493,94 @@ def test_section8_identity_verification_rejects_client_supplied_trusted_proof(mo
     finally:
         http.close()
         get_settings.cache_clear()
+
+
+def test_blocker_a_secret_scanner_distinguishes_code_from_real_private_keys():
+    """
+    Blocker A:
+    - `scripts/check_secrets.py` passes on the current repository (returns 0 violations).
+    - `REAL_PRIVATE_KEY_BLOCK_RE` accurately catches a real multi-line PEM private key block.
+    - Single-line marker checks or test code references do not trigger false positives.
+    """
+    from scripts.check_secrets import REAL_PRIVATE_KEY_BLOCK_RE, scan_tracked_files
+
+    assert scan_tracked_files() == []
+
+    # Simulated real multi-line PEM key block -> MUST be detected
+    fake_pem = (
+        "-----BEGIN " + "PRIVATE KEY-----\n"
+        + ("MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQC7\n" * 3)
+        + "-----END " + "PRIVATE KEY-----"
+    )
+    assert REAL_PRIVATE_KEY_BLOCK_RE.search(fake_pem) is not None
+
+    # Single-line code reference -> MUST NOT trigger
+    code_ref = "assert '-----BEGIN ' + 'PRIVATE KEY-----' not in content"
+    assert REAL_PRIVATE_KEY_BLOCK_RE.search(code_ref) is None
+
+
+def test_blocker_b_canonical_expiry_precedence_and_partial_write_failures(monkeypatch):
+    """
+    Blocker B:
+    - Legacy `accounts` (`doc_v1`) with an older or expired `expires_date` MUST NEVER overwrite
+      a newer `expires_date` managed in canonical `accounts_v2` (`doc_v2`).
+    - Conversely, if `doc_v2` has an expired `expires_date` while `doc_v1` has an un-updated future `expires_date`,
+      canonical `doc_v2` still takes precedence (`expired`).
+    - Partial write failures on `entitlements` during `add-account`, `activate`, or `revoke` fail closed with HTTP 503.
+    """
+    from app.services.entitlement_service import merge_canonical_and_legacy_account
+
+    now = datetime.now(timezone.utc)
+    past_exp = now - timedelta(days=10)
+    future_short = now + timedelta(days=15)
+    future_long = now + timedelta(days=365)
+
+    # 1. Canonical v2 has newer future expiry (365d), legacy v1 has old past expiry (-10d) -> v2 (365d, active) MUST win!
+    m1 = merge_canonical_and_legacy_account(
+        {'locket_id': 'u1', 'expires_date': future_long, 'status': 'active'},
+        {'locket_id': 'u1', 'expires_date': past_exp},
+    )
+    assert m1['expires_date'] == future_long
+    assert m1['status'] == 'active'
+
+    # 2. Canonical v2 was shortened/expired (-10d), legacy v1 still has old future expiry (365d) -> v2 (-10d) MUST win!
+    m2 = merge_canonical_and_legacy_account(
+        {'locket_id': 'u2', 'expires_date': past_exp, 'status': 'expired'},
+        {'locket_id': 'u2', 'expires_date': future_long},
+    )
+    assert m2['expires_date'] == past_exp
+
+    # 3. Canonical v2 is 'pending' with future expiry, legacy v1 is active -> 'pending' MUST win (no Gold granted)
+    m3 = merge_canonical_and_legacy_account(
+        {'locket_id': 'u3', 'expires_date': future_long, 'status': 'pending'},
+        {'locket_id': 'u3', 'expires_date': future_short, 'status': 'active'},
+    )
+    assert m3['status'] == 'pending'
+
+    # 4. Partial write failure on step 3 (`entitlements.update_one`) after `accounts` and `accounts_v2` succeed -> HTTP 503
+    app, password, accounts_store, accounts_v2_store, *_ = _setup_app_with_stores(monkeypatch)
+    http = TestClient(app, base_url='http://localhost', raise_server_exceptions=False)
+    try:
+        login_res = http.post('/api/admin/login', json={'email': 'admin@example.test', 'password': password})
+        admin_headers = {'Authorization': 'Bearer ' + login_res.json()['access_token']}
+
+        # Seed user in both stores with mismatched expiry: legacy has past_exp, v2 has future_long
+        accounts_store['diverged_exp_user'] = {'locket_id': 'diverged_exp_user', 'expires_date': past_exp}
+        accounts_v2_store['diverged_exp_user'] = {
+            'locket_id': 'diverged_exp_user',
+            'account_id': 'diverged_exp_user',
+            'expires_date': future_long,
+            'status': 'active',
+        }
+        sub_res = http.get('/v1/subscribers/diverged_exp_user', headers=admin_headers)
+        assert sub_res.status_code == 200
+        assert sub_res.headers['x-lab-entitlement-status'] == 'active'
+        assert sub_res.json()['subscriber']['entitlements']['Gold']['expires_date'] == future_long.isoformat().replace('+00:00', 'Z')
+
+        # Now fail entitlements.update_one on activate -> must return 503
+        app.state.entitlements.update_one.side_effect = PyMongoError('Entitlement collection write failure')
+        act_fail = http.post('/admin/accounts/diverged_exp_user/activate', headers=admin_headers, json={})
+        assert act_fail.status_code == 503
+    finally:
+        http.close()
+        get_settings.cache_clear()

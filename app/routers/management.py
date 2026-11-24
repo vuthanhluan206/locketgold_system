@@ -436,16 +436,36 @@ async def upsert_account(
         await accounts.update_one({'locket_id': data.locket_id}, {'$set': legacy_doc})
 
     # 2. Write canonical v2 record to `accounts_v2` and `entitlements` (NEVER swallow write failures!)
+    # Enforce server-side verification honesty: Admin input can NEVER self-assert `verified_uid`
+    is_28char_id = bool(len(data.locket_id) == 28 and data.locket_id.isalnum())
+    is_28char_fb = bool(data.firebase_uid and len(data.firebase_uid) == 28 and data.firebase_uid.isalnum())
+    if is_28char_id or is_28char_fb:
+        safe_ver_status = 'unverified_uid'
+        safe_ver_method = 'format_only_uid'
+        safe_ver_source = 'admin_manual_input'
+        resolved_fb_uid = data.firebase_uid or (data.locket_id if is_28char_id else None)
+    elif data.username or data.verification_status == 'unverified_handle':
+        safe_ver_status = 'unverified_handle'
+        safe_ver_method = 'link_handle_only'
+        safe_ver_source = 'admin_manual_input'
+        resolved_fb_uid = None
+    else:
+        safe_ver_status = 'manual_lab_id'
+        safe_ver_method = 'admin_manual_override'
+        safe_ver_source = 'admin_direct_input'
+        resolved_fb_uid = None
+
     v2_doc = {
         'schema_version': 2,
         'account_id': data.locket_id,
         'locket_id': data.locket_id,
         'username': data.username,
-        'firebase_uid': data.firebase_uid,
+        'firebase_uid': resolved_fb_uid,
         'source_link': data.source_link,
-        'verification_status': data.verification_status,
-        'verification_method': data.verification_method,
-        'verification_source': data.verification_source,
+        'verification_status': safe_ver_status,
+        'verification_method': safe_ver_method,
+        'verification_source': safe_ver_source,
+        '_server_uid_proof': False,
         'status': data.status,
         'product_identifier': 'com.locket.gold.yearly',
         'expires_date': data.expires_date,

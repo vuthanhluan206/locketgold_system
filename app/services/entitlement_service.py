@@ -10,17 +10,27 @@ from ..models import (
 
 FIREBASE_UID_RE = re.compile(r'^[A-Za-z0-9]{28}$')
 
+# Trusted server-side verification sources that cannot be forged by raw Admin form input
+SERVER_TRUSTED_UID_SOURCES = {
+    'verified_subscriber_traffic',
+    'firebase_admin_sdk',
+    'cryptographic_id_token',
+}
+
 
 def merge_canonical_and_legacy_account(doc_v2: dict | None, doc_v1: dict | None) -> dict | None:
     """
-    Canonical Account Merger (Single Source of Truth = `accounts_v2`, with legacy `accounts` compatibility).
-    Rules:
-    1. If `doc_v2` exists and its status is 'revoked' or 'pending' (or `revoked_at` is set),
-       `doc_v2` is 100% authoritative — a legacy `doc_v1` record MUST NEVER override a revoked or pending state.
-    2. If `doc_v1` is explicitly marked 'revoked', the merged record is 'revoked'.
-    3. If both exist and neither is revoked/pending, `doc_v2` provides all canonical metadata, while
-       if `doc_v1` has a legacy `expires_date` and `doc_v2` was not updated more recently (`updated_at` absent),
-       `doc_v1['expires_date']` is respected for legacy fixture compatibility.
+    Canonical Account Merger (Single Source of Truth = `accounts_v2`, with legacy `accounts` fallback).
+    Strict Precedence Rules:
+    1. If only one document exists (`doc_v2` or `doc_v1`), return a copy of that document.
+    2. Status Precedence:
+       - If EITHER `doc_v2` or `doc_v1` is explicitly `'revoked'` (or `revoked_at` is set or `is_active is False`),
+         the merged status is `'revoked'` (fail-closed revocation).
+       - Else if `doc_v2` has `status == 'pending'`, the merged status is `'pending'`.
+    3. Expiry Date Precedence (`accounts_v2` Canonical Authority):
+       - When `doc_v2` exists and has a valid `expires_date`, `doc_v2['expires_date']` is ALWAYS authoritative.
+         An older or different `expires_date` in legacy `doc_v1` MUST NEVER overwrite `doc_v2['expires_date']`.
+       - Legacy `doc_v1['expires_date']` is used ONLY as a fallback when `doc_v2` has no valid `expires_date`.
     """
     if doc_v2 is None and doc_v1 is None:
         return None
@@ -30,6 +40,7 @@ def merge_canonical_and_legacy_account(doc_v2: dict | None, doc_v1: dict | None)
         return doc_v1.copy()
 
     assert isinstance(doc_v2, dict) and isinstance(doc_v1, dict)
+    # Start with legacy fields, then overlay canonical accounts_v2 fields so v2 always wins
     merged = {**doc_v1, **doc_v2}
 
     v2_status = str(doc_v2.get('status') or '').lower()
@@ -38,18 +49,29 @@ def merge_canonical_and_legacy_account(doc_v2: dict | None, doc_v1: dict | None)
         merged['status'] = 'revoked'
         merged['revoked_at'] = doc_v2.get('revoked_at')
         merged['revoke_reason'] = doc_v2.get('revoke_reason')
-        return merged
-    if v1_status == 'revoked' or doc_v1.get('revoked_at') is not None or doc_v1.get('is_active') is False:
+    elif v1_status == 'revoked' or doc_v1.get('revoked_at') is not None or doc_v1.get('is_active') is False:
         merged['status'] = 'revoked'
         merged['revoked_at'] = doc_v1.get('revoked_at')
         merged['revoke_reason'] = doc_v1.get('revoke_reason')
-        return merged
-    if v2_status == 'pending':
+    elif v2_status == 'pending':
         merged['status'] = 'pending'
-        return merged
 
-    if 'expires_date' in doc_v1 and doc_v1['expires_date'] is not None:
+    # Canonical Expiry Precedence: doc_v2['expires_date'] is authoritative whenever valid
+    v2_raw_exp = doc_v2.get('expires_date') if 'expires_date' in doc_v2 else (
+        doc_v2.get('expires_at') or doc_v2.get('gold_expires_at')
+    )
+    v2_expiry = None
+    if v2_raw_exp is not None:
+        try:
+            v2_expiry = normalize_expiry(v2_raw_exp)
+        except (ValueError, TypeError):
+            v2_expiry = None
+
+    if v2_expiry is not None:
+        merged['expires_date'] = v2_expiry
+    elif 'expires_date' in doc_v1 and doc_v1['expires_date'] is not None:
         merged['expires_date'] = doc_v1['expires_date']
+
     return merged
 
 
@@ -57,9 +79,11 @@ def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, 
     """
     Inspect a database account record and determine its honest UID & verification state:
     Returns `(firebase_uid, uid_verified, verification_status, verification_method, verification_source)`.
-    Never marks a 28-char string as `verified_uid` unless the record explicitly carries
-    `verification_status == 'verified_uid'` and a valid `verification_method` / `verification_source`
-    (such as `'trusted_proof'` or `'verified_subscriber_traffic'`).
+    Security Invariant:
+    - Never marks a 28-char string as `verified_uid` based on regex length or admin-submitted metadata.
+    - Requires `_server_uid_proof == True` AND `verification_source in SERVER_TRUSTED_UID_SOURCES`
+      alongside `verification_status == 'verified_uid'` and `verification_method == 'trusted_proof'`.
+    - Otherwise, any 28-char UID string is classified honestly as `unverified_uid` (`uid_verified=False`).
     """
     lid = str(record.get('locket_id') or record.get('account_id') or '')
     explicit_uid = record.get('firebase_uid') or record.get('verified_uid')
@@ -72,19 +96,20 @@ def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, 
     rec_status = record.get('verification_status')
     rec_method = record.get('verification_method')
     rec_source = record.get('verification_source')
+    has_server_proof = record.get('_server_uid_proof') is True
 
-    # Only honor verified_uid if candidate_uid is a valid 28-char UID AND record has explicit proof metadata
     if (
         candidate_uid is not None
+        and has_server_proof
         and rec_status == 'verified_uid'
-        and rec_method in {'trusted_proof', 'direct_uid'}
-        and rec_source not in {None, '', 'none', 'format_inspection_only', 'regex_28char_format_only'}
+        and rec_method == 'trusted_proof'
+        and rec_source in SERVER_TRUSTED_UID_SOURCES
     ):
         return (
             candidate_uid,
             True,
             'verified_uid',
-            rec_method,
+            'trusted_proof',
             str(rec_source),
         )
 
@@ -94,7 +119,7 @@ def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, 
             False,
             'unverified_uid',
             'format_only_uid',
-            str(rec_source or 'db_stored_unverified_uid'),
+            'admin_manual_input' if not has_server_proof else str(rec_source or 'db_stored_unverified_uid'),
         )
 
     if record.get('username') or rec_status == 'unverified_handle':
@@ -162,7 +187,6 @@ async def find_canonical_account(request, account_id: str, accounts_col=None) ->
         if isinstance(res, dict):
             doc_v2 = res
         else:
-            # Secondary lookup by username or firebase_uid in accounts_v2
             for field in ('username', 'firebase_uid'):
                 try:
                     res_alt = accounts_v2.find_one({field: account_id}, {'_id': 0})

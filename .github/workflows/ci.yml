@@ -30,18 +30,7 @@ jobs:
 
       - name: Verify no committed secrets, private keys, or forbidden files
         run: |
-          python -c "
-          from pathlib import Path
-          import subprocess
-          tracked = subprocess.check_output(['git', 'ls-files'], text=True).splitlines()
-          forbidden_ext = ('.key', '.pem', '.cer', '.der', '.p12', '.pfx', '.zip', '.rar')
-          for f in tracked:
-              assert not f.endswith(forbidden_ext), f'Forbidden tracked file: {f}'
-              assert Path(f).name != '.env', f'Forbidden tracked .env file: {f}'
-              content = Path(f).read_text(encoding='utf-8', errors='ignore')
-              assert '-----BEGIN PRIVATE KEY-----' not in content or f.startswith('tests/'), f'Private key material in {f}'
-          print(f'Verified {len(tracked)} tracked files clean of secrets and private keys.')
-          "
+          python -m scripts.check_secrets
 
       - name: Python syntax & bytecode compile check
         run: |
@@ -51,7 +40,7 @@ jobs:
         run: |
           ruff check app scripts tests --select E9,F63,F7,F82
 
-      - name: Run full pytest suite (unit, device auth, DB consistency, mobileconfig, PKI, rollback)
+      - name: Run full pytest suite (unit, device auth, DB consistency, lookup, mobileconfig, PKI, rollback)
         run: |
           pytest -v
 

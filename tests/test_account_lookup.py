@@ -88,8 +88,18 @@ def lookup_env(monkeypatch):
                     return doc.copy()
         return None
 
+    async def v2_update_one(q, u, upsert=False):
+        lid = q['locket_id']
+        doc = v2_store.get(lid, {'locket_id': lid})
+        if '$setOnInsert' in u and lid not in v2_store:
+            doc.update(u['$setOnInsert'])
+        if '$set' in u:
+            doc.update(u['$set'])
+        v2_store[lid] = doc
+
     accounts.find_one.side_effect = v1_find_one
     accounts_v2.find_one.side_effect = v2_find_one
+    accounts_v2.update_one.side_effect = v2_update_one
 
     app.dependency_overrides[get_accounts] = lambda: accounts
     app.state.accounts = accounts
@@ -229,7 +239,7 @@ def test_admin_lookup_distinguishes_handle_unverified_uid_and_verified_uid(looku
     assert data_handle['verification_status'] == 'unverified_handle'
     assert data_handle['entitlement_status'] == 'active'
 
-    # Scenario 7: Account in MongoDB has 28-char Firebase UID AND valid verification proof -> verified_uid
+    # Scenario 7: Account in MongoDB has 28-char Firebase UID AND valid server-side verification proof -> verified_uid
     verified_uid = '4Vee1rBLoJN9TDjql9xPzDEuf5D2'
     v2_store['verified_member'] = {
         'locket_id': verified_uid,
@@ -238,6 +248,7 @@ def test_admin_lookup_distinguishes_handle_unverified_uid_and_verified_uid(looku
         'verification_status': 'verified_uid',
         'verification_method': 'trusted_proof',
         'verification_source': 'verified_subscriber_traffic',
+        '_server_uid_proof': True,
         'expires_date': future,
         'status': 'active',
         'updated_at': now,
@@ -311,3 +322,45 @@ def test_zero_dependency_on_amlongtruc_or_external_network_in_lookup():
     assert 'uplocket' not in combined
     assert 'urllib.request.urlopen' not in combined
     assert 'httpx.' not in combined
+
+
+# Scenario 13 (Prompt 7 Blocker C): Admin attempting to spoof verification_status='verified_uid',
+# verification_method='trusted_proof', verification_source='verified_subscriber_traffic' via POST /admin/add-account
+def test_admin_cannot_spoof_verified_uid_metadata_via_add_account(lookup_env):
+    http, _, _, _, _, v2_store, admin_headers = lookup_env
+    future = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+    spoofed_uid = '7Abc1dEFgHI2JKlmn3oPqRS4tUvW'
+
+    res_add = http.post(
+        '/admin/add-account',
+        headers=admin_headers,
+        json={
+            'locket_id': spoofed_uid,
+            'username': 'spoof_attempt_user',
+            'firebase_uid': spoofed_uid,
+            'expires_date': future,
+            'verification_status': 'verified_uid',
+            'verification_method': 'trusted_proof',
+            'verification_source': 'verified_subscriber_traffic',
+        },
+    )
+    assert res_add.status_code == 200
+    saved = res_add.json()
+    # Even though Admin sent verified_uid/trusted_proof/verified_subscriber_traffic, backend MUST downgrade to unverified_uid!
+    assert saved['verification_status'] == 'unverified_uid'
+    assert saved['verification_method'] == 'format_only_uid'
+    assert saved['verification_source'] == 'admin_manual_input'
+    assert v2_store[spoofed_uid]['_server_uid_proof'] is False
+
+    # Confirm via GET /admin/accounts/lookup that uid_verified is False
+    res_lookup = http.get(
+        '/admin/accounts/lookup',
+        params={'query': 'https://locket.cam/spoof_attempt_user'},
+        headers=admin_headers,
+    )
+    assert res_lookup.status_code == 200
+    lookup_data = res_lookup.json()
+    assert lookup_data['exists'] is True
+    assert lookup_data['firebase_uid'] == spoofed_uid
+    assert lookup_data['uid_verified'] is False
+    assert lookup_data['verification_status'] == 'unverified_uid'
