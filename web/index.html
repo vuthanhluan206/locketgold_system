@@ -1304,6 +1304,20 @@
       overflow-wrap: anywhere;
     }
 
+    .admin .account-cell-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+
+    .admin .account-uid-meta {
+      font-size: 12px;
+      line-height: 1.4;
+      color: var(--muted);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      overflow-wrap: anywhere;
+    }
+
     .admin .account-expiry {
       font-size: 14px;
       color: var(--muted);
@@ -2001,6 +2015,11 @@
                   pattern="[A-Za-z0-9_$:@.\-]+" autocomplete="off"></div>
               <div class="field"><label for="expiry">Expires at · local time</label><input id="expiry"
                   type="datetime-local" required></div>
+              <div class="field"><label for="accountUsername">Username (optional)</label><input id="accountUsername"
+                  maxlength="64" pattern="[A-Za-z0-9_.\-]*" autocomplete="off" placeholder="username"></div>
+              <div class="field"><label for="accountFirebaseUid">Firebase UID (optional)</label><input
+                  id="accountFirebaseUid" maxlength="128" pattern="[A-Za-z0-9_\-]*" autocomplete="off"
+                  placeholder="Chưa liên kết Firebase UID"></div>
             </div>
             <p class="status" id="accountMessage" role="status" aria-live="polite"></p>
             <div class="dialog-actions">
@@ -2163,12 +2182,22 @@
               const td = document.createElement('td');
               const label = document.createElement('span'); label.textContent = value;
               if (index === 0) {
+                const stack = document.createElement('div'); stack.className = 'account-cell-stack';
                 const name = document.createElement('span'); name.className = 'account-name';
                 const crown = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
                 crown.setAttribute('viewBox', '0 0 32 32'); crown.setAttribute('class', 'account-crown'); crown.setAttribute('aria-hidden', 'true');
                 const symbol = document.createElementNS('http://www.w3.org/2000/svg', 'use');
                 symbol.setAttribute('href', '#gold-crown'); crown.append(symbol);
-                name.append(crown, label); td.append(name);
+                if (row.username && row.username !== row.locket_id) {
+                  label.textContent = row.locket_id + ' (@' + row.username + ')';
+                }
+                name.append(crown, label);
+                const uidMeta = document.createElement('div'); uidMeta.className = 'account-uid-meta';
+                uidMeta.textContent = 'Firebase UID: ' + (row.firebase_uid ? row.firebase_uid : 'Chưa liên kết Firebase UID');
+                const verMeta = document.createElement('div'); verMeta.className = 'account-uid-meta';
+                verMeta.textContent = 'Verification: ' + (row.verification_status === 'verified_uid' ? 'Verified' : 'Unverified');
+                stack.append(name, uidMeta, verMeta);
+                td.append(stack);
               } else {
                 label.className = index === 1 ? 'account-expiry' : 'account-status' + (value === 'Gold' ? ' is-gold' : '');
                 td.append(label);
@@ -2181,6 +2210,8 @@
               $('accountId').value = row.locket_id;
               const date = new Date(row.expires_date);
               $('expiry').value = new Date(date - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+              $('accountUsername').value = row.username || '';
+              $('accountFirebaseUid').value = row.firebase_uid || '';
               openAccountDialog(true);
             };
             const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'secondary'; remove.textContent = 'Delete';
@@ -2250,7 +2281,15 @@
           event.preventDefault(); $('save').disabled = true;
           $('accountMessage').textContent = '';
           try {
-            await api('/admin/add-account', { method: 'POST', body: JSON.stringify({ locket_id: $('accountId').value, expires_date: new Date($('expiry').value).toISOString() }) });
+            const payload = {
+              locket_id: $('accountId').value.trim(),
+              expires_date: new Date($('expiry').value).toISOString(),
+            };
+            const uVal = $('accountUsername').value.trim();
+            const fVal = $('accountFirebaseUid').value.trim();
+            if (uVal) payload.username = uVal;
+            if (fVal) payload.firebase_uid = fVal;
+            await api('/admin/add-account', { method: 'POST', body: JSON.stringify(payload) });
             accountDialog.close();
             $('adminMessage').textContent = 'Account saved.'; await load();
           } catch (error) {

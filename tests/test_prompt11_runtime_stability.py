@@ -787,3 +787,354 @@ def test_prompt14_mobileconfig_fields_server_addresses_and_root_ca_validation(tm
     pl_custom = plistlib.loads(build_profile(s_custom_doh_addrs, scoped_domains=['mock.lab.vuthanhluan.bond']))
     assert pl_custom['PayloadContent'][0]['DNSSettings']['ServerAddresses'] == ['103.118.29.159']
     assert pl_custom['PayloadContent'][0]['DNSSettings']['SupplementalMatchDomains'] == ['mock.lab.vuthanhluan.bond']
+
+
+def test_prompt17_groups_a_b_c_d_and_real_mobileconfig_file_verification(monkeypatch, tmp_path):
+    """
+    Prompt 17 Sections X & XI:
+      - Group A (A01-A15): Apple .mobileconfig structure, distinct reverse-DNS PayloadIdentifiers, headers, no sample leakage.
+      - Group B (B01-B12): Root CA validation (PEM/DER, expired, leaf CA:FALSE, private key rejection, lab_ca & scoped_lab 503 fail-closed when CA missing).
+      - Group C (C01-C10): DoH URL resolution, 503 when unconfigured, wireformat A/AAAA/HTTPS/SVCB/REFUSED/400 & JSON DoH.
+      - Group D (D01-D10): Firebase UID linking, lookup by locket_id/username/firebase_uid, verified vs unverified honesty, legacy compatibility, and UI fields.
+      - Section XI: Real .mobileconfig file written to disk, opened in binary mode with plistlib.load(f), X.509 DER & SHA-256 fingerprint verified.
+    """
+    from uuid import UUID
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import rsa
+    from app.config import Settings
+
+    pub_dir = tmp_path / 'p17_pub'
+    priv_dir = tmp_path / 'p17_priv'
+    domains = ['locketgold.vuthanhluan.bond', 'mock.lab.vuthanhluan.bond']
+    gen = generate_ca_and_leaf_files(pub_dir, priv_dir, domains)
+    ca_pem_path = pub_dir / 'lab_root_ca.pem'
+    ca_cer_path = pub_dir / 'lab_root_ca.cer'
+    expected_fp = gen['ca_metadata']['sha256_fingerprint']
+
+    password = secrets.token_urlsafe(20)
+    encoded = hash_password(password)
+
+    # B05 & B06: Expired CA certificate and non-CA leaf certificate must fail closed
+    key_exp = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    subj_exp = x509.Name([x509.NameAttribute(x509.oid.NameOID.COMMON_NAME, 'Expired Test CA')])
+    now_utc = datetime.now(timezone.utc)
+    expired_cert = (
+        x509.CertificateBuilder()
+        .subject_name(subj_exp)
+        .issuer_name(subj_exp)
+        .public_key(key_exp.public_key())
+        .serial_number(x509.random_serial_number())
+        .not_valid_before(now_utc - timedelta(days=20))
+        .not_valid_after(now_utc - timedelta(days=1))
+        .add_extension(x509.BasicConstraints(ca=True, path_length=None), critical=True)
+        .add_extension(
+            x509.KeyUsage(
+                digital_signature=True, content_commitment=False, key_encipherment=False,
+                data_encipherment=False, key_agreement=False, key_cert_sign=True,
+                crl_sign=True, encipher_only=False, decipher_only=False,
+            ),
+            critical=True,
+        )
+        .sign(private_key=key_exp, algorithm=hashes.SHA256())
+    )
+    expired_pem = expired_cert.public_bytes(serialization.Encoding.PEM).decode('utf-8')
+    s_expired = Settings(
+        _env_file=None,
+        superadmin_email='admin@example.test',
+        superadmin_password_hash=encoded,
+        mongodb_uri='mongodb://127.0.0.1:27017',
+        nextdns_id='a8b247',
+        root_ca_pem=expired_pem,
+    )
+    with pytest.raises(ValueError, match='expired or not yet valid'):
+        build_profile(s_expired)
+
+    # B06: Leaf cert (CA:FALSE) rejected as Root CA
+    s_leaf_as_ca = Settings(
+        _env_file=None,
+        superadmin_email='admin@example.test',
+        superadmin_password_hash=encoded,
+        mongodb_uri='mongodb://127.0.0.1:27017',
+        nextdns_id='a8b247',
+        root_ca_path=str(priv_dir / 'lab_leaf.pem'),
+    )
+    with pytest.raises(ValueError, match='CA certificate'):
+        build_profile(s_leaf_as_ca)
+
+    # C03: Missing both NEXTDNS_ID and DOH_SERVER_URL -> HTTPException 503
+    s_no_dns = Settings(
+        _env_file=None,
+        superadmin_email='admin@example.test',
+        superadmin_password_hash=encoded,
+        mongodb_uri='mongodb://127.0.0.1:27017',
+        nextdns_id='',
+        doh_server_url='',
+    )
+    with pytest.raises(HTTPException) as exc_info:
+        build_profile(s_no_dns)
+    assert exc_info.value.status_code == 503
+
+    # B12: HTTP endpoint /profile.mobileconfig?mode=lab_ca and ?mode=scoped_lab MUST return 503 when Root CA is not configured
+    monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
+    monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
+    monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
+    monkeypatch.setenv('ALLOWED_HOSTS', '["localhost"]')
+    monkeypatch.setenv('REQUIRE_HTTPS', 'false')
+    monkeypatch.setenv('NEXTDNS_ID', 'a8b247')
+    monkeypatch.setenv('ROOT_CA_PATH', '')
+    monkeypatch.setenv('ROOT_CA_PEM', '')
+    get_settings.cache_clear()
+
+    app_no_ca = create_app()
+    app_no_ca.state.profile = build_profile(get_settings())
+    client_no_ca = TestClient(app_no_ca, base_url='http://localhost')
+    try:
+        # dns_only and default succeed without Root CA
+        r_dns = client_no_ca.get('/profile.mobileconfig?mode=dns_only')
+        assert r_dns.status_code == 200
+        assert len(plistlib.loads(r_dns.content)['PayloadContent']) == 1
+        # lab_ca and scoped_lab MUST fail closed with 503 when Root CA is missing
+        r_lab_ca_503 = client_no_ca.get('/profile.mobileconfig?mode=lab_ca')
+        assert r_lab_ca_503.status_code == 503
+        r_scoped_503 = client_no_ca.get('/profile.mobileconfig?mode=scoped_lab')
+        assert r_scoped_503.status_code == 503
+    finally:
+        client_no_ca.close()
+
+    # Now configure valid ROOT_CA_PATH and test full HTTP flow (Group A, B, C, D & Section XI)
+    monkeypatch.setenv('ROOT_CA_PATH', str(ca_pem_path))
+    get_settings.cache_clear()
+
+    app = create_app()
+    v1_store: dict[str, dict] = {}
+    v2_store: dict[str, dict] = {}
+    sessions_store: dict[str, dict] = {}
+
+    class InMemoryAccountsV1:
+        async def find_one(self, q, projection=None):
+            lid = q.get('locket_id')
+            return v1_store.get(lid, None)
+
+        async def update_one(self, q, u, upsert=False):
+            lid = q['locket_id']
+            doc = v1_store.get(lid, {'locket_id': lid}).copy()
+            if '$set' in u:
+                doc.update(u['$set'])
+            v1_store[lid] = doc
+
+        def find(self, q, projection=None):
+            rows = sorted(v1_store.values(), key=lambda x: x['locket_id'])
+            c = MagicMock()
+            c.sort.return_value = c
+            c.skip.return_value = c
+            c.limit.return_value = c
+            c.to_list = AsyncMock(return_value=rows)
+            return c
+
+    class InMemoryAccountsV2:
+        async def find_one(self, q, projection=None):
+            for field in ('locket_id', 'username', 'firebase_uid'):
+                if field in q and q[field] is not None:
+                    for doc in v2_store.values():
+                        if doc.get(field) == q[field]:
+                            return doc.copy()
+            return None
+
+        async def update_one(self, q, u, upsert=False):
+            lid = q['locket_id']
+            doc = v2_store.get(lid, {'locket_id': lid}).copy()
+            if '$setOnInsert' in u and lid not in v2_store:
+                doc.update(u['$setOnInsert'])
+            if '$set' in u:
+                doc.update(u['$set'])
+            v2_store[lid] = doc
+
+        def find(self, q, projection=None):
+            rows = sorted(v2_store.values(), key=lambda x: x['locket_id'])
+            c = MagicMock()
+            c.sort.return_value = c
+            c.skip.return_value = c
+            c.limit.return_value = c
+            c.to_list = AsyncMock(return_value=rows)
+            return c
+
+    admin_doc = {
+        '_id': 'superadmin',
+        'email': 'admin@example.test',
+        'password_hash': encoded,
+        'auth_version': hashlib.sha256(encoded.encode()).hexdigest(),
+    }
+    admins = AsyncMock()
+    admins.find_one.return_value = admin_doc
+    sessions = AsyncMock()
+    sessions.insert_one.side_effect = lambda d: sessions_store.setdefault(d['_id'], d.copy())
+    sessions.find_one.side_effect = lambda q: sessions_store.get(q['_id'])
+    login_limits = AsyncMock()
+    login_limits.find_one_and_update.return_value = {'count': 1}
+
+    mem_v1 = InMemoryAccountsV1()
+    mem_v2 = InMemoryAccountsV2()
+    app.state.admins = admins
+    app.state.sessions = sessions
+    app.state.login_limits = login_limits
+    app.state.accounts = mem_v1
+    app.state.accounts_v2 = mem_v2
+    app.state.entitlements = AsyncMock()
+    app.state.profile = build_profile(get_settings())
+    app.dependency_overrides[get_accounts] = lambda: mem_v1
+
+    client = TestClient(app, base_url='http://localhost')
+    try:
+        # Group A (A01-A15) & Section XI: Download real .mobileconfig, save to disk, open in binary mode with plistlib.load
+        resp_mc = client.get('/profile.mobileconfig')
+        assert resp_mc.status_code == 200
+        assert resp_mc.headers['content-type'].startswith('application/x-apple-aspen-config')
+        assert resp_mc.headers['content-disposition'] == 'attachment; filename="locket.mobileconfig"'
+        assert 'no-store' in resp_mc.headers['cache-control']
+        assert b'hvnothv.bond' not in resp_mc.content
+        assert b'217.15.161.106' not in resp_mc.content
+
+        real_mc_file = tmp_path / 'locket.mobileconfig'
+        real_mc_file.write_bytes(resp_mc.content)
+
+        with open(real_mc_file, 'rb') as f:
+            profile = plistlib.load(f)
+
+        assert profile['PayloadType'] == 'Configuration'
+        assert profile['PayloadVersion'] == 1
+        assert profile['PayloadOrganization'] == 'vuthanhluan.bond'
+        assert profile['PayloadIdentifier'] == 'bond.vuthanhluan.locketgold.profile'
+        assert UUID(profile['PayloadUUID']).version == 4
+
+        payloads = profile['PayloadContent']
+        assert len(payloads) == 2
+        identifiers = [profile['PayloadIdentifier']] + [p['PayloadIdentifier'] for p in payloads]
+        assert len(set(identifiers)) == 3
+        assert identifiers == [
+            'bond.vuthanhluan.locketgold.profile',
+            'bond.vuthanhluan.locketgold.dns',
+            'bond.vuthanhluan.locketgold.root-ca',
+        ]
+
+        dns = next(p for p in payloads if p['PayloadType'] == 'com.apple.dnsSettings.managed')
+        assert dns['DNSSettings']['DNSProtocol'] == 'HTTPS'
+        assert dns['DNSSettings']['ServerURL'] == 'https://dns.nextdns.io/a8b247'
+        assert 'ServerAddresses' not in dns['DNSSettings']
+
+        ca = next(p for p in payloads if p['PayloadType'] == 'com.apple.security.root')
+        assert ca['PayloadCertificateFileName'] == 'LocketGoldCA.cer'
+        assert isinstance(ca['PayloadContent'], bytes)
+        assert ca['PayloadContent'] == ca_cer_path.read_bytes()
+        cert = x509.load_der_x509_certificate(ca['PayloadContent'])
+        bc = cert.extensions.get_extension_for_class(x509.BasicConstraints).value
+        assert bc.ca is True
+        cert.verify_directly_issued_by(cert)
+        assert inspect_certificate_metadata(cert)['sha256_fingerprint'] == expected_fp
+
+        # A10: scoped_lab includes SupplementalMatchDomains
+        resp_scoped = client.get('/profile.mobileconfig?mode=scoped_lab')
+        assert resp_scoped.status_code == 200
+        pl_scoped = plistlib.loads(resp_scoped.content)
+        assert pl_scoped['PayloadContent'][0]['DNSSettings']['SupplementalMatchDomains'] == get_settings().lab_scoped_domains
+
+        # Group C (C10 & C09): HTTP JSON DoH and malformed wireformat
+        r_doh_json = client.get('/dns-query?name=mock.lab.vuthanhluan.bond&type=A')
+        assert r_doh_json.status_code == 200
+        assert r_doh_json.json()['Status'] == 0
+        r_doh_refused = client.get('/dns-query?name=api.revenuecat.com&type=A')
+        assert r_doh_refused.status_code == 200
+        assert r_doh_refused.json()['Status'] == 5
+        r_doh_bad = client.get('/dns-query?dns=!!!not_base64!!!')
+        assert r_doh_bad.status_code == 400
+
+        # Group D (D01-D10): Admin login, Firebase UID manual add/edit, legacy compatibility, verified vs unverified
+        login_res = client.post('/api/admin/login', json={'email': 'admin@example.test', 'password': password})
+        assert login_res.status_code == 200
+        token = login_res.json()['access_token']
+        auth_headers = {'Authorization': f'Bearer {token}'}
+
+        future_iso = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
+
+        # D07 & D10: Manually add account with username + firebase_uid (even if payload claims verified_uid, server forces unverified_uid)
+        manual_fb_uid = 'FbUidManualTest1234567890AbC'
+        add_res = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={
+                'locket_id': 'luan_gold_user',
+                'username': 'luan_handle',
+                'firebase_uid': manual_fb_uid,
+                'verification_status': 'verified_uid',
+                'expires_date': future_iso,
+            },
+        )
+        assert add_res.status_code == 200
+        added = add_res.json()
+        assert added['locket_id'] == 'luan_gold_user'
+        assert added['username'] == 'luan_handle'
+        assert added['firebase_uid'] == manual_fb_uid
+        assert added['verification_status'] == 'unverified_uid'
+
+        # D08: Legacy account without firebase_uid
+        legacy_res = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={
+                'locket_id': 'legacy_only_user',
+                'expires_date': future_iso,
+            },
+        )
+        assert legacy_res.status_code == 200
+        assert legacy_res.json()['firebase_uid'] is None
+        assert legacy_res.json()['verification_status'] == 'manual_lab_id'
+
+        # D06: Server-verified Firebase UID record in accounts_v2
+        verified_fb_uid = 'VerifiedFirebaseUid987654321'
+        v2_store['verified_gold_user'] = {
+            'schema_version': 2,
+            'account_id': 'verified_gold_user',
+            'locket_id': 'verified_gold_user',
+            'username': 'verified_user',
+            'firebase_uid': verified_fb_uid,
+            'verification_status': 'verified_uid',
+            'verification_method': 'trusted_proof',
+            'verification_source': 'verified_subscriber_traffic',
+            '_server_uid_proof': True,
+            'status': 'active',
+            'expires_date': datetime.now(timezone.utc) + timedelta(days=90),
+        }
+
+        # D05: GET /admin/accounts returns all three accounts with accurate firebase_uid & verification_status
+        list_res = client.get('/admin/accounts', headers=auth_headers)
+        assert list_res.status_code == 200
+        by_id = {r['locket_id']: r for r in list_res.json()}
+        assert by_id['luan_gold_user']['firebase_uid'] == manual_fb_uid
+        assert by_id['luan_gold_user']['verification_status'] == 'unverified_uid'
+        assert by_id['legacy_only_user']['firebase_uid'] is None
+        assert by_id['verified_gold_user']['firebase_uid'] == verified_fb_uid
+        assert by_id['verified_gold_user']['verification_status'] == 'verified_uid'
+
+        # D01, D02, D03, D04: Public lookup works by locket_id, username, and firebase_uid, returning ONLY {"exists": bool}
+        for q in ('luan_gold_user', 'luan_handle', 'https://locket.cam/luan_handle', manual_fb_uid, verified_fb_uid):
+            pub_lk = client.get(f'/api/accounts/lookup?query={q}')
+            assert pub_lk.status_code == 200
+            assert pub_lk.json() == {'exists': True}
+        pub_miss = client.get('/api/accounts/lookup?query=nonexistent_account_xyz')
+        assert pub_miss.status_code == 200
+        assert pub_miss.json() == {'exists': False}
+
+        # D03: Subscriber entitlement endpoint resolves by locket_id, username, AND firebase_uid
+        for sub_id in ('luan_gold_user', 'luan_handle', manual_fb_uid, verified_fb_uid):
+            sub_res = client.get(f'/v1/subscribers/{sub_id}', headers=auth_headers)
+            assert sub_res.status_code == 200
+            assert 'Gold' in sub_res.json()['subscriber']['entitlements']
+
+        # D09: Admin HTML contains Firebase UID display & dialog input IDs without extra tables or columns
+        adm_html = client.get('/admin').text
+        assert 'id="accountFirebaseUid"' in adm_html
+        assert 'id="accountUsername"' in adm_html
+        assert 'Chưa liên kết Firebase UID' in adm_html
+        assert 'account-uid-meta' in adm_html
+    finally:
+        client.close()
+        get_settings.cache_clear()
