@@ -2,11 +2,13 @@ from datetime import datetime, timezone
 import time
 from typing import Annotated
 from uuid import uuid4
-from fastapi import APIRouter, Depends, Request
+from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
+from ..config import get_settings
 from ..database import get_accounts
 from ..models import AccountId, compute_entitlement_status, subscriber_response
 from ..security import require_subscriber_access
+from ..services.doh_service import decode_base64url_dns_param, resolve_lab_dns_wireformat
 from ..services.entitlement_service import find_canonical_account
 from ..services.lab_inspector_service import redact_headers, redact_payload
 
@@ -153,3 +155,77 @@ async def lab_echo_inspect(request: Request):
             pass
 
     return JSONResponse(content=resp_payload)
+
+
+@router.get('/dns-query')
+@router.get('/dns-query/{device_label}')
+async def doh_get_query(
+    request: Request,
+    dns: str | None = Query(None, max_length=1024),
+    name: str | None = Query(None, max_length=253),
+    type: str = Query('A', max_length=16),
+    device_label: str | None = None,
+):
+    """
+    Controlled Research Lab DNS-over-HTTPS (RFC 8484 GET & JSON) Endpoint.
+    Only resolves domains explicitly listed in `settings.lab_scoped_domains`.
+    Refuses all external/third-party domains (`REFUSED`) so it never acts as an open DNS proxy.
+    """
+    settings = get_settings()
+    if dns is not None:
+        try:
+            packet = decode_base64url_dns_param(dns)
+            resp_bytes, _ = resolve_lab_dns_wireformat(
+                packet,
+                allowed_domains=settings.lab_scoped_domains,
+                target_ipv4=settings.lab_dns_target_ip,
+            )
+        except Exception as exc:
+            raise HTTPException(400, 'Malformed RFC 8484 DNS query packet') from exc
+        return Response(content=resp_bytes, media_type='application/dns-message')
+
+    if name is not None:
+        qname = name.strip().lower().rstrip('.')
+        allowed_set = {d.strip().lower().rstrip('.') for d in settings.lab_scoped_domains if d.strip()}
+        if qname not in allowed_set:
+            return JSONResponse(
+                status_code=200,
+                content={'Status': 5, 'Comment': 'REFUSED: Domain outside controlled Research Lab scope', 'Question': [{'name': qname, 'type': 1}], 'Answer': []},
+            )
+        qtype_upper = type.strip().upper()
+        answers = (
+            [{'name': qname, 'type': 1, 'TTL': 60, 'data': settings.lab_dns_target_ip}]
+            if qtype_upper in {'A', '1'}
+            else []
+        )
+        return JSONResponse(
+            status_code=200,
+            content={
+                'Status': 0,
+                'TC': False,
+                'RD': True,
+                'RA': True,
+                'AD': False,
+                'CD': False,
+                'Question': [{'name': qname, 'type': 1 if qtype_upper in {'A', '1'} else 28}],
+                'Answer': answers,
+            },
+        )
+    raise HTTPException(400, 'Provide either RFC 8484 ?dns=<base64url> or JSON ?name=<domain>')
+
+
+@router.post('/dns-query')
+@router.post('/dns-query/{device_label}')
+async def doh_post_query(request: Request, device_label: str | None = None):
+    """Controlled Research Lab DNS-over-HTTPS (RFC 8484 POST `application/dns-message`) Endpoint."""
+    settings = get_settings()
+    body = await request.body()
+    try:
+        resp_bytes, _ = resolve_lab_dns_wireformat(
+            body,
+            allowed_domains=settings.lab_scoped_domains,
+            target_ipv4=settings.lab_dns_target_ip,
+        )
+    except Exception as exc:
+        raise HTTPException(400, 'Malformed RFC 8484 DNS query packet') from exc
+    return Response(content=resp_bytes, media_type='application/dns-message')

@@ -3,6 +3,13 @@ from tempfile import TemporaryDirectory
 import sys
 
 if sys.platform == 'win32':
+    import os
+    os.environ['NO_COLOR'] = '1'
+    try:
+        import _colorize
+        _colorize.can_colorize = lambda *a, **kw: False
+    except ImportError:
+        pass
     import asyncio
     import asyncio.base_events
     import asyncio.proactor_events

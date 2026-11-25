@@ -161,7 +161,8 @@ async def lifespan(app: FastAPI):
     settings = get_settings()
     app.state.profile = None
     try:
-        app.state.profile = build_profile(settings) if settings.nextdns_id else None
+        has_dns = bool(settings.nextdns_id or getattr(settings, 'doh_server_url', ''))
+        app.state.profile = build_profile(settings) if has_dns else None
     except (ValueError, OSError, x509.ExtensionNotFound, InvalidSignature, UnsupportedAlgorithm) as exc:
         logger.error('PROFILE_CONFIG_INVALID: %s; profile download disabled', type(exc).__name__)
     client = AsyncMongoClient(

@@ -217,6 +217,123 @@ async def verify_post_migration(db) -> dict:
     }
 
 
+async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
+    """
+    Detect and safely reconcile partial write drift across `accounts_v2` (canonical),
+    `accounts` (legacy mirror), and `entitlements` (Gold projection).
+    Safety Invariants:
+    1. Canonical `accounts_v2` is authoritative.
+    2. NEVER resurrects or re-activates a record that is marked `revoked` in EITHER `accounts_v2` or `accounts`
+       (if `accounts` is revoked while `accounts_v2` was active due to an interrupted revoke call,
+       reconciliation propagates `revoked` into `accounts_v2` and `entitlements` — fail-closed!).
+    3. Ensures `accounts` and `entitlements` match the authoritative status and `expires_date` of `accounts_v2`.
+    """
+    now = datetime.now(timezone.utc)
+    v1_list = await _fetch_all_documents(getattr(db, 'accounts', None), {}, {'_id': 0})
+    v2_list = await _fetch_all_documents(getattr(db, 'accounts_v2', None), {}, {'_id': 0})
+    ent_list = await _fetch_all_documents(getattr(db, 'entitlements', None), {'entitlement_key': 'Gold'}, {'_id': 0})
+
+    v1_map = {d['locket_id']: d for d in v1_list if isinstance(d, dict) and isinstance(d.get('locket_id'), str)}
+    v2_map = {d['locket_id']: d for d in v2_list if isinstance(d, dict) and isinstance(d.get('locket_id'), str)}
+    ent_map = {d['account_id']: d for d in ent_list if isinstance(d, dict) and isinstance(d.get('account_id'), str)}
+
+    drifts = []
+    repaired = 0
+
+    for lid, v2_doc in v2_map.items():
+        v1_doc = v1_map.get(lid)
+        ent_doc = ent_map.get(lid)
+
+        v2_status = str(v2_doc.get('status') or 'active').lower()
+        v1_status = str(v1_doc.get('status') or '').lower() if isinstance(v1_doc, dict) else ''
+        v2_revoked = v2_status == 'revoked' or v2_doc.get('revoked_at') is not None
+        v1_revoked = isinstance(v1_doc, dict) and (v1_status == 'revoked' or v1_doc.get('revoked_at') is not None)
+
+        # Fail-closed revocation: if either v1 or v2 is revoked, canonical status MUST be revoked
+        auth_status = 'revoked' if (v2_revoked or v1_revoked) else v2_status
+        auth_revoked_at = (
+            (v2_doc.get('revoked_at') or (v1_doc.get('revoked_at') if isinstance(v1_doc, dict) else None) or now)
+            if auth_status == 'revoked'
+            else None
+        )
+        try:
+            auth_expiry = normalize_expiry(v2_doc.get('expires_date'))
+        except Exception:
+            auth_expiry = datetime(1970, 1, 1, tzinfo=timezone.utc)
+
+        # Check if v2 itself needs fail-closed revocation propagation from v1
+        if auth_status == 'revoked' and v2_status != 'revoked':
+            drifts.append({'locket_id': lid, 'target': 'accounts_v2', 'reason': 'Propagate revoked state from legacy accounts'})
+            if not dry_run:
+                await db.accounts_v2.update_one(
+                    {'locket_id': lid},
+                    {'$set': {'status': 'revoked', 'revoked_at': auth_revoked_at, 'updated_at': now}},
+                )
+                repaired += 1
+
+        # Check legacy accounts mirror drift
+        v1_exp = None
+        if isinstance(v1_doc, dict) and v1_doc.get('expires_date') is not None:
+            try:
+                v1_exp = normalize_expiry(v1_doc['expires_date'])
+            except Exception:
+                v1_exp = None
+
+        if v1_doc is None or v1_exp != auth_expiry or (auth_status == 'revoked' and v1_status != 'revoked'):
+            drifts.append({'locket_id': lid, 'target': 'accounts', 'reason': 'Legacy mirror out of sync with accounts_v2'})
+            if not dry_run and getattr(db, 'accounts', None) is not None:
+                await db.accounts.update_one(
+                    {'locket_id': lid},
+                    {
+                        '$set': {
+                            'locket_id': lid,
+                            'expires_date': auth_expiry,
+                            'status': auth_status,
+                            'revoked_at': auth_revoked_at,
+                        }
+                    },
+                    upsert=True,
+                )
+                repaired += 1
+
+        # Check entitlements projection drift
+        if getattr(db, 'entitlements', None) is not None:
+            ent_exp = None
+            if isinstance(ent_doc, dict) and ent_doc.get('expires_date') is not None:
+                try:
+                    ent_exp = normalize_expiry(ent_doc['expires_date'])
+                except Exception:
+                    ent_exp = None
+            ent_status = str(ent_doc.get('status') or '').lower() if isinstance(ent_doc, dict) else ''
+            if ent_doc is None or ent_exp != auth_expiry or ent_status != auth_status:
+                drifts.append({'locket_id': lid, 'target': 'entitlements', 'reason': 'Entitlement projection out of sync with accounts_v2'})
+                if not dry_run:
+                    await db.entitlements.update_one(
+                        {'account_id': lid, 'entitlement_key': 'Gold'},
+                        {
+                            '$set': {
+                                'account_id': lid,
+                                'entitlement_key': 'Gold',
+                                'product_identifier': 'com.locket.gold.yearly',
+                                'status': auth_status,
+                                'expires_date': auth_expiry,
+                                'revoked_at': auth_revoked_at,
+                                'updated_at': now,
+                            }
+                        },
+                        upsert=True,
+                    )
+                    repaired += 1
+
+    return {
+        'dry_run': dry_run,
+        'checked_v2_records': len(v2_map),
+        'drift_count': len(drifts),
+        'repaired_operations': repaired,
+        'drifts': drifts,
+    }
+
+
 async def run_migration_cli(
     dry_run: bool = False,
     backup_path: str | None = None,
@@ -224,6 +341,7 @@ async def run_migration_cli(
     rollback_path: str | None = None,
     rollback_mode: Literal['partial', 'full'] = 'partial',
     confirm_destructive: bool = False,
+    reconcile: bool = False,
 ):
     if verify_backup_path:
         info = verify_backup_file_on_disk(verify_backup_path)
@@ -231,6 +349,10 @@ async def run_migration_cli(
         return info
 
     settings = get_settings()
+    if settings.app_env == 'staging' and settings.mongodb_database.strip() == 'locket_manager' and not dry_run:
+        raise RuntimeError(
+            "Refusing to run write migration/rollback against production database 'locket_manager' when APP_ENV=staging!"
+        )
     client = AsyncMongoClient(
         settings.mongodb_uri.get_secret_value(),
         tz_aware=True,
@@ -239,6 +361,10 @@ async def run_migration_cli(
     try:
         await client.admin.command('ping')
         db = client[settings.mongodb_database]
+        if reconcile:
+            rec_report = await reconcile_collections(db, dry_run=dry_run)
+            print(f"Reconciliation report (dry_run={dry_run}): {json.dumps(rec_report)}")
+            return rec_report
         legacy_count = await db.accounts.count_documents({})
         v2_count_before = await db.accounts_v2.count_documents({})
         print(f"Connected to database '{settings.mongodb_database}'.")
@@ -308,6 +434,11 @@ if __name__ == '__main__':
         action='store_true',
         help='Confirm deleting post-snapshot records when running --rollback with --mode full',
     )
+    parser.add_argument(
+        '--reconcile',
+        action='store_true',
+        help='Detect and repair collection drift across accounts_v2, accounts, and entitlements',
+    )
     args = parser.parse_args()
     is_dry_run = args.dry_run or not (args.apply or args.rollback or args.verify_backup)
     asyncio.run(
@@ -318,5 +449,6 @@ if __name__ == '__main__':
             rollback_path=args.rollback,
             rollback_mode=args.mode,
             confirm_destructive=args.confirm_destructive,
+            reconcile=args.reconcile,
         )
     )
