@@ -193,6 +193,7 @@ def run_single_e2e_pass(pass_idx: int) -> None:
     https_port = find_free_loopback_port()
     http_lab_port = find_free_loopback_port()
     base_http = f"http://127.0.0.1:{http_port}"
+    host_gid = getattr(os, "getgid", lambda: 10001)()
 
     admin_email = "staging-e2e@example.test"
     admin_password = secrets.token_urlsafe(24)
@@ -244,13 +245,13 @@ ENABLE_RESEARCH_PROXY=false
       - {backups_dir.as_posix()}:/mnt/backups
       - {certs_pub_dir.as_posix()}:/mnt/certs_public
       - {certs_priv_dir.as_posix()}:/mnt/certs_private
-    command: ["sh", "-c", "chown -R 10001:10001 /mnt/backups /mnt/certs_public /mnt/certs_private && chmod 0755 /mnt/backups /mnt/certs_public && chmod 0750 /mnt/certs_private"]
+    command: ["sh", "-c", "chown -R 10001:{host_gid} /mnt/backups /mnt/certs_public /mnt/certs_private && chmod 0755 /mnt/backups /mnt/certs_public && chmod 0750 /mnt/certs_private"]
 
   ca_init:
     build:
       context: {ROOT.as_posix()}
     container_name: {ca_cname}
-    user: "10001:10001"
+    user: "10001:{host_gid}"
     volumes:
       - {certs_pub_dir.as_posix()}:/app/certs_public
       - {certs_priv_dir.as_posix()}:/app/certs_private
@@ -640,6 +641,16 @@ volumes:
         print(f"=== [SCENARIO 20] Cleaning up isolated E2E project {project_name} & temporary workspace ===", flush=True)
         subprocess.run(
             compose_base + ["down", "-v"],
+            cwd=ROOT,
+            check=False,
+        )
+        subprocess.run(
+            [
+                "docker", "run", "--rm",
+                "-v", f"{e2e_temp_root.as_posix()}:/mnt/e2e_clean",
+                "alpine:3.20",
+                "sh", "-c", "rm -rf /mnt/e2e_clean/backups /mnt/e2e_clean/certs_public /mnt/e2e_clean/certs_private",
+            ],
             cwd=ROOT,
             check=False,
         )
