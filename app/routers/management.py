@@ -18,15 +18,22 @@ from ..models import (
     DeviceOutput,
     LinkVerifyInput,
     LinkVerifyOutput,
+    ProfileTicketInput,
+    ProfileTicketOutput,
     PublicLookupOutput,
     RevokeAccountInput,
     TestResultInput,
     compute_entitlement_status,
 )
 from ..profile import build_profile, load_validated_root_ca
-from ..security import require_admin
+from ..security import bearer, require_admin
 from ..config import get_settings
-from ..services.device_service import enroll_device, verify_device_token
+from ..services.device_service import (
+    consume_profile_download_ticket,
+    enroll_device,
+    issue_profile_download_ticket,
+    verify_device_token,
+)
 from ..services.entitlement_service import (
     extract_verified_uid_metadata,
     find_canonical_account,
@@ -191,26 +198,73 @@ async def admin_login_default(request: Request):
     return render_page(True, request)
 
 
+@router.post('/api/profile/download-ticket', response_model=ProfileTicketOutput)
+async def create_profile_ticket_from_device_bearer(
+    request: Request,
+    data: ProfileTicketInput | None = None,
+):
+    """
+    Exchange an authenticated device Bearer token (`Authorization: Bearer lkg_dev_*`)
+    for a short-lived, single-use download ticket (`lkg_dl_*`) suitable for Safari `.mobileconfig` download.
+    Never logs raw tokens.
+    """
+    auth_hdr = request.headers.get('authorization', '')
+    scheme, _, raw_token = auth_hdr.partition(' ')
+    if scheme.lower() != 'bearer' or not raw_token.strip().startswith('lkg_dev_'):
+        raise HTTPException(
+            401,
+            'Yêu cầu Authorization: Bearer <device_token> hợp lệ để cấp mã tải một lần.',
+            headers={'WWW-Authenticate': 'Bearer'},
+        )
+    device_doc = await verify_device_token(request, raw_token.strip())
+    if device_doc is None:
+        raise HTTPException(401, 'Device token không hợp lệ hoặc đã bị thu hồi.')
+    eff_mode = data.mode if data is not None else 'scoped_lab'
+    eff_ttl = data.ttl_seconds if data is not None else 300
+    return await issue_profile_download_ticket(request, device_doc=device_doc, mode=eff_mode, ttl_seconds=eff_ttl)
+
+
 @router.get('/profile.mobileconfig')
 async def download_profile(
     request: Request,
     mode: Literal['default', 'dns_only', 'lab_ca', 'scoped_lab'] = Query('default'),
-    device_token: str | None = Query(None, max_length=128),
+    ticket: str | None = Query(None, max_length=128),
 ):
+    # Security Policy (Prompt 11 P1): Long-lived device/Bearer tokens MUST NEVER be passed in URL query parameters!
+    if any(k in request.query_params for k in ('device_token', 'token', 'access_token', 'bearer')):
+        raise HTTPException(
+            400,
+            'Không được truyền device_token hoặc Bearer token dài hạn trên URL. '
+            'Hãy dùng Authorization: Bearer header hoặc mã tải một lần (?ticket=lkg_dl_...).',
+        )
+
     profile_bytes = getattr(request.app.state, 'profile', None)
     if not profile_bytes:
         raise HTTPException(503, 'Cấu hình DNS hoặc chứng chỉ chưa sẵn sàng.')
 
     settings = get_settings()
     eff_mode = mode if isinstance(mode, str) else 'default'
-    eff_token = device_token if isinstance(device_token, str) else None
+    eff_ticket = ticket if isinstance(ticket, str) else None
 
     device_label = None
-    if eff_token:
-        device_doc = await verify_device_token(request, eff_token)
-        if device_doc is None:
-            raise HTTPException(401, 'Device token không hợp lệ hoặc đã bị thu hồi.')
-        device_label = device_doc.get('device_id')
+    if eff_ticket:
+        if eff_ticket.startswith('lkg_dev_'):
+            raise HTTPException(
+                400,
+                'Không được truyền device_token dài hạn vào tham số ticket. Hãy dùng mã tải một lần (lkg_dl_*).',
+            )
+        ticket_doc = await consume_profile_download_ticket(request, eff_ticket)
+        device_label = ticket_doc.get('device_id')
+        if eff_mode == 'default' and ticket_doc.get('mode'):
+            eff_mode = ticket_doc['mode']
+    else:
+        auth_hdr = request.headers.get('authorization', '')
+        scheme, _, raw_cred = auth_hdr.partition(' ')
+        if scheme.lower() == 'bearer' and raw_cred.strip().startswith('lkg_dev_'):
+            device_doc = await verify_device_token(request, raw_cred.strip())
+            if device_doc is None:
+                raise HTTPException(401, 'Device token không hợp lệ hoặc đã bị thu hồi.')
+            device_label = device_doc.get('device_id')
 
     if eff_mode != 'default' or device_label:
         try:
@@ -775,11 +829,43 @@ async def revoke_device_endpoint(
     if not isinstance(doc, dict):
         raise HTTPException(404, 'Device not found')
     now = datetime.now(timezone.utc)
-    await devices.update_one({'device_id': device_id}, {'$set': {'status': 'revoked', 'revoked_at': now}})
+    await devices.update_one(
+        {'device_id': device_id},
+        {'$set': {'status': 'revoked', 'revoked_at': now, 'slot_index': None}},
+    )
     doc['status'] = 'revoked'
     doc['revoked_at'] = now
     await record_audit(request, admin, 'DEVICE_REVOKE', doc.get('locket_id', device_id), {'device_id': device_id})
     return doc
+
+
+@admin_router.post('/devices/{device_id}/profile-ticket', response_model=ProfileTicketOutput)
+async def create_admin_device_profile_ticket(
+    device_id: str,
+    request: Request,
+    admin: Annotated[dict, Depends(require_admin)],
+    data: ProfileTicketInput | None = None,
+):
+    """Admin endpoint to issue a short-lived one-time Safari `.mobileconfig` download ticket for an enrolled device."""
+    devices = getattr(request.app.state, 'devices', None)
+    if devices is None:
+        raise HTTPException(503, 'Device service unavailable')
+    doc = await devices.find_one({'device_id': device_id}, {'_id': 0})
+    if not isinstance(doc, dict):
+        raise HTTPException(404, 'Device not found')
+    if doc.get('status') != 'active':
+        raise HTTPException(409, 'Cannot issue download ticket for a revoked device')
+    eff_mode = data.mode if data is not None else 'scoped_lab'
+    eff_ttl = data.ttl_seconds if data is not None else 300
+    ticket_info = await issue_profile_download_ticket(request, device_doc=doc, mode=eff_mode, ttl_seconds=eff_ttl)
+    await record_audit(
+        request,
+        admin,
+        'DEVICE_PROFILE_TICKET_ISSUE',
+        doc.get('locket_id', device_id),
+        {'device_id': device_id, 'mode': eff_mode},
+    )
+    return ticket_info
 
 
 @admin_router.get('/logs')

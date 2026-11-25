@@ -1,13 +1,14 @@
 """Opt in with TEST_MONGODB_URI; all writes use a disposable, uniquely named database."""
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timedelta, timezone
 import os
 import secrets
-from datetime import datetime, timedelta, timezone
 from uuid import uuid4
 
-import pytest
 from fastapi.testclient import TestClient
 from pymongo import AsyncMongoClient
+import pytest
 
 from app.config import get_settings
 from app.main import create_app
@@ -51,6 +52,7 @@ def test_real_mongodb_accounts_rotation_and_cold_starts(monkeypatch):
             for value in [expiry, expiry + timedelta(days=1)]:
                 result = http.post('/admin/add-account', headers=headers, json={
                     'locket_id': 'internal_user_123', 'expires_date': value.isoformat(),
+                    'max_devices': 2,
                 })
                 assert result.status_code == 200
             rows = http.get('/admin/accounts', headers=headers).json()
@@ -58,9 +60,44 @@ def test_real_mongodb_accounts_rotation_and_cold_starts(monkeypatch):
             response = http.get('/v1/subscribers/internal_user_123', headers=headers)
             assert 'Gold' in response.json()['subscriber']['entitlements']
 
+            # Verify canonical accounts_v2 precedence: revoking in v2 cannot be overridden by active legacy accounts
+            rev_res = http.post('/admin/accounts/internal_user_123/revoke', headers=headers, json={'reason': 'Real Mongo revoke test'})
+            assert rev_res.status_code == 200
+
+            async def force_legacy_active():
+                await http.app.state.accounts.update_one(
+                    {'locket_id': 'internal_user_123'},
+                    {'$set': {'status': 'active', 'is_active': True, 'expires_date': datetime.now(timezone.utc) + timedelta(days=365)}},
+                )
+
+            http.portal.call(force_legacy_active)
+            sub_after_legacy_tamper = http.get('/v1/subscribers/internal_user_123', headers=headers)
+            assert sub_after_legacy_tamper.headers['x-lab-entitlement-status'] == 'revoked'
+            assert sub_after_legacy_tamper.json()['subscriber']['entitlements'] == {}
+
+            # Re-activate and verify concurrent device enrollment strictly respects max_devices=2 on real MongoDB
+            act_res = http.post('/admin/accounts/internal_user_123/activate', headers=headers, json={})
+            assert act_res.status_code == 200
+
+            def try_enroll(idx: int) -> int:
+                r = http.post('/admin/devices', headers=headers, json={
+                    'locket_id': 'internal_user_123',
+                    'device_name': f'iPhone Concurrent {idx}',
+                    'ios_version': '18.2',
+                })
+                return r.status_code
+
+            with ThreadPoolExecutor(max_workers=5) as pool:
+                statuses = list(pool.map(try_enroll, range(5)))
+            assert statuses.count(200) == 2
+            assert statuses.count(409) == 3
+
             async def expire():
+                await http.app.state.accounts_v2.update_one({'locket_id': 'internal_user_123'}, {
+                    '$set': {'expires_date': datetime.now(timezone.utc) - timedelta(seconds=1), 'status': 'expired'},
+                })
                 await http.app.state.accounts.update_one({'locket_id': 'internal_user_123'}, {
-                    '$set': {'expires_date': datetime.now(timezone.utc) - timedelta(seconds=1)},
+                    '$set': {'expires_date': datetime.now(timezone.utc) - timedelta(seconds=1), 'status': 'expired'},
                 })
 
             http.portal.call(expire)

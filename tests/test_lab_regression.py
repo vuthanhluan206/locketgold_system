@@ -314,13 +314,29 @@ def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
         })
         assert dev2_res.status_code == 409
 
-        # 7. Download scoped mobileconfig using device_token
-        mc_res = http.get(f'/profile.mobileconfig?mode=scoped_lab&device_token={device_token}')
+        # 7. Long-lived device_token in query string is rejected (400); exchange for short-lived 1-time ticket
+        bad_url_res = http.get(f'/profile.mobileconfig?mode=scoped_lab&device_token={device_token}')
+        assert bad_url_res.status_code == 400
+
+        tk_res = http.post(
+            '/api/profile/download-ticket',
+            headers={'Authorization': f'Bearer {device_token}'},
+            json={'mode': 'scoped_lab'},
+        )
+        assert tk_res.status_code == 200
+        download_ticket = tk_res.json()['download_ticket']
+        assert download_ticket.startswith('lkg_dl_')
+
+        mc_res = http.get(f'/profile.mobileconfig?mode=scoped_lab&ticket={download_ticket}')
         assert mc_res.status_code == 200
         parsed_mc = plistlib.loads(mc_res.content)
         dns_payload = parsed_mc['PayloadContent'][0]['DNSSettings']
         assert dns_payload['ServerURL'] == f'https://dns.nextdns.io/a8b247/{device_id}'
         assert 'mock.lab.vuthanhluan.bond' in dns_payload['SupplementalMatchDomains']
+
+        # Replaying the single-use download ticket MUST fail with 401
+        replay_res = http.get(f'/profile.mobileconfig?mode=scoped_lab&ticket={download_ticket}')
+        assert replay_res.status_code == 401
 
         # 8. Query subscriber endpoint using device_token -> Active Gold
         sub_res = http.get(

@@ -431,9 +431,10 @@
         <div><span>4.</span> Chỉ bật Certificate Trust khi kiểm thử HTTPS Lab</div>
       </div>
 
-      <a href="/profile.mobileconfig" class="button gold-btn">Tải về cấu hình (.mobileconfig)</a>
+      <a href="/profile.mobileconfig" class="button gold-btn">Tải về cấu hình Lab (DNS + Root CA)</a>
+      <a href="/profile.mobileconfig?mode=dns_only" class="button secondary" style="margin-top:10px;width:100%">Tải cấu hình DNS-Only (Không cài Root CA)</a>
 
-      <p class="note note-spacing">Lưu ý: Cấu hình NextDNS phục vụ nghiên cứu mạng và kiểm thử entitlement trong Lab, không tự động cấp quyền trong ứng dụng Locket chính thức.</p>
+      <p class="note note-spacing">Lưu ý: Chế độ DNS-Only chỉ cấu hình DoH (không cài Root CA). Chế độ Lab (DNS + Root CA) yêu cầu cài đặt thủ công trong Cài đặt iOS và bật Tin cậy chứng chỉ gốc (Certificate Trust Settings) khi kiểm thử HTTPS Lab.</p>
     </section>
     <!-- PUBLIC_END -->
     <!-- ADMIN_START -->
@@ -494,7 +495,8 @@
           <h2 id="adminTitle">Accounts, Identity &amp; Entitlements</h2>
         </div>
         <div class="row">
-          <a class="button secondary" href="/profile.mobileconfig" id="adminDownloadProfile">Download .mobileconfig</a>
+          <a class="button secondary" href="/profile.mobileconfig?mode=dns_only" id="adminDownloadDnsProfile">DNS-Only .mobileconfig</a>
+          <a class="button secondary" href="/profile.mobileconfig" id="adminDownloadProfile">Lab CA .mobileconfig</a>
           <a class="button secondary" href="/profile.mobileconfig?mode=scoped_lab" id="adminDownloadScopedProfile">Scoped Lab Profile</a>
           <button class="secondary" id="openDeviceBtn" type="button">+ Link Device</button>
           <button id="addAccount" type="button" style="width:auto">+ Add / Renew Account</button>
@@ -731,13 +733,23 @@
               }
               const actTd = document.createElement('td');
               if (dev.status === 'active') {
+                const ticketBtn = document.createElement('button');
+                ticketBtn.type = 'button'; ticketBtn.className = 'secondary'; ticketBtn.textContent = '1-Time Profile Link';
+                ticketBtn.onclick = async () => {
+                  try {
+                    const tk = await api('/admin/devices/' + encodeURIComponent(dev.device_id) + '/profile-ticket?mode=scoped_lab', { method: 'POST' });
+                    $('adminMessage').textContent = '1-Time Scoped Profile URL (expires in ' + tk.expires_in + 's): ' + tk.download_url;
+                  } catch (error) {
+                    $('adminMessage').textContent = error.message;
+                  }
+                };
                 const revBtn = document.createElement('button');
                 revBtn.type = 'button'; revBtn.className = 'secondary'; revBtn.textContent = 'Revoke Device';
                 revBtn.onclick = async () => {
                   await api('/admin/devices/' + encodeURIComponent(dev.device_id) + '/revoke', { method: 'POST' });
                   await loadDevicesAndLogs();
                 };
-                actTd.append(revBtn);
+                actTd.append(ticketBtn, revBtn);
               }
               tr.append(actTd); dBody.append(tr);
             }

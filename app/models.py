@@ -192,6 +192,21 @@ class DeviceOutput(BaseModel):
     revoked_at: AwareDatetime | None = None
 
 
+class ProfileTicketInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    mode: Literal['default', 'dns_only', 'lab_ca', 'scoped_lab'] = 'scoped_lab'
+    ttl_seconds: int = Field(default=300, ge=30, le=900)
+
+
+class ProfileTicketOutput(BaseModel):
+    download_ticket: str
+    device_id: str
+    locket_id: str
+    mode: Literal['default', 'dns_only', 'lab_ca', 'scoped_lab']
+    expires_at: AwareDatetime
+    download_url: str
+
+
 class TestResultInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     scenario: str = Field(min_length=1, max_length=128)

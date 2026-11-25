@@ -232,6 +232,7 @@ def inspect_certificate_metadata(cert: x509.Certificate) -> dict:
         'not_valid_after_utc': cert.not_valid_after_utc.isoformat(),
         'sha256_fingerprint': fp,
         'is_ca': bc,
+        'is_self_signed': cert.subject == cert.issuer,
         'key_cert_sign': can_sign,
         'is_currently_valid': cert.not_valid_before_utc <= now < cert.not_valid_after_utc,
         'pem': cert.public_bytes(Encoding.PEM).decode('ascii'),

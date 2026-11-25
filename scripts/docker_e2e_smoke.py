@@ -1,11 +1,13 @@
 """
 Automated 20-Step Docker Runtime End-to-End Verification Suite (`scripts/docker_e2e_smoke.py`).
-Hardened for Prompt 10 (P1 TLS Hostname Verification & P1 Safe Docker E2E Isolation):
+Hardened for Prompt 10 & Prompt 11:
   - Uses minimal directory permissions (`0755` for public/backups, `0700` for private keys)
     and container UID `10001:10001` ownership inside a dedicated temporary E2E workspace.
-  - Uses an isolated Docker Compose project (`locket_e2e_ci`), distinct container names (`locket_e2e_ci_*`),
+  - Uses a unique isolated Docker Compose project (`locket_e2e_<run_id>`), unique container names,
     and dynamically allocated free loopback ports (`find_free_loopback_port()`).
+  - Runs 2 consecutive passes by default to prove zero leftover container/volume/port conflicts.
   - Enforces strict TLS SNI and SAN hostname matching (`check_hostname = True`, `verify_mode = ssl.CERT_REQUIRED`).
+  - Verifies Root CA persistence across restarts, single-use mobileconfig download tickets, and real MongoDB indexes.
 """
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
@@ -14,11 +16,11 @@ import json
 import os
 from pathlib import Path
 import plistlib
+import secrets
 import shutil
 import socket
 import ssl
 import subprocess
-import sys
 import tempfile
 import time
 import urllib.error
@@ -158,9 +160,19 @@ def wait_for_container_healthy(container_name: str, timeout_sec: int = 90) -> No
     raise RuntimeError(f"Container {container_name} did not become healthy in {timeout_sec}s:\n{logs.stdout}\n{logs.stderr}")
 
 
-def main() -> int:
+def run_single_e2e_pass(pass_idx: int) -> None:
+    run_id = f"p{pass_idx}_{secrets.token_hex(3)}"
+    project_name = f"locket_e2e_ci_{run_id}"
+    mongo_cname = f"{project_name}_mongo"
+    chown_cname = f"{project_name}_chown"
+    ca_cname = f"{project_name}_ca_init"
+    api_cname = f"{project_name}_api"
+    https_cname = f"{project_name}_lab_https"
+
+    print(f"\n================ [DOCKER E2E PASS #{pass_idx} | PROJECT {project_name}] ================", flush=True)
+
     # Create an isolated temporary workspace for E2E volumes so we never collide with live staging or use 0777
-    e2e_temp_root = Path(tempfile.mkdtemp(prefix="locket_e2e_vol_"))
+    e2e_temp_root = Path(tempfile.mkdtemp(prefix=f"locket_e2e_{run_id}_"))
     backups_dir = e2e_temp_root / "backups"
     certs_pub_dir = e2e_temp_root / "certs_public"
     certs_priv_dir = e2e_temp_root / "certs_private"
@@ -183,7 +195,7 @@ def main() -> int:
     base_http = f"http://127.0.0.1:{http_port}"
 
     admin_email = "staging-e2e@example.test"
-    admin_password = secrets.token_urlsafe(24) if "secrets" in sys.modules else "StagingE2ePassword!2026"
+    admin_password = secrets.token_urlsafe(24)
     admin_hash = hash_password(admin_password)
 
     env_staging_path = e2e_temp_root / ".env.e2e"
@@ -216,7 +228,7 @@ ENABLE_RESEARCH_PROXY=false
         f"""services:
   mongo_e2e:
     image: mongo:7.0
-    container_name: locket_e2e_ci_mongo
+    container_name: {mongo_cname}
     command: ["mongod", "--quiet", "--logpath", "/dev/null"]
     healthcheck:
       test: ["CMD", "mongosh", "--quiet", "--eval", "db.adminCommand('ping').ok"]
@@ -226,7 +238,7 @@ ENABLE_RESEARCH_PROXY=false
 
   chown_init:
     image: alpine:3.20
-    container_name: locket_e2e_ci_chown
+    container_name: {chown_cname}
     user: "0:0"
     volumes:
       - {backups_dir.as_posix()}:/mnt/backups
@@ -237,7 +249,7 @@ ENABLE_RESEARCH_PROXY=false
   ca_init:
     build:
       context: {ROOT.as_posix()}
-    container_name: locket_e2e_ci_ca_init
+    container_name: {ca_cname}
     user: "10001:10001"
     volumes:
       - {certs_pub_dir.as_posix()}:/app/certs_public
@@ -256,7 +268,7 @@ ENABLE_RESEARCH_PROXY=false
   api:
     build:
       context: {ROOT.as_posix()}
-    container_name: locket_e2e_ci_api
+    container_name: {api_cname}
     env_file:
       - {env_staging_path.as_posix()}
     environment:
@@ -277,29 +289,29 @@ ENABLE_RESEARCH_PROXY=false
 
   lab_https:
     image: caddy:2-alpine
-    container_name: locket_e2e_ci_lab_https
+    container_name: {https_cname}
     ports:
       - "127.0.0.1:{https_port}:8443"
       - "127.0.0.1:{http_lab_port}:8081"
     volumes:
       - {(ROOT / 'Caddyfile.lab').as_posix()}:/etc/caddy/Caddyfile:ro
       - {certs_priv_dir.as_posix()}:/etc/caddy/certs:ro
-      - e2e_ci_caddy_data:/data
-      - e2e_ci_caddy_config:/config
+      - e2e_caddy_data:/data
+      - e2e_caddy_config:/config
     depends_on:
       - api
     mem_limit: 64m
 
 volumes:
-  e2e_ci_caddy_data:
-  e2e_ci_caddy_config:
+  e2e_caddy_data:
+  e2e_caddy_config:
 """,
         encoding="utf-8",
     )
 
     compose_base = [
         "docker", "compose",
-        "-p", "locket_e2e_ci",
+        "-p", project_name,
         "-f", str(compose_e2e_file),
     ]
 
@@ -315,14 +327,21 @@ volumes:
         ca_cert = x509.load_pem_x509_certificate(ca_pem_file.read_bytes())
         expected_ca_fp = inspect_certificate_metadata(ca_cert)["sha256_fingerprint"]
 
+        # Re-run ca_init without --rotate to verify Root CA is NOT overwritten on restart
+        run_cmd(compose_base + ["run", "--rm", "ca_init"])
+        ca_cert_after_rerun = x509.load_pem_x509_certificate(ca_pem_file.read_bytes())
+        assert inspect_certificate_metadata(ca_cert_after_rerun)["sha256_fingerprint"] == expected_ca_fp, (
+            "Root CA fingerprint changed on ca_init rerun without --rotate!"
+        )
+
         print("=== [SCENARIO 1 & 2] Starting isolated MongoDB + API + HTTPS Lab containers & awaiting healthy ===", flush=True)
         run_cmd(compose_base + ["up", "-d", "mongo_e2e", "api", "lab_https"])
-        wait_for_container_healthy("locket_e2e_ci_mongo", timeout_sec=60)
-        wait_for_container_healthy("locket_e2e_ci_api", timeout_sec=60)
+        wait_for_container_healthy(mongo_cname, timeout_sec=60)
+        wait_for_container_healthy(api_cname, timeout_sec=60)
 
         print("=== [SCENARIO 3 & 4] Verifying /api/health and /api/ready ===", flush=True)
         st, _, body = http_req(f"{base_http}/api/health")
-        assert st == 200, f"/api/health returned {st}: {body}"
+        assert st == 200, f"/api/health returned {st}"
         health_json = json.loads(body)
         assert health_json["database"] == "locket_manager_staging"
         assert health_json["nextdns_id"] == "a8b247"
@@ -330,7 +349,7 @@ volumes:
         assert health_json["root_ca_sha256"] == expected_ca_fp
 
         st, _, body = http_req(f"{base_http}/api/ready")
-        assert st == 200, f"/api/ready returned {st}: {body}"
+        assert st == 200, f"/api/ready returned {st}"
         ready_json = json.loads(body)
         assert ready_json["status"] == "ready" and ready_json["mongodb_connected"] is True
 
@@ -340,7 +359,7 @@ volumes:
             method="POST",
             json_body={"email": admin_email, "password": admin_password},
         )
-        assert st == 200, f"Admin login failed ({st}): {body}"
+        assert st == 200, f"Admin login failed ({st})"
         admin_token = json.loads(body)["access_token"]
         admin_headers = {"Authorization": f"Bearer {admin_token}"}
 
@@ -358,7 +377,7 @@ volumes:
                     "max_devices": 1,
                 },
             )
-            assert st == 200, f"Add account {uid} failed ({st}): {body}"
+            assert st == 200, f"Add account {uid} failed ({st})"
 
         print("=== [SCENARIO 7 & 8] Verifying Account Lookup by username and Locket link ===", flush=True)
         st, _, body = http_req(f"{base_http}/api/accounts/lookup?query=e2e_user_1")
@@ -375,18 +394,29 @@ volumes:
         assert adm_lookup["internal_identifier"] == "e2e_user_1"
         assert adm_lookup["verification_status"] == "unverified_handle"
 
-        print("=== [SCENARIO 9] Verifying data persistence directly in MongoDB ===", flush=True)
+        print("=== [SCENARIO 9] Verifying data persistence & mandatory unique indexes directly in MongoDB ===", flush=True)
+        mongo_verify_script = "\n".join([
+            "import asyncio",
+            "from pymongo import AsyncMongoClient",
+            "async def chk():",
+            "    c = AsyncMongoClient('mongodb://mongo_e2e:27017')",
+            "    db = c['locket_manager_staging']",
+            "    d2 = await db.accounts_v2.find_one({'locket_id': 'e2e_user_1'})",
+            "    d1 = await db.accounts.find_one({'locket_id': 'e2e_user_1'})",
+            "    assert d2 is not None and d2.get('locket_id') == 'e2e_user_1', 'Missing accounts_v2 record'",
+            "    assert d1 is not None and d1.get('locket_id') == 'e2e_user_1', 'Missing accounts record'",
+            "    v2_idx = await db.accounts_v2.index_information()",
+            "    dev_idx = await db.devices.index_information()",
+            "    tk_idx = await db.download_tickets.index_information()",
+            "    assert any(i.get('unique') for i in v2_idx.values()), 'Missing unique index on accounts_v2'",
+            "    assert any(i.get('unique') for i in dev_idx.values()), 'Missing unique index on devices'",
+            "    assert any(i.get('unique') for i in tk_idx.values()), 'Missing unique index on download_tickets'",
+            "    await c.close()",
+            "asyncio.run(chk())",
+        ])
         db_check = run_cmd([
-            "docker", "exec", "locket_e2e_ci_api",
-            "python", "-c",
-            "import asyncio; from pymongo import AsyncMongoClient; "
-            "async def chk():\n"
-            "  c = AsyncMongoClient('mongodb://mongo_e2e:27017'); db = c['locket_manager_staging']\n"
-            "  d2 = await db.accounts_v2.find_one({'locket_id': 'e2e_user_1'})\n"
-            "  d1 = await db.accounts.find_one({'locket_id': 'e2e_user_1'})\n"
-            "  assert d2 is not None and d1 is not None\n"
-            "  await c.close()\n"
-            "asyncio.run(chk())"
+            "docker", "exec", api_cname,
+            "python", "-c", mongo_verify_script,
         ])
         assert db_check.returncode == 0
 
@@ -397,7 +427,7 @@ volumes:
             headers=admin_headers,
             json_body={"locket_id": "e2e_user_1", "device_name": "iPhone E2E", "ios_version": "18.2"},
         )
-        assert st == 200, f"Device enroll failed ({st}): {body}"
+        assert st == 200, f"Device enroll failed ({st})"
         dev_info = json.loads(body)
         dev_token = dev_info["device_token"]
         dev_id = dev_info["device_id"]
@@ -443,7 +473,7 @@ volumes:
         st_unauth, _, _ = http_req(f"{base_http}/v1/subscribers/e2e_user_1", headers=dev_headers)
         assert st_unauth == 401
 
-        print("=== [SCENARIO 16] Verifying Mobileconfig modes & STRICT TLS SNI/Hostname Verification against Caddy Lab ===", flush=True)
+        print("=== [SCENARIO 16] Verifying Mobileconfig modes, 1-time download ticket & STRICT TLS SNI/Hostname Verification ===", flush=True)
         # 16a. dns_only
         st_dns, hdrs_dns, body_dns = http_req(f"{base_http}/profile.mobileconfig?mode=dns_only")
         assert st_dns == 200
@@ -453,7 +483,7 @@ volumes:
         assert [p["PayloadType"] for p in plist_dns["PayloadContent"]] == ["com.apple.dnsSettings.managed"]
         assert plist_dns["PayloadContent"][0]["DNSSettings"]["ServerURL"] == "https://mock.lab.vuthanhluan.bond/dns-query"
 
-        # 16b. lab_ca & scoped_lab
+        # 16b. lab_ca & scoped_lab + One-Time Download Ticket Security
         for mode in ("lab_ca", "scoped_lab"):
             st_m, _, body_m = http_req(f"{base_http}/profile.mobileconfig?mode={mode}")
             assert st_m == 200
@@ -465,6 +495,40 @@ volumes:
             assert "mock.lab.vuthanhluan.bond" in pl_m["PayloadContent"][0]["DNSSettings"]["SupplementalMatchDomains"]
             der_cert = x509.load_der_x509_certificate(pl_m["PayloadContent"][1]["PayloadContent"])
             assert inspect_certificate_metadata(der_cert)["sha256_fingerprint"] == expected_ca_fp
+
+        # Enroll device for e2e_user_2 to verify 1-time profile download ticket and URL token rejection
+        st_d2, _, body_d2 = http_req(
+            f"{base_http}/admin/devices",
+            method="POST",
+            headers=admin_headers,
+            json_body={"locket_id": "e2e_user_2", "device_name": "iPhone E2E Ticket", "ios_version": "18.2"},
+        )
+        assert st_d2 == 200
+        d2_info = json.loads(body_d2)
+        d2_token = d2_info["device_token"]
+        d2_id = d2_info["device_id"]
+
+        # Passing long-lived device_token in URL query string MUST be rejected with 400
+        st_bad_q, _, _ = http_req(f"{base_http}/profile.mobileconfig?mode=scoped_lab&device_token={d2_token}")
+        assert st_bad_q == 400, f"Expected 400 when passing device_token in URL query string, got {st_bad_q}"
+
+        # Exchange device_token via Authorization header for a short-lived single-use download ticket
+        st_tk, _, body_tk = http_req(
+            f"{base_http}/api/profile/download-ticket",
+            method="POST",
+            headers={"Authorization": f"Bearer {d2_token}"},
+            json_body={"mode": "scoped_lab"},
+        )
+        assert st_tk == 200
+        dl_ticket = json.loads(body_tk)["download_ticket"]
+        st_dl, _, body_dl = http_req(f"{base_http}/profile.mobileconfig?mode=scoped_lab&ticket={dl_ticket}")
+        assert st_dl == 200
+        pl_dl = plistlib.loads(body_dl)
+        assert pl_dl["PayloadContent"][0]["DNSSettings"]["ServerURL"] == f"https://mock.lab.vuthanhluan.bond/dns-query/{d2_id}"
+
+        # Replaying the single-use ticket MUST return 401
+        st_replay, _, _ = http_req(f"{base_http}/profile.mobileconfig?mode=scoped_lab&ticket={dl_ticket}")
+        assert st_replay == 401, f"Expected 401 on single-use ticket replay, got {st_replay}"
 
         # 16c. Strict TLS SNI & SAN Hostname Verification (`check_hostname=True`, `CERT_REQUIRED`) over Caddy Lab
         for valid_host in ("mock.lab.vuthanhluan.bond", "sub.lab.vuthanhluan.bond", "locketgold.vuthanhluan.bond"):
@@ -490,7 +554,7 @@ volumes:
             rejected_wrong_host = True
         assert rejected_wrong_host is True, "Strict TLS hostname check MUST reject hostname not in Leaf SAN!"
 
-        # 16d. Verify Controlled RFC 8484 DoH Lab endpoint over strict HTTPS Caddy Lab
+        # 16d. Verify Controlled RFC 8484 DoH Lab endpoint (A, AAAA, HTTPS/SVCB, malformed, and REFUSED) over strict HTTPS
         st_doh_ok, _, body_doh_ok, _ = https_req_with_strict_sni_and_hostname_verification(
             "https://mock.lab.vuthanhluan.bond/dns-query?name=mock.lab.vuthanhluan.bond&type=A",
             target_ip="127.0.0.1",
@@ -500,6 +564,25 @@ volumes:
         assert st_doh_ok == 200
         doh_ok_json = json.loads(body_doh_ok)
         assert doh_ok_json["Status"] == 0 and len(doh_ok_json["Answer"]) == 1
+
+        for extra_qtype, expected_num in (("AAAA", 28), ("HTTPS", 65), ("SVCB", 64)):
+            st_q, _, body_q, _ = https_req_with_strict_sni_and_hostname_verification(
+                f"https://mock.lab.vuthanhluan.bond/dns-query?name=mock.lab.vuthanhluan.bond&type={extra_qtype}",
+                target_ip="127.0.0.1",
+                target_port=https_port,
+                ca_pem_path=ca_pem_file,
+            )
+            assert st_q == 200
+            q_json = json.loads(body_q)
+            assert q_json["Status"] == 0 and q_json["Question"][0]["type"] == expected_num
+
+        st_doh_bad, _, _, _ = https_req_with_strict_sni_and_hostname_verification(
+            "https://mock.lab.vuthanhluan.bond/dns-query?dns=!!!not_valid_dns_wireformat!!!",
+            target_ip="127.0.0.1",
+            target_port=https_port,
+            ca_pem_path=ca_pem_file,
+        )
+        assert st_doh_bad == 400
 
         st_doh_ref, _, body_doh_ref, _ = https_req_with_strict_sni_and_hostname_verification(
             "https://mock.lab.vuthanhluan.bond/dns-query?name=api.revenuecat.com&type=A",
@@ -511,18 +594,18 @@ volumes:
         assert json.loads(body_doh_ref)["Status"] == 5  # REFUSED
 
         print("=== [SCENARIO 17] Simulating MongoDB outage & verifying HTTP 503 fail-closed ===", flush=True)
-        run_cmd(["docker", "pause", "locket_e2e_ci_mongo"])
+        run_cmd(["docker", "pause", mongo_cname])
         try:
             st_outage, _, _ = http_req(f"{base_http}/api/ready", timeout=8.0)
             assert st_outage == 503, f"Expected 503 during DB outage, got {st_outage}"
         finally:
-            run_cmd(["docker", "unpause", "locket_e2e_ci_mongo"])
+            run_cmd(["docker", "unpause", mongo_cname])
         st_rec, _, _ = http_req(f"{base_http}/api/ready", timeout=8.0)
         assert st_rec == 200
 
         print("=== [SCENARIO 18] Restarting API container & verifying persistence ===", flush=True)
-        run_cmd(["docker", "restart", "locket_e2e_ci_api"])
-        wait_for_container_healthy("locket_e2e_ci_api", timeout_sec=60)
+        run_cmd(["docker", "restart", api_cname])
+        wait_for_container_healthy(api_cname, timeout_sec=60)
         st_post_restart, _, body_post_restart = http_req(f"{base_http}/api/accounts/lookup?query=e2e_user_2")
         assert st_post_restart == 200 and json.loads(body_post_restart) == {"exists": True}
 
@@ -552,16 +635,22 @@ volumes:
         st_restored, _, body_restored = http_req(f"{base_http}/api/accounts/lookup?query=e2e_user_2")
         assert st_restored == 200 and json.loads(body_restored) == {"exists": True}
 
-        print("=== [ALL 20 DOCKER E2E SCENARIOS PASSED WITH STRICT TLS HOSTNAME VERIFICATION] ===", flush=True)
-        return 0
+        print(f"=== [PASS #{pass_idx}: ALL 20 DOCKER E2E SCENARIOS SUCCEEDED] ===", flush=True)
     finally:
-        print("=== [SCENARIO 20] Cleaning up isolated E2E test containers & temporary workspace ===", flush=True)
+        print(f"=== [SCENARIO 20] Cleaning up isolated E2E project {project_name} & temporary workspace ===", flush=True)
         subprocess.run(
             compose_base + ["down", "-v"],
             cwd=ROOT,
             check=False,
         )
         shutil.rmtree(e2e_temp_root, ignore_errors=True)
+
+
+def main() -> int:
+    for pass_idx in (1, 2):
+        run_single_e2e_pass(pass_idx)
+    print("\n=== [BOTH CONSECUTIVE 20-STEP DOCKER E2E PASSES SUCCEEDED WITH ZERO RESOURCE CONFLICTS] ===", flush=True)
+    return 0
 
 
 if __name__ == "__main__":

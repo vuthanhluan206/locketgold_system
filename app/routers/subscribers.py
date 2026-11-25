@@ -187,23 +187,33 @@ async def doh_get_query(
 
     if name is not None:
         qname = name.strip().lower().rstrip('.')
+        if not qname or len(qname) > 253 or any(ch in qname for ch in (' ', '/', '\\', '\x00', '?')):
+            raise HTTPException(400, 'Malformed DNS query name')
+        qtype_upper = type.strip().upper()
+        type_map = {
+            'A': 1, '1': 1,
+            'AAAA': 28, '28': 28,
+            'CNAME': 5, '5': 5,
+            'TXT': 16, '16': 16,
+            'SVCB': 64, '64': 64,
+            'HTTPS': 65, '65': 65,
+        }
+        if qtype_upper not in type_map:
+            raise HTTPException(400, 'Unsupported or malformed DNS query type')
+        qtype_num = type_map[qtype_upper]
         allowed_set = {d.strip().lower().rstrip('.') for d in settings.lab_scoped_domains if d.strip()}
         if qname not in allowed_set:
             return JSONResponse(
                 status_code=200,
-                content={'Status': 5, 'Comment': 'REFUSED: Domain outside controlled Research Lab scope', 'Question': [{'name': qname, 'type': 1}], 'Answer': []},
+                content={'Status': 5, 'Comment': 'REFUSED: Domain outside controlled Research Lab scope', 'Question': [{'name': qname, 'type': qtype_num}], 'Answer': []},
             )
-        qtype_upper = type.strip().upper()
         target_v6 = getattr(settings, 'lab_dns_target_ipv6', '').strip()
-        if qtype_upper in {'A', '1'}:
+        if qtype_num == 1:
             answers = [{'name': qname, 'type': 1, 'TTL': 60, 'data': settings.lab_dns_target_ip}]
-            qtype_num = 1
-        elif qtype_upper in {'AAAA', '28'} and target_v6:
+        elif qtype_num == 28 and target_v6:
             answers = [{'name': qname, 'type': 28, 'TTL': 60, 'data': target_v6}]
-            qtype_num = 28
         else:
             answers = []
-            qtype_num = 28 if qtype_upper in {'AAAA', '28'} else 65
         return JSONResponse(
             status_code=200,
             content={

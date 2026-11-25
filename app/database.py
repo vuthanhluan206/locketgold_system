@@ -199,25 +199,27 @@ async def lifespan(app: FastAPI):
         app.state.lab_requests = getattr(db, 'lab_requests', None)
         app.state.test_results = getattr(db, 'test_results', None)
         app.state.profile_versions = getattr(db, 'profile_versions', None)
+        app.state.download_tickets = getattr(db, 'download_tickets', None)
 
+        # Mandatory unique & TTL indexes for canonical v2 collections (never silently ignore failures!)
         for col_name, idx_spec, idx_kwargs in [
             ('accounts_v2', 'locket_id', {'unique': True}),
             ('accounts_v2', 'username', {'sparse': True}),
             ('accounts_v2', 'firebase_uid', {'sparse': True}),
             ('devices', 'device_id', {'unique': True}),
             ('devices', 'token_hash', {'unique': True}),
+            ('devices', [('locket_id', 1), ('slot_index', 1)], {'unique': True, 'sparse': True}),
             ('entitlements', [('account_id', 1), ('entitlement_key', 1)], {'unique': True}),
+            ('download_tickets', 'ticket_hash', {'unique': True}),
+            ('download_tickets', 'expires_at', {'expireAfterSeconds': 0}),
             ('audit', [('timestamp', -1)], {}),
             ('lab_requests', 'timestamp', {'expireAfterSeconds': 604800}),
         ]:
             col = getattr(db, col_name, None)
             if col is not None and hasattr(col, 'create_index'):
-                try:
-                    res = col.create_index(idx_spec, **idx_kwargs)
-                    if asyncio.iscoroutine(res):
-                        await res
-                except Exception:
-                    pass
+                res = col.create_index(idx_spec, **idx_kwargs)
+                if asyncio.iscoroutine(res):
+                    await res
 
         await db.admins.update_one(
             {'_id': 'superadmin'},

@@ -9,6 +9,7 @@ Usage:
 import argparse
 import os
 from pathlib import Path
+from cryptography import x509
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.serialization import Encoding
 from app.services.pki_service import (
@@ -33,6 +34,8 @@ def generate_ca_and_leaf_files(
     out_public: Path,
     out_private: Path,
     domains: list[str],
+    *,
+    rotate: bool = False,
 ) -> dict:
     for d in domains:
         clean_d = d.strip().lower()
@@ -46,18 +49,42 @@ def generate_ca_and_leaf_files(
     out_public.mkdir(parents=True, exist_ok=True)
     out_private.mkdir(parents=True, exist_ok=True)
 
-    ca_key, ca_cert = generate_lab_root_ca()
     ca_key_path = out_private / 'lab_root_ca.key'
     ca_pem_public_path = out_public / 'lab_root_ca.pem'
     ca_der_public_path = out_public / 'lab_root_ca.cer'
     ca_pem_private_copy = out_private / 'lab_root_ca.pem'
 
-    ca_key_bytes = ca_key.private_bytes(
-        encoding=Encoding.PEM,
-        format=serialization.PrivateFormat.PKCS8,
-        encryption_algorithm=serialization.NoEncryption(),
-    )
-    ca_key_path.write_bytes(ca_key_bytes)
+    ca_key = None
+    ca_cert = None
+    ca_reused = False
+
+    if not rotate and ca_key_path.is_file() and ca_pem_public_path.is_file():
+        try:
+            loaded_key = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
+            loaded_cert = x509.load_pem_x509_certificate(ca_pem_public_path.read_bytes())
+            existing_meta = inspect_certificate_metadata(loaded_cert)
+            if (
+                existing_meta.get('is_currently_valid')
+                and existing_meta.get('is_ca')
+                and existing_meta.get('is_self_signed')
+            ):
+                ca_key = loaded_key
+                ca_cert = loaded_cert
+                ca_reused = True
+        except Exception:
+            ca_key = None
+            ca_cert = None
+            ca_reused = False
+
+    if ca_key is None or ca_cert is None:
+        ca_key, ca_cert = generate_lab_root_ca()
+        ca_key_bytes = ca_key.private_bytes(
+            encoding=Encoding.PEM,
+            format=serialization.PrivateFormat.PKCS8,
+            encryption_algorithm=serialization.NoEncryption(),
+        )
+        ca_key_path.write_bytes(ca_key_bytes)
+
     try:
         os.chmod(ca_key_path, 0o600)
     except OSError:
@@ -65,9 +92,12 @@ def generate_ca_and_leaf_files(
 
     ca_pem_bytes = ca_cert.public_bytes(Encoding.PEM)
     ca_der_bytes = ca_cert.public_bytes(Encoding.DER)
-    ca_pem_public_path.write_bytes(ca_pem_bytes)
-    ca_der_public_path.write_bytes(ca_der_bytes)
-    ca_pem_private_copy.write_bytes(ca_pem_bytes)
+    if not ca_reused or not ca_pem_public_path.is_file():
+        ca_pem_public_path.write_bytes(ca_pem_bytes)
+    if not ca_der_public_path.is_file() or not ca_reused:
+        ca_der_public_path.write_bytes(ca_der_bytes)
+    if not ca_pem_private_copy.is_file() or not ca_reused:
+        ca_pem_private_copy.write_bytes(ca_pem_bytes)
     for pub_file in (ca_pem_public_path, ca_der_public_path, ca_pem_private_copy):
         try:
             os.chmod(pub_file, 0o644)
@@ -87,7 +117,7 @@ def generate_ca_and_leaf_files(
         )
     )
     try:
-        # 0o644 inside the 0700 certs_private directory allows non-root Caddy container to read the leaf key
+        # 0o644 inside the 0700/0750 certs_private directory allows non-root Caddy container to read the leaf key
         # while ca_key_path remains 0o600 (owner-only).
         os.chmod(leaf_key_path, 0o644)
     except OSError:
@@ -104,6 +134,7 @@ def generate_ca_and_leaf_files(
     meta = inspect_certificate_metadata(ca_cert)
     return {
         'ca_metadata': meta,
+        'ca_reused': ca_reused,
         'ca_key_path': str(ca_key_path),
         'ca_pem_public_path': str(ca_pem_public_path),
         'ca_der_public_path': str(ca_der_public_path),
@@ -135,6 +166,11 @@ def main(argv: list[str] | None = None) -> dict:
         default='locketgold.vuthanhluan.bond,mock.lab.vuthanhluan.bond,sub.lab.vuthanhluan.bond',
         help='Comma-separated SAN domains for the lab leaf certificate (must be controlled lab domains only)',
     )
+    parser.add_argument(
+        '--rotate',
+        action='store_true',
+        help='Explicitly rotate and overwrite an existing Root CA key and certificate',
+    )
     args = parser.parse_args(argv)
 
     if args.out_dir and not args.out_public and not args.out_private:
@@ -145,9 +181,10 @@ def main(argv: list[str] | None = None) -> dict:
         out_private = Path(args.out_private or 'certs_private').resolve()
 
     domains = [d.strip() for d in args.domains.split(',') if d.strip()]
-    result = generate_ca_and_leaf_files(out_public, out_private, domains)
+    result = generate_ca_and_leaf_files(out_public, out_private, domains, rotate=bool(args.rotate))
     meta = result['ca_metadata']
-    print("=== Research Lab Root CA & Leaf Generated ===")
+    action_label = "Reused Existing Root CA & Signed Leaf" if result.get('ca_reused') else "Generated New Root CA & Leaf"
+    print(f"=== Research Lab PKI ({action_label}) ===")
     print("Subject:", meta['subject'])
     print("SHA-256 Fingerprint:", meta['sha256_fingerprint'])
     print("Valid:", meta['not_valid_before_utc'], "->", meta['not_valid_after_utc'])
