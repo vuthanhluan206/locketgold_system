@@ -3,14 +3,20 @@ import os
 import re
 from functools import lru_cache
 from ipaddress import ip_network
-from typing import Annotated, Any
+from typing import Annotated, Any, Literal
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
 from .passwords import validate_password_hash
 
+PRODUCTION_DATABASE_NAME = 'locket_manager'
+
 
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(env_file='.env', extra='ignore', hide_input_in_errors=True)
+    app_env: Literal['production', 'staging', 'development', 'test'] = Field(
+        default='production',
+        validation_alias=AliasChoices('app_env', 'APP_ENV'),
+    )
     superadmin_email: str = Field(
         min_length=3,
         max_length=254,
@@ -30,6 +36,8 @@ class Settings(BaseSettings):
     )
     mongodb_database: str = 'locket_manager'
     nextdns_id: str = Field(default='', pattern=r'^([a-fA-F0-9]{6})?$')
+    doh_server_url: str = Field(default='', max_length=256)
+    lab_dns_target_ip: str = Field(default='127.0.0.1', max_length=64)
     root_ca_path: str = ''
     root_ca_pem: str = Field(default='', max_length=65536, repr=False)
     lab_domain: str = Field(default='locketgold.vuthanhluan.bond', max_length=253)
@@ -100,6 +108,11 @@ class Settings(BaseSettings):
 
     @model_validator(mode='after')
     def deployment_hosts(self):
+        if self.app_env == 'staging' and self.mongodb_database.strip() == PRODUCTION_DATABASE_NAME:
+            raise ValueError(
+                f"Staging environment (APP_ENV=staging) is strictly forbidden from using production database "
+                f"'{PRODUCTION_DATABASE_NAME}'. Set MONGODB_DATABASE=locket_manager_staging."
+            )
         if self.vercel == '1':
             for host in (self.vercel_url, self.vercel_branch_url):
                 if host:
@@ -130,6 +143,31 @@ class Settings(BaseSettings):
         for network in cidrs:
             ip_network(network)
         return cidrs
+
+    @field_validator('doh_server_url')
+    @classmethod
+    def validate_doh_url(cls, value: str) -> str:
+        raw = (value or '').strip()
+        if not raw:
+            return ''
+        from urllib.parse import urlparse
+        parsed = urlparse(raw)
+        if parsed.scheme != 'https':
+            raise ValueError('DOH_SERVER_URL must use https:// scheme')
+        host = (parsed.hostname or '').lower()
+        if not host or not re.fullmatch(r'[a-z0-9.\-\[\]:]+', host):
+            raise ValueError('DOH_SERVER_URL must contain a valid hostname')
+        if parsed.username or parsed.password or '?' in raw or '#' in raw:
+            raise ValueError('DOH_SERVER_URL must not contain credentials, query strings, or fragments')
+        forbidden_unverified_doh = {
+            'dns.nodns.vn',
+            'api.revenuecat.com',
+            'revenuecat.com',
+            'api.locketcamera.com',
+        }
+        if host in forbidden_unverified_doh or any(host.endswith('.' + fb) for fb in forbidden_unverified_doh):
+            raise ValueError(f"Unverified third-party DoH endpoint '{host}' is prohibited in DOH_SERVER_URL")
+        return raw
 
     @field_validator('lab_scoped_domains', mode='before')
     @classmethod

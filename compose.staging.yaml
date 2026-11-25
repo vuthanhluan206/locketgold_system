@@ -2,26 +2,28 @@
 # Designed to run safely in parallel on the Ubuntu VPS (103.118.29.159) WHILE the old
 # `locket.gold` Caddy container is still occupying ports 80 and 443.
 #
-# Usage (Core Staging API + MongoDB Readiness Check — NO optional Lab CA required):
-#   docker compose -p locket_staging -f compose.staging.yaml up -d --build
-#   curl -fsS http://127.0.0.1:18000/api/health
-#   curl -fsS http://127.0.0.1:18000/api/ready
-#
-# Usage with optional HTTPS Research Lab listener (after running `python -m scripts.generate_lab_ca`):
-#   docker compose -p locket_staging -f compose.staging.yaml --profile lab up -d
-#
-# Note: Never binds ports 80 or 443, and uses isolated container names (`locket_staging_*`).
+# Key Security & Isolation Properties:
+# 1. Uses `.env.staging` (override via `STAGING_ENV_FILE`), NEVER `.env` production.
+# 2. Enforces `APP_ENV=staging`, which refuses to boot if `MONGODB_DATABASE=locket_manager` (production).
+# 3. Core Staging (`api`) binds strictly to loopback `127.0.0.1:18000:8000` (never exposed to Internet).
+# 4. API mounts `./certs_public:/app/certs_public:ro` (read-only public CA; NEVER mounts `certs_private`)
+#    and `./backups:/app/backups` (writable by UID 10001).
+# 5. Optional HTTPS Research Lab (`lab_https`) runs under `--profile lab` on `127.0.0.1:18443:8443`,
+#    mounting `./certs_private:/etc/caddy/certs:ro` after certificates are generated via one-shot `ca_init`.
 
 services:
   api:
     build: .
     container_name: locket_staging_api
     env_file:
-      - .env
+      - ${STAGING_ENV_FILE:-.env.staging}
+    environment:
+      - APP_ENV=staging
     ports:
       - "127.0.0.1:18000:8000"
     volumes:
       - ./backups:/app/backups
+      - ./certs_public:/app/certs_public:ro
     mem_limit: 256m
     restart: unless-stopped
     healthcheck:
@@ -34,6 +36,26 @@ services:
       options:
         max-size: "5m"
         max-file: "2"
+
+  ca_init:
+    build: .
+    container_name: locket_staging_ca_init
+    profiles:
+      - ca_init
+    user: "10001:10001"
+    volumes:
+      - ./certs_public:/app/certs_public
+      - ./certs_private:/app/certs_private
+    command:
+      - python
+      - -m
+      - scripts.generate_lab_ca
+      - --out-public
+      - /app/certs_public
+      - --out-private
+      - /app/certs_private
+      - --domains
+      - locketgold.vuthanhluan.bond,mock.lab.vuthanhluan.bond,sub.lab.vuthanhluan.bond
 
   lab_https:
     image: caddy:2-alpine

@@ -68,6 +68,11 @@ def generate_ca_and_leaf_files(
     ca_pem_public_path.write_bytes(ca_pem_bytes)
     ca_der_public_path.write_bytes(ca_der_bytes)
     ca_pem_private_copy.write_bytes(ca_pem_bytes)
+    for pub_file in (ca_pem_public_path, ca_der_public_path, ca_pem_private_copy):
+        try:
+            os.chmod(pub_file, 0o644)
+        except OSError:
+            pass
 
     leaf_key, leaf_cert = generate_lab_leaf_certificate(ca_key, ca_cert, domains)
     leaf_key_path = out_private / 'lab_leaf.key'
@@ -82,12 +87,19 @@ def generate_ca_and_leaf_files(
         )
     )
     try:
-        os.chmod(leaf_key_path, 0o600)
+        # 0o644 inside the 0700 certs_private directory allows non-root Caddy container to read the leaf key
+        # while ca_key_path remains 0o600 (owner-only).
+        os.chmod(leaf_key_path, 0o644)
     except OSError:
         pass
     leaf_pem_bytes = leaf_cert.public_bytes(Encoding.PEM)
     leaf_pem_path.write_bytes(leaf_pem_bytes)
     leaf_pub_pem_path.write_bytes(leaf_pem_bytes)
+    for lp in (leaf_pem_path, leaf_pub_pem_path):
+        try:
+            os.chmod(lp, 0o644)
+        except OSError:
+            pass
 
     meta = inspect_certificate_metadata(ca_cert)
     return {

@@ -58,6 +58,33 @@ def load_validated_root_ca(settings: Settings) -> x509.Certificate | None:
     return cert
 
 
+def resolve_doh_server_url(settings: Settings, *, device_label: str | None = None) -> str:
+    """
+    Resolve the DNS-over-HTTPS ServerURL supporting two modes:
+    - Mode B (Custom DoH Lab): Uses `settings.doh_server_url` when configured (validated HTTPS endpoint
+      under operator control, e.g. `https://mock.lab.vuthanhluan.bond/dns-query`).
+    - Mode A (NextDNS): Uses `https://dns.nextdns.io/<nextdns_id>[/<device_label>]`.
+    Never accepts arbitrary URLs from end-user request parameters.
+    """
+    custom_doh = (getattr(settings, 'doh_server_url', '') or '').strip()
+    if custom_doh:
+        base_url = custom_doh.rstrip('/')
+        if device_label:
+            safe_label = ''.join(c for c in device_label if c.isalnum() or c in {'-', '_'})[:32]
+            if safe_label and not base_url.endswith('/' + safe_label):
+                return f'{base_url}/{safe_label}'
+        return base_url
+
+    if not settings.nextdns_id:
+        raise HTTPException(503, 'Chưa cấu hình NEXTDNS_ID hoặc DOH_SERVER_URL trên server.')
+    server_url = f'https://dns.nextdns.io/{settings.nextdns_id}'
+    if device_label:
+        safe_label = ''.join(c for c in device_label if c.isalnum() or c in {'-', '_'})[:32]
+        if safe_label:
+            server_url = f'{server_url}/{safe_label}'
+    return server_url
+
+
 def build_profile(
     settings: Settings,
     *,
@@ -65,14 +92,8 @@ def build_profile(
     device_label: str | None = None,
     override_ca_cert: x509.Certificate | None = None,
 ) -> bytes:
-    if not settings.nextdns_id:
-        raise HTTPException(503, 'Chưa cấu hình NEXTDNS_ID trên server.')
-    dns = payload('com.apple.dnsSettings.managed', 'NextDNS')
-    server_url = f'https://dns.nextdns.io/{settings.nextdns_id}'
-    if device_label:
-        safe_label = ''.join(c for c in device_label if c.isalnum() or c in {'-', '_'})[:32]
-        if safe_label:
-            server_url = f'{server_url}/{safe_label}'
+    server_url = resolve_doh_server_url(settings, device_label=device_label)
+    dns = payload('com.apple.dnsSettings.managed', 'NextDNS' if not getattr(settings, 'doh_server_url', '') else 'Locket Gold DoH Lab')
     dns_settings: dict = {
         'DNSProtocol': 'HTTPS',
         'ServerURL': server_url,
