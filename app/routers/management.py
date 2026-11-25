@@ -23,10 +23,9 @@ from ..models import (
     PublicLookupOutput,
     RevokeAccountInput,
     TestResultInput,
-    compute_entitlement_status,
 )
 from ..profile import build_profile, load_validated_root_ca
-from ..security import bearer, require_admin
+from ..security import require_admin
 from ..config import get_settings
 from ..services.device_service import (
     consume_profile_download_ticket,
@@ -41,12 +40,7 @@ from ..services.entitlement_service import (
     merge_canonical_and_legacy_account,
 )
 from ..services.identity_service import normalize_lookup_query, verify_account_link_or_identifier
-from ..services.pki_service import (
-    generate_lab_leaf_certificate,
-    generate_lab_root_ca,
-    inspect_certificate_metadata,
-    verify_certificate_chain_and_hostname,
-)
+from ..services.pki_service import inspect_certificate_metadata
 
 router = APIRouter()
 WEB = Path(__file__).resolve().parent.parent.parent / 'web'

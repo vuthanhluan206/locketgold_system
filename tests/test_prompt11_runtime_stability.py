@@ -28,11 +28,7 @@ from app.main import create_app
 from app.models import DeviceCreateInput
 from app.passwords import hash_password
 from app.profile import build_profile
-from app.services.device_service import (
-    consume_profile_download_ticket,
-    enroll_device,
-    issue_profile_download_ticket,
-)
+from app.services.device_service import enroll_device
 from app.services.doh_service import (
     TYPE_A,
     TYPE_AAAA,

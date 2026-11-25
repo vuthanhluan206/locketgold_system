@@ -14,8 +14,8 @@ from pymongo.errors import PyMongoError
 from app.config import Settings, get_settings
 from app.database import get_accounts, lifespan
 from app.main import create_app
-from app.middleware import RateLimiter, SecurityMiddleware
-from app.models import AccountInput, subscriber_response
+from app.middleware import RateLimiter
+from app.models import subscriber_response
 from app.passwords import hash_password, verify_password
 from app.profile import build_profile
 from app.security import token_digest

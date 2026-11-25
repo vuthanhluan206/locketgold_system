@@ -1,4 +1,5 @@
 .git
+.github
 .env
 .env.*
 .venv
@@ -11,6 +12,11 @@ __pycache__
 *.p12
 *.pfx
 *.zip
+*.rar
 *.log
+*.md
+backups
+certs_public
+certs_private
 tests
 SOURCE.md

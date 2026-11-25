@@ -15,7 +15,6 @@ from .models import subscriber_response
 from .routers.management import download_profile
 from .security import token_digest
 from .services.entitlement_service import find_canonical_account
-from .services.lab_inspector_service import redact_headers
 
 router = APIRouter(prefix="/proxy", tags=["Locket Proxy"])
 
@@ -63,18 +62,16 @@ def _forward_upstream(url: str, body: bytes | None, headers: dict[str, str], met
 
 
 def _extract_locket_id(path: str, data: dict) -> str:
-    sub = data.get('subscriber')
-    if isinstance(sub, dict) and isinstance(sub.get('original_app_user_id'), str) and sub['original_app_user_id']:
-        return sub['original_app_user_id']
+    if isinstance(data, dict):
+        sub = data.get('subscriber')
+        if isinstance(sub, dict) and isinstance(sub.get('original_app_user_id'), str) and sub['original_app_user_id']:
+            return sub['original_app_user_id']
     parts = [p for p in path.split("/") if p]
     if "subscribers" in parts:
         idx = parts.index("subscribers")
         if idx + 1 < len(parts):
             return parts[idx + 1]
     if isinstance(data, dict):
-        sub = data.get("subscriber")
-        if isinstance(sub, dict) and sub.get("original_app_user_id"):
-            return str(sub["original_app_user_id"])
         for key in ("locket_id", "uid", "user_id", "id"):
             if isinstance(data.get(key), str) and data[key]:
                 return data[key]

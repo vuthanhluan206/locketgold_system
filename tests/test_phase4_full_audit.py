@@ -1,16 +1,14 @@
 import asyncio
-import json
 import py_compile
 import secrets
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
 from fastapi.testclient import TestClient
 
 from app.config import get_settings
-from app.database import get_accounts, sync_legacy_accounts_to_v2
+from app.database import sync_legacy_accounts_to_v2
 from app.main import create_app
 from app.models import compute_entitlement_status, subscriber_response
 from app.passwords import hash_password
