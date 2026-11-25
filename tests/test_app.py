@@ -99,7 +99,8 @@ def test_views_and_csp(client):
     public = http.get('/')
     assert public.status_code == 200
     assert 'id="loginForm"' not in public.text and 'id="accountForm"' not in public.text
-    assert '<script' not in public.text
+    assert 'id="lookupForm"' in public.text and 'id="lookupDialog"' in public.text
+    assert '__NONCE__' not in public.text
     assert 'href="/profile.mobileconfig"' in public.text
     admin = http.get('/admin')
     assert 'loginForm' in admin.text and 'accountForm' in admin.text

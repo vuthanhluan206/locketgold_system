@@ -9,7 +9,8 @@ from .config import Settings
 
 
 def payload(kind: str, name: str) -> dict:
-    identifier = 'local.license-manager.' + name.lower().replace(' ', '-')
+    slug = name.lower().replace(' ', '-')
+    identifier = f'bond.vuthanhluan.locketgold.{slug}'
     return {
         'PayloadType': kind,
         'PayloadVersion': 1,
@@ -27,7 +28,10 @@ def load_validated_root_ca(settings: Settings) -> x509.Certificate | None:
     if settings.root_ca_pem:
         raw = settings.root_ca_pem.replace('\\n', '\n').strip().encode('utf-8')
     else:
-        path = Path(settings.root_ca_path).resolve(strict=True)
+        try:
+            path = Path(settings.root_ca_path).resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError('ROOT_CA_PATH must be an existing certificate file') from exc
         if not path.is_file():
             raise ValueError('ROOT_CA_PATH must be a certificate file')
         with path.open('rb') as certificate_file:
@@ -93,11 +97,16 @@ def build_profile(
     override_ca_cert: x509.Certificate | None = None,
 ) -> bytes:
     server_url = resolve_doh_server_url(settings, device_label=device_label)
-    dns = payload('com.apple.dnsSettings.managed', 'NextDNS' if not getattr(settings, 'doh_server_url', '') else 'Locket Gold DoH Lab')
+    has_custom_doh = bool((getattr(settings, 'doh_server_url', '') or '').strip())
+    dns = payload('com.apple.dnsSettings.managed', 'Locket Gold DNS')
     dns_settings: dict = {
         'DNSProtocol': 'HTTPS',
         'ServerURL': server_url,
     }
+    # ServerAddresses is only included when using a custom DoH server with verified IP addresses (never for NextDNS)
+    doh_addrs = getattr(settings, 'doh_server_addresses', None) or []
+    if has_custom_doh and doh_addrs:
+        dns_settings['ServerAddresses'] = [str(a) for a in doh_addrs if a]
     if scoped_domains:
         dns_settings['SupplementalMatchDomains'] = [d for d in scoped_domains if d]
     dns['DNSSettings'] = dns_settings
@@ -105,21 +114,24 @@ def build_profile(
 
     cert = override_ca_cert if override_ca_cert is not None else load_validated_root_ca(settings)
     if cert is not None:
-        ca = payload('com.apple.security.root', 'Root CA')
-        ca['PayloadCertificateFileName'] = 'root-ca.cer'
+        ca = payload('com.apple.security.root', 'Locket Gold Root CA')
+        ca['PayloadCertificateFileName'] = 'LocketGoldCA.cer'
         ca['PayloadContent'] = cert.public_bytes(Encoding.DER)
         contents.append(ca)
 
-    profile = payload('Configuration', 'Locket Gold DNS')
+    profile = payload('Configuration', 'Locket Gold')
     has_ca = any(item.get('PayloadType') == 'com.apple.security.root' for item in contents)
+    org_domain = (getattr(settings, 'lab_domain', '') or '').strip() or 'vuthanhluan.bond'
     profile.update(
         PayloadContent=contents,
+        PayloadOrganization=org_domain,
         PayloadRemovalDisallowed=False,
         PayloadScope='System',
         PayloadDescription=(
-            'Cấu hình NextDNS + Research Lab Root CA (chỉ dành cho môi trường Lab thử nghiệm).'
+            f'Cấu hình Locket Gold ({org_domain}). Sau khi cài đặt, vào Cài đặt chung → Giới thiệu → '
+            'Cài đặt tin cậy chứng nhận → Bật Locket Gold Root CA.'
             if has_ca
-            else 'Cấu hình NextDNS. Không tự cấp quyền trong ứng dụng Locket.'
+            else f'Cấu hình NextDNS ({org_domain}). Không tự cấp quyền trong ứng dụng Locket.'
         ),
     )
     xml_bytes = plistlib.dumps(profile, fmt=plistlib.FMT_XML)

@@ -428,7 +428,7 @@ def test_doh_wireformat_and_json_queries_a_aaaa_https_svcb_malformed_and_refused
 
 
 def test_iphone_web_ui_distinguishes_dns_only_and_lab_ca(monkeypatch):
-    """P2 iPhone Web UI: Verify public and admin views expose both DNS-only and Lab CA mobileconfig download buttons."""
+    """Prompt 14 Section 3 & Test #15: Verify restored UI matches exact locketgoldmanager HTML/CSS structure without extra Lab UI clutter."""
     password = secrets.token_urlsafe(20)
     encoded = hash_password(password)
     monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
@@ -446,14 +446,32 @@ def test_iphone_web_ui_distinguishes_dns_only_and_lab_ca(monkeypatch):
     try:
         pub = http.get('/')
         assert pub.status_code == 200
+        assert 'Locket Gold Premium' in pub.text
+        assert 'id="lookupForm"' in pub.text
+        assert 'id="locketAccount"' in pub.text
+        assert 'id="lookupBtn"' in pub.text
+        assert 'id="lookupDialog"' in pub.text
+        assert 'id="downloadResult"' in pub.text
+        assert 'id="installBtn"' in pub.text
         assert 'href="/profile.mobileconfig"' in pub.text
-        assert 'href="/profile.mobileconfig?mode=dns_only"' in pub.text
+        assert 'class="developer-credit"' in pub.text
+        # Must NOT contain hardcoded sample Base64 certificate or extra technical Lab UI panels
+        assert 'MIIFVDCCAzygAwIBAgIU' not in pub.text
+        assert 'id="devicesBody"' not in pub.text
+        assert 'id="labClientForm"' not in pub.text
 
         adm = http.get('/admin')
         assert adm.status_code == 200
-        assert 'href="/profile.mobileconfig?mode=dns_only"' in adm.text
-        assert 'href="/profile.mobileconfig?mode=scoped_lab"' in adm.text
-        assert '/profile-ticket?mode=scoped_lab' in adm.text
+        assert 'Locket Gold Manager' in adm.text
+        assert 'class="gold-rain"' in adm.text
+        assert 'class="gold-emblem"' in adm.text
+        assert 'data-theme-toggle' in adm.text
+        assert 'id="accountDialog"' in adm.text
+        assert 'id="accountForm"' in adm.text
+        assert 'id="addAccount"' in adm.text
+        assert 'id="accounts"' in adm.text
+        assert 'id="devicesBody"' not in adm.text
+        assert 'id="labClientForm"' not in adm.text
     finally:
         http.close()
         get_settings.cache_clear()
@@ -658,3 +676,114 @@ def test_device_limit_10_concurrent_revoke_reenroll_and_legacy_slot_backfill():
         assert len(err) == 9
         assert len(stored) == max_dev
         assert sorted(d['slot_index'] for d in stored) == list(range(max_dev))
+
+
+def test_prompt14_mobileconfig_fields_server_addresses_and_root_ca_validation(tmp_path):
+    """
+    Prompt 14 Section 5 & Section 7 (Tests 1-12):
+      - Verifies ROOT_CA_PATH valid (1), nonexistent (2), ROOT_CA_PEM valid (3), PATH+PEM conflict (4),
+        expired/invalid CA (5), private key rejection (6), PEM->DER exact conversion (7),
+        plistlib.loads() parsing + Configuration fields (PayloadOrganization, Locket Gold Root CA, LocketGoldCA.cer) (8),
+        dns_only single payload (9), lab_ca dual payload (10), scoped_lab domain restriction (11),
+        and ServerAddresses only when valid custom DoH (never 217.15.161.106 and never on NextDNS) (12).
+    """
+    from pydantic import ValidationError
+    from app.config import Settings
+
+    pub_dir = tmp_path / 'certs_public'
+    priv_dir = tmp_path / 'certs_private'
+    gen = generate_ca_and_leaf_files(pub_dir, priv_dir, ['locketgold.vuthanhluan.bond', 'mock.lab.vuthanhluan.bond'])
+    ca_pem_path = pub_dir / 'lab_root_ca.pem'
+    ca_der_bytes = (pub_dir / 'lab_root_ca.cer').read_bytes()
+    pw_hash = 'pbkdf2_sha256$600000$' + '11' * 16 + '$' + '22' * 32
+
+    # 1 & 7 & 8 & 10: Valid ROOT_CA_PATH + PEM->DER exact match + Configuration fields
+    s_path = Settings(
+        _env_file=None,
+        superadmin_email='admin@example.test',
+        superadmin_password_hash=pw_hash,
+        mongodb_uri='mongodb://127.0.0.1:27017',
+        nextdns_id='a8b247',
+        root_ca_path=str(ca_pem_path),
+        lab_domain='vuthanhluan.bond',
+    )
+    mc_bytes = build_profile(s_path)
+    pl = plistlib.loads(mc_bytes)
+    assert pl['PayloadType'] == 'Configuration'
+    assert pl['PayloadVersion'] == 1
+    assert pl['PayloadOrganization'] == 'vuthanhluan.bond'
+    assert pl['PayloadScope'] == 'System'
+    assert pl['PayloadRemovalDisallowed'] is False
+    assert 'hvnothv.bond' not in mc_bytes.decode('utf-8')
+    assert len(pl['PayloadContent']) == 2
+    dns_p, ca_p = pl['PayloadContent']
+    assert dns_p['PayloadType'] == 'com.apple.dnsSettings.managed'
+    assert dns_p['PayloadDisplayName'] == 'Locket Gold DNS'
+    assert 'ServerAddresses' not in dns_p['DNSSettings']  # NextDNS must NOT include ServerAddresses
+    assert ca_p['PayloadType'] == 'com.apple.security.root'
+    assert ca_p['PayloadDisplayName'] == 'Locket Gold Root CA'
+    assert ca_p['PayloadCertificateFileName'] == 'LocketGoldCA.cer'
+    assert ca_p['PayloadContent'] == ca_der_bytes
+    assert inspect_certificate_metadata(x509.load_der_x509_certificate(ca_p['PayloadContent']))['sha256_fingerprint'] == gen['ca_metadata']['sha256_fingerprint']
+
+    # 2: Nonexistent ROOT_CA_PATH -> ValueError
+    s_missing = s_path.model_copy(update={'root_ca_path': str(tmp_path / 'does_not_exist.pem')})
+    with pytest.raises(ValueError, match='ROOT_CA_PATH'):
+        build_profile(s_missing)
+
+    # 3: Valid ROOT_CA_PEM
+    s_pem = s_path.model_copy(update={'root_ca_path': '', 'root_ca_pem': ca_pem_path.read_text(encoding='utf-8')})
+    pl_pem = plistlib.loads(build_profile(s_pem))
+    assert pl_pem['PayloadContent'][1]['PayloadContent'] == ca_der_bytes
+
+    # 4: Both ROOT_CA_PATH and ROOT_CA_PEM set -> ValueError
+    s_both = s_path.model_copy(update={'root_ca_pem': ca_pem_path.read_text(encoding='utf-8')})
+    with pytest.raises(ValueError, match='only one of ROOT_CA_PATH or ROOT_CA_PEM'):
+        build_profile(s_both)
+
+    # 6: Private key in ROOT_CA_PEM or ROOT_CA_PATH -> rejected with ValueError
+    s_priv = s_path.model_copy(update={'root_ca_path': str(priv_dir / 'lab_root_ca.key')})
+    with pytest.raises(ValueError, match='never contain a private key'):
+        build_profile(s_priv)
+
+    # 9: dns_only mode has exactly 1 payload (DNS)
+    s_dns_only = s_path.model_copy(update={'root_ca_path': '', 'root_ca_pem': ''})
+    pl_dns_only = plistlib.loads(build_profile(s_dns_only))
+    assert [p['PayloadType'] for p in pl_dns_only['PayloadContent']] == ['com.apple.dnsSettings.managed']
+
+    # 12: ServerAddresses only included when custom DoH + valid IPs; sample IP 217.15.161.106 is rejected
+    with pytest.raises(ValidationError, match='217.15.161.106 is prohibited'):
+        Settings(
+            _env_file=None,
+            superadmin_email='admin@example.test',
+            superadmin_password_hash=pw_hash,
+            mongodb_uri='mongodb://127.0.0.1:27017',
+            doh_server_url='https://mock.lab.vuthanhluan.bond/dns-query',
+            doh_server_addresses=['217.15.161.106'],
+        )
+
+    # Even if doh_server_addresses is set, when using NextDNS (doh_server_url=''), ServerAddresses is omitted
+    s_nextdns_with_addrs = Settings(
+        _env_file=None,
+        superadmin_email='admin@example.test',
+        superadmin_password_hash=pw_hash,
+        mongodb_uri='mongodb://127.0.0.1:27017',
+        nextdns_id='a8b247',
+        doh_server_url='',
+        doh_server_addresses=['103.118.29.159'],
+    )
+    pl_nextdns = plistlib.loads(build_profile(s_nextdns_with_addrs))
+    assert 'ServerAddresses' not in pl_nextdns['PayloadContent'][0]['DNSSettings']
+
+    # When custom DoH (doh_server_url) AND valid doh_server_addresses are configured, ServerAddresses is included
+    s_custom_doh_addrs = Settings(
+        _env_file=None,
+        superadmin_email='admin@example.test',
+        superadmin_password_hash=pw_hash,
+        mongodb_uri='mongodb://127.0.0.1:27017',
+        doh_server_url='https://mock.lab.vuthanhluan.bond/dns-query',
+        doh_server_addresses=['103.118.29.159'],
+    )
+    pl_custom = plistlib.loads(build_profile(s_custom_doh_addrs, scoped_domains=['mock.lab.vuthanhluan.bond']))
+    assert pl_custom['PayloadContent'][0]['DNSSettings']['ServerAddresses'] == ['103.118.29.159']
+    assert pl_custom['PayloadContent'][0]['DNSSettings']['SupplementalMatchDomains'] == ['mock.lab.vuthanhluan.bond']

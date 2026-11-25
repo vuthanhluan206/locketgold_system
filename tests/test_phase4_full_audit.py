@@ -117,20 +117,27 @@ def test_admin_frontend_ui_elements_and_docker_configs(monkeypatch):
     app.state.profile = build_profile(get_settings())
     http = TestClient(app, base_url='http://localhost')
     try:
+        public_html = http.get('/').text
+        for pub_id in ['title', 'lookupForm', 'locketAccount', 'lookupBtn', 'lookupDialog', 'downloadResult', 'installBtn']:
+            assert f'id="{pub_id}"' in public_html, f'Missing Public UI element #{pub_id}'
+        assert 'Locket Gold Premium' in public_html
+
         admin_html = http.get('/admin').text
         for required_id in [
+            'loginScreen',
             'loginForm',
-            'verifyLinkForm',
-            'rawLinkInput',
+            'dashboard',
+            'accountDialog',
             'accountForm',
-            'deviceForm',
-            'labClientForm',
-            'adminDownloadProfile',
-            'adminDownloadScopedProfile',
-            'auditLogBox',
-            'devicesBody',
+            'addAccount',
+            'accounts',
+            'previous',
+            'next',
+            'logout',
         ]:
-            assert f'id="{required_id}"' in admin_html, f'Missing UI element #{required_id}'
+            assert f'id="{required_id}"' in admin_html, f'Missing Admin UI element #{required_id}'
+        assert 'Locket Gold Manager' in admin_html
+        assert 'class="gold-rain"' in admin_html
 
         root = Path(__file__).resolve().parent.parent
         compose_main = (root / 'compose.yaml').read_text(encoding='utf-8')

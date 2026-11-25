@@ -37,6 +37,7 @@ class Settings(BaseSettings):
     mongodb_database: str = 'locket_manager'
     nextdns_id: str = Field(default='', pattern=r'^([a-fA-F0-9]{6})?$')
     doh_server_url: str = Field(default='', max_length=256)
+    doh_server_addresses: Annotated[list[str], NoDecode] = Field(default_factory=list)
     lab_mode: Literal['local', 'real_device'] = Field(
         default='local',
         validation_alias=AliasChoices('lab_mode', 'LAB_MODE'),
@@ -159,6 +160,12 @@ class Settings(BaseSettings):
                     # iOS resolves the DoH hostname via normal system DNS first before bootstrapping DoH,
                     # so that hostname MUST have a public DNS A record pointing to LAB_DNS_TARGET_IP.
                     pass
+            for addr_str in self.doh_server_addresses:
+                addr_obj = ip_address(addr_str)
+                if addr_obj.is_loopback or addr_obj.is_unspecified:
+                    raise ValueError(
+                        'Real Device Lab mode (LAB_MODE=real_device) cannot use loopback/unspecified IP in DOH_SERVER_ADDRESSES.'
+                    )
         if self.vercel == '1':
             for host in (self.vercel_url, self.vercel_branch_url):
                 if host:
@@ -189,6 +196,31 @@ class Settings(BaseSettings):
         for network in cidrs:
             ip_network(network)
         return cidrs
+
+    @field_validator('doh_server_addresses', mode='before')
+    @classmethod
+    def validate_doh_addresses(cls, value: Any) -> list[str]:
+        if isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                items = []
+            elif raw.startswith('['):
+                items = json.loads(raw)
+            else:
+                items = [a.strip() for a in raw.split(',') if a.strip()]
+        elif isinstance(value, list):
+            items = [str(a).strip() for a in value if str(a).strip()]
+        else:
+            raise ValueError('DOH_SERVER_ADDRESSES must be a list of IP addresses')
+        validated: list[str] = []
+        for item in items:
+            ip_obj = ip_address(item)
+            if str(ip_obj) == '217.15.161.106':
+                raise ValueError('Sample file third-party IP 217.15.161.106 is prohibited in DOH_SERVER_ADDRESSES')
+            if ip_obj.is_unspecified or ip_obj.is_multicast:
+                raise ValueError(f"Invalid DoH server IP address '{item}'")
+            validated.append(str(ip_obj))
+        return validated
 
     @field_validator('doh_server_url')
     @classmethod
