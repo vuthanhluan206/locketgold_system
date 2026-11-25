@@ -71,7 +71,7 @@ class AccountInput(BaseModel):
     locket_id: AccountId
     expires_date: AwareDatetime
     username: str | None = Field(default=None, max_length=64, pattern=r'^[A-Za-z0-9_.\-]*$')
-    firebase_uid: str | None = Field(default=None, pattern=r'^[A-Za-z0-9]{28}$')
+    firebase_uid: str | None = Field(default=None, min_length=6, max_length=128, pattern=r'^[A-Za-z0-9_\-]+$')
     source_link: str | None = Field(default=None, max_length=256)
     verification_status: VerificationStatus = 'manual_lab_id'
     verification_method: VerificationMethod = 'admin_manual_override'
@@ -79,6 +79,14 @@ class AccountInput(BaseModel):
     status: Literal['active', 'pending', 'revoked'] = 'active'
     max_devices: int = Field(default=2, ge=1, le=10)
     notes: str | None = Field(default=None, max_length=256)
+
+    @field_validator('username', 'firebase_uid', mode='before')
+    @classmethod
+    def empty_optional_to_none(cls, value):
+        if isinstance(value, str):
+            stripped = value.strip()
+            return stripped or None
+        return value
 
     @field_validator('expires_date', mode='before')
     @classmethod

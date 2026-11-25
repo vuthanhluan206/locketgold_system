@@ -85,8 +85,8 @@ def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, 
     lid = str(record.get('locket_id') or record.get('account_id') or '')
     explicit_uid = record.get('firebase_uid') or record.get('verified_uid')
     candidate_uid = None
-    if isinstance(explicit_uid, str) and FIREBASE_UID_RE.fullmatch(explicit_uid):
-        candidate_uid = explicit_uid
+    if isinstance(explicit_uid, str) and explicit_uid.strip():
+        candidate_uid = explicit_uid.strip()
     elif FIREBASE_UID_RE.fullmatch(lid):
         candidate_uid = lid
 

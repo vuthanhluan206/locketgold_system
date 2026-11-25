@@ -268,7 +268,7 @@ async def download_profile(
                 profile_bytes = build_profile(s_copy, scoped_domains=None, device_label=device_label)
             elif eff_mode in {'lab_ca', 'scoped_lab'}:
                 cert = load_validated_root_ca(settings)
-                if eff_mode == 'lab_ca' and cert is None:
+                if cert is None:
                     raise ValueError('Lab Root CA is not configured on this server')
                 profile_bytes = build_profile(
                     settings,
@@ -490,23 +490,47 @@ async def upsert_account(
 
     # 2. Write canonical v2 record to `accounts_v2` and `entitlements` (NEVER swallow write failures!)
     # Enforce server-side verification honesty: Admin input can NEVER self-assert `verified_uid`
+    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
+    existing_v2 = None
+    if accounts_v2 is not None and hasattr(accounts_v2, 'find_one'):
+        existing_res = accounts_v2.find_one({'locket_id': data.locket_id}, {'_id': 0})
+        if hasattr(existing_res, '__await__'):
+            existing_res = await existing_res
+        if isinstance(existing_res, dict):
+            existing_v2 = existing_res
+
     is_28char_id = bool(len(data.locket_id) == 28 and data.locket_id.isalnum())
-    is_28char_fb = bool(data.firebase_uid and len(data.firebase_uid) == 28 and data.firebase_uid.isalnum())
-    if is_28char_id or is_28char_fb:
-        safe_ver_status = 'unverified_uid'
-        safe_ver_method = 'format_only_uid'
-        safe_ver_source = 'admin_manual_input'
-        resolved_fb_uid = data.firebase_uid or (data.locket_id if is_28char_id else None)
+    has_explicit_fb = bool(data.firebase_uid and data.firebase_uid.strip())
+    if has_explicit_fb or is_28char_id:
+        resolved_fb_uid = data.firebase_uid.strip() if has_explicit_fb else data.locket_id
+        # Preserve server-verified proof only if the existing record already had cryptographic proof for this exact UID
+        if (
+            isinstance(existing_v2, dict)
+            and existing_v2.get('_server_uid_proof') is True
+            and existing_v2.get('firebase_uid') == resolved_fb_uid
+            and existing_v2.get('verification_status') == 'verified_uid'
+        ):
+            safe_ver_status = 'verified_uid'
+            safe_ver_method = existing_v2.get('verification_method', 'trusted_proof')
+            safe_ver_source = existing_v2.get('verification_source', 'verified_subscriber_traffic')
+            server_proof = True
+        else:
+            safe_ver_status = 'unverified_uid'
+            safe_ver_method = 'format_only_uid'
+            safe_ver_source = 'admin_manual_input'
+            server_proof = False
     elif data.username or data.verification_status == 'unverified_handle':
         safe_ver_status = 'unverified_handle'
         safe_ver_method = 'link_handle_only'
         safe_ver_source = 'admin_manual_input'
         resolved_fb_uid = None
+        server_proof = False
     else:
         safe_ver_status = 'manual_lab_id'
         safe_ver_method = 'admin_manual_override'
         safe_ver_source = 'admin_direct_input'
         resolved_fb_uid = None
+        server_proof = False
 
     v2_doc = {
         'schema_version': 2,
@@ -518,7 +542,7 @@ async def upsert_account(
         'verification_status': safe_ver_status,
         'verification_method': safe_ver_method,
         'verification_source': safe_ver_source,
-        '_server_uid_proof': False,
+        '_server_uid_proof': server_proof,
         'status': data.status,
         'product_identifier': 'com.locket.gold.yearly',
         'expires_date': data.expires_date,
@@ -529,7 +553,6 @@ async def upsert_account(
         'updated_at': now,
         'updated_by': admin.get('email', 'superadmin'),
     }
-    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
         res = accounts_v2.update_one(
             {'locket_id': data.locket_id},

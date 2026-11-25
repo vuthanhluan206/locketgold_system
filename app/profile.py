@@ -8,9 +8,9 @@ from fastapi import HTTPException
 from .config import Settings
 
 
-def payload(kind: str, name: str) -> dict:
-    slug = name.lower().replace(' ', '-')
-    identifier = f'bond.vuthanhluan.locketgold.{slug}'
+def payload(kind: str, name: str, slug: str | None = None) -> dict:
+    resolved_slug = slug or name.lower().replace(' ', '-')
+    identifier = f'bond.vuthanhluan.locketgold.{resolved_slug}'
     return {
         'PayloadType': kind,
         'PayloadVersion': 1,
@@ -98,7 +98,7 @@ def build_profile(
 ) -> bytes:
     server_url = resolve_doh_server_url(settings, device_label=device_label)
     has_custom_doh = bool((getattr(settings, 'doh_server_url', '') or '').strip())
-    dns = payload('com.apple.dnsSettings.managed', 'Locket Gold DNS')
+    dns = payload('com.apple.dnsSettings.managed', 'Locket Gold DNS', 'dns')
     dns_settings: dict = {
         'DNSProtocol': 'HTTPS',
         'ServerURL': server_url,
@@ -114,14 +114,14 @@ def build_profile(
 
     cert = override_ca_cert if override_ca_cert is not None else load_validated_root_ca(settings)
     if cert is not None:
-        ca = payload('com.apple.security.root', 'Locket Gold Root CA')
+        ca = payload('com.apple.security.root', 'Locket Gold Root CA', 'root-ca')
         ca['PayloadCertificateFileName'] = 'LocketGoldCA.cer'
         ca['PayloadContent'] = cert.public_bytes(Encoding.DER)
         contents.append(ca)
 
-    profile = payload('Configuration', 'Locket Gold')
+    profile = payload('Configuration', 'Locket Gold', 'profile')
     has_ca = any(item.get('PayloadType') == 'com.apple.security.root' for item in contents)
-    org_domain = (getattr(settings, 'lab_domain', '') or '').strip() or 'vuthanhluan.bond'
+    org_domain = 'vuthanhluan.bond'
     profile.update(
         PayloadContent=contents,
         PayloadOrganization=org_domain,
