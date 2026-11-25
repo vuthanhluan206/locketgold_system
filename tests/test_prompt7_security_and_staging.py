@@ -1,13 +1,10 @@
 import asyncio
 import json
-import plistlib
 import secrets
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
-from cryptography import x509
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
 from pymongo.errors import PyMongoError
@@ -17,13 +14,10 @@ from app.database import get_accounts
 from app.main import create_app
 from app.passwords import hash_password
 from app.profile import build_profile
-from app.services.identity_service import verify_account_link_or_identifier
-from app.services.pki_service import generate_lab_root_ca, inspect_certificate_metadata
 from scripts.generate_lab_ca import main as generate_lab_ca_main
 from scripts.migrate_db import (
     _json_default,
     export_backup_to_dict,
-    restore_rollback_from_dict,
     verify_backup_file_on_disk,
 )
 

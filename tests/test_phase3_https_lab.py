@@ -1,13 +1,7 @@
-import plistlib
 import secrets
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock, MagicMock
 
-import pytest
-from cryptography import x509
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.asymmetric import ec
-from cryptography.x509.oid import NameOID
 from fastapi.testclient import TestClient
 
 from app.config import get_settings

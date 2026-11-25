@@ -8,21 +8,18 @@ import pytest
 from cryptography import x509
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
-from pymongo.errors import ConfigurationError, OperationFailure, PyMongoError
+from pymongo.errors import OperationFailure
 
 from app.config import Settings, get_settings
 from app.database import get_accounts, lifespan, run_controlled_migration
 from app.main import create_app
-from app.models import compute_entitlement_status, subscriber_response
 from app.passwords import hash_password
 from app.profile import build_profile
-from app.services.identity_service import verify_account_link_or_identifier
 from app.services.pki_service import generate_lab_root_ca, inspect_certificate_metadata
 from scripts.migrate_db import (
     export_backup_to_dict,
     preview_rollback,
     restore_rollback_from_dict,
-    verify_post_migration,
     verify_snapshot_integrity,
 )
 

@@ -1,4 +1,3 @@
-from datetime import datetime, timezone
 import re
 from typing import Any
 
@@ -19,6 +18,8 @@ SENSITIVE_BODY_KEYS = {
     'refresh_token',
     'id_token',
     'device_token',
+    'download_ticket',
+    'ticket',
     'turnstile_token',
     'secret',
     'api_token',
@@ -26,6 +27,7 @@ SENSITIVE_BODY_KEYS = {
 }
 
 BEARER_TOKEN_REGEX = re.compile(r'(?i)\b(Bearer\s+)([A-Za-z0-9._\-~+/]+=*)')
+TICKET_PARAM_REGEX = re.compile(r'(?i)([?&]ticket=)(lkg_dl_[A-Za-z0-9_\-]+)')
 
 
 def mask_token_string(raw: str) -> str:
@@ -74,5 +76,6 @@ def redact_payload(data: Any) -> Any:
     if isinstance(data, list):
         return [redact_payload(item) for item in data]
     if isinstance(data, str):
-        return BEARER_TOKEN_REGEX.sub(lambda m: m.group(1) + mask_token_string(m.group(2)), data)
+        masked = BEARER_TOKEN_REGEX.sub(lambda m: m.group(1) + mask_token_string(m.group(2)), data)
+        return TICKET_PARAM_REGEX.sub(lambda m: m.group(1) + mask_token_string(m.group(2)), masked)
     return data

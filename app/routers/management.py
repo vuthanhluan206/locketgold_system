@@ -23,10 +23,9 @@ from ..models import (
     PublicLookupOutput,
     RevokeAccountInput,
     TestResultInput,
-    compute_entitlement_status,
 )
 from ..profile import build_profile, load_validated_root_ca
-from ..security import bearer, require_admin
+from ..security import require_admin
 from ..config import get_settings
 from ..services.device_service import (
     consume_profile_download_ticket,
@@ -41,12 +40,7 @@ from ..services.entitlement_service import (
     merge_canonical_and_legacy_account,
 )
 from ..services.identity_service import normalize_lookup_query, verify_account_link_or_identifier
-from ..services.pki_service import (
-    generate_lab_leaf_certificate,
-    generate_lab_root_ca,
-    inspect_certificate_metadata,
-    verify_certificate_chain_and_hostname,
-)
+from ..services.pki_service import inspect_certificate_metadata
 
 router = APIRouter()
 WEB = Path(__file__).resolve().parent.parent.parent / 'web'
@@ -253,10 +247,10 @@ async def download_profile(
                 400,
                 'Không được truyền device_token dài hạn vào tham số ticket. Hãy dùng mã tải một lần (lkg_dl_*).',
             )
-        ticket_doc = await consume_profile_download_ticket(request, eff_ticket)
+        ticket_doc = await consume_profile_download_ticket(request, eff_ticket, requested_mode=eff_mode)
         device_label = ticket_doc.get('device_id')
-        if eff_mode == 'default' and ticket_doc.get('mode'):
-            eff_mode = ticket_doc['mode']
+        # Never trust URL mode over the ticket's authorized mode
+        eff_mode = ticket_doc.get('mode') or 'scoped_lab'
     else:
         auth_hdr = request.headers.get('authorization', '')
         scheme, _, raw_cred = auth_hdr.partition(' ')
@@ -307,7 +301,12 @@ async def download_profile(
     return Response(
         profile_bytes,
         media_type='application/x-apple-aspen-config',
-        headers={'Content-Disposition': 'attachment; filename="locket.mobileconfig"'},
+        headers={
+            'Content-Disposition': 'attachment; filename="locket.mobileconfig"',
+            'Cache-Control': 'no-store, no-cache, must-revalidate, private, max-age=0',
+            'Pragma': 'no-cache',
+            'Expires': '0',
+        },
     )
 
 
@@ -831,10 +830,11 @@ async def revoke_device_endpoint(
     now = datetime.now(timezone.utc)
     await devices.update_one(
         {'device_id': device_id},
-        {'$set': {'status': 'revoked', 'revoked_at': now, 'slot_index': None}},
+        {'$set': {'status': 'revoked', 'revoked_at': now}, '$unset': {'slot_index': ''}},
     )
     doc['status'] = 'revoked'
     doc['revoked_at'] = now
+    doc.pop('slot_index', None)
     await record_audit(request, admin, 'DEVICE_REVOKE', doc.get('locket_id', device_id), {'device_id': device_id})
     return doc
 
@@ -844,6 +844,7 @@ async def create_admin_device_profile_ticket(
     device_id: str,
     request: Request,
     admin: Annotated[dict, Depends(require_admin)],
+    mode: Literal['default', 'dns_only', 'lab_ca', 'scoped_lab'] | None = Query(None),
     data: ProfileTicketInput | None = None,
 ):
     """Admin endpoint to issue a short-lived one-time Safari `.mobileconfig` download ticket for an enrolled device."""
@@ -855,7 +856,7 @@ async def create_admin_device_profile_ticket(
         raise HTTPException(404, 'Device not found')
     if doc.get('status') != 'active':
         raise HTTPException(409, 'Cannot issue download ticket for a revoked device')
-    eff_mode = data.mode if data is not None else 'scoped_lab'
+    eff_mode = (data.mode if data is not None else None) or (mode if isinstance(mode, str) else None) or 'scoped_lab'
     eff_ttl = data.ttl_seconds if data is not None else 300
     ticket_info = await issue_profile_download_ticket(request, device_doc=doc, mode=eff_mode, ttl_seconds=eff_ttl)
     await record_audit(

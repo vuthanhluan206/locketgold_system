@@ -208,7 +208,11 @@ async def lifespan(app: FastAPI):
             ('accounts_v2', 'firebase_uid', {'sparse': True}),
             ('devices', 'device_id', {'unique': True}),
             ('devices', 'token_hash', {'unique': True}),
-            ('devices', [('locket_id', 1), ('slot_index', 1)], {'unique': True, 'sparse': True}),
+            (
+                'devices',
+                [('locket_id', 1), ('slot_index', 1)],
+                {'unique': True, 'partialFilterExpression': {'status': 'active', 'slot_index': {'$type': 'number'}}},
+            ),
             ('entitlements', [('account_id', 1), ('entitlement_key', 1)], {'unique': True}),
             ('download_tickets', 'ticket_hash', {'unique': True}),
             ('download_tickets', 'expires_at', {'expireAfterSeconds': 0}),
@@ -217,9 +221,17 @@ async def lifespan(app: FastAPI):
         ]:
             col = getattr(db, col_name, None)
             if col is not None and hasattr(col, 'create_index'):
-                res = col.create_index(idx_spec, **idx_kwargs)
-                if asyncio.iscoroutine(res):
-                    await res
+                try:
+                    res = col.create_index(idx_spec, **idx_kwargs)
+                    if asyncio.iscoroutine(res):
+                        await res
+                except Exception as exc:
+                    logger.error(
+                        'MONGODB_INDEX_CREATION_FAILED: collection=%s error=%s',
+                        col_name,
+                        type(exc).__name__,
+                    )
+                    raise
 
         await db.admins.update_one(
             {'_id': 'superadmin'},

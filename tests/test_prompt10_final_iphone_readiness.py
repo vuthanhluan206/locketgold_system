@@ -13,15 +13,10 @@ Automated Regression Test Suite for Prompt 10 (`tests/test_prompt10_final_iphone
    - Verifies `scripts/docker_e2e_smoke.py` never uses `check_hostname = False`, never uses `0o777` / `chmod 777`, and uses isolated container names (`locket_e2e_ci_*`) and dynamic free ports (`find_free_loopback_port()`).
 """
 import inspect
-from pathlib import Path
 import pytest
-from fastapi.testclient import TestClient
 from pydantic import ValidationError
 
-from app.config import Settings, get_settings
-from app.main import create_app
-from app.passwords import hash_password
-from app.profile import build_profile
+from app.config import Settings
 from app.services.doh_service import (
     TYPE_A,
     TYPE_AAAA,

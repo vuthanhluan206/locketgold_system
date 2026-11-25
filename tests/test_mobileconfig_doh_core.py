@@ -35,8 +35,6 @@ from app.main import create_app
 from app.passwords import hash_password
 from app.profile import build_profile
 from app.services.doh_service import (
-    RCODE_NOERROR,
-    RCODE_REFUSED,
     TYPE_A,
     TYPE_AAAA,
     build_dns_query_packet,

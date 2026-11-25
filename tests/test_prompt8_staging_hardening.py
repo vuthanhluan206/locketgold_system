@@ -17,7 +17,7 @@ from app.services.pki_service import inspect_certificate_metadata
 from scripts.generate_lab_ca import main as generate_lab_ca_main
 from scripts.migrate_db import reconcile_collections
 from scripts.seed_staging_db import assert_safe_staging_db_name, seed_staging_accounts
-from scripts.staging_preflight import mask_mongodb_uri, verify_staging_settings
+from scripts.staging_preflight import verify_staging_settings
 
 
 def test_problem1_docker_staging_volume_mounts_and_uid10001_ca_generation(tmp_path):

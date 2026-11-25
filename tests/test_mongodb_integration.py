@@ -75,7 +75,7 @@ def test_real_mongodb_accounts_rotation_and_cold_starts(monkeypatch):
             assert sub_after_legacy_tamper.headers['x-lab-entitlement-status'] == 'revoked'
             assert sub_after_legacy_tamper.json()['subscriber']['entitlements'] == {}
 
-            # Re-activate and verify concurrent device enrollment strictly respects max_devices=2 on real MongoDB
+            # Re-activate and verify 10 concurrent device enrollments strictly respect max_devices=2 on real MongoDB
             act_res = http.post('/admin/accounts/internal_user_123/activate', headers=headers, json={})
             assert act_res.status_code == 200
 
@@ -87,10 +87,37 @@ def test_real_mongodb_accounts_rotation_and_cold_starts(monkeypatch):
                 })
                 return r.status_code
 
-            with ThreadPoolExecutor(max_workers=5) as pool:
-                statuses = list(pool.map(try_enroll, range(5)))
+            with ThreadPoolExecutor(max_workers=10) as pool:
+                statuses = list(pool.map(try_enroll, range(10)))
             assert statuses.count(200) == 2
-            assert statuses.count(409) == 3
+            assert statuses.count(409) == 8
+
+            # Verify revoking both devices and re-enrolling works without slot_index DuplicateKeyError
+            active_devs = http.get('/admin/devices?locket_id=internal_user_123', headers=headers).json()
+            assert len(active_devs) == 2
+            for d in active_devs:
+                r_rev = http.post(f"/admin/devices/{d['device_id']}/revoke", headers=headers)
+                assert r_rev.status_code == 200
+
+            reenroll_res = http.post('/admin/devices', headers=headers, json={
+                'locket_id': 'internal_user_123',
+                'device_name': 'iPhone Reenrolled After Revoke',
+                'ios_version': '18.2',
+            })
+            assert reenroll_res.status_code == 200
+            reenrolled_dev = reenroll_res.json()
+
+            # Verify one-time ticket mode binding & atomic replay protection on real MongoDB
+            tk_dns = http.post(
+                f"/admin/devices/{reenrolled_dev['device_id']}/profile-ticket?mode=dns_only",
+                headers=headers,
+            )
+            assert tk_dns.status_code == 200
+            dns_ticket_val = tk_dns.json()['download_ticket']
+            # Escalating dns_only ticket to lab_ca MUST return 403
+            assert http.get(f'/profile.mobileconfig?mode=lab_ca&ticket={dns_ticket_val}').status_code == 403
+            # Ticket was atomically consumed on the attempt, so second use returns 401
+            assert http.get(f'/profile.mobileconfig?mode=dns_only&ticket={dns_ticket_val}').status_code == 401
 
             async def expire():
                 await http.app.state.accounts_v2.update_one({'locket_id': 'internal_user_123'}, {
