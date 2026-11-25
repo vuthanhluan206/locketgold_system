@@ -196,12 +196,24 @@ def run_single_e2e_pass(pass_idx: int) -> None:
     host_gid = getattr(os, "getgid", lambda: 10001)()
 
     admin_email = "staging-e2e@example.test"
+    # Deterministically ensure we test PBKDF2 hashes where salt or digest starts with a letter [a-f]
+    # (which previously broke unquoted Docker Compose env_file $VAR interpolation)
     admin_password = secrets.token_urlsafe(24)
     admin_hash = hash_password(admin_password)
+    for _ in range(12):
+        parts = admin_hash.split("$")
+        if pass_idx == 1 and any(p[0] in "abcdef" for p in parts[2:]):
+            break
+        if pass_idx >= 2 and all(p[0] in "abcdef" for p in parts[2:]):
+            break
+        admin_password = secrets.token_urlsafe(24)
+        admin_hash = hash_password(admin_password)
 
     env_staging_path = e2e_temp_root / ".env.e2e"
     compose_e2e_file = e2e_temp_root / "compose.e2e.isolated.yaml"
 
+    # Single-quoting PBKDF2 hashes in .env prevents Docker Compose env_file parser from
+    # treating $<salt_hex> or $<digest_hex> as shell variable interpolation.
     env_staging_path.write_text(
         f"""APP_ENV=staging
 MONGODB_URI=mongodb://mongo_e2e:27017
@@ -213,7 +225,11 @@ LAB_DNS_TARGET_IP=127.0.0.1
 ROOT_CA_PATH=/app/certs_public/lab_root_ca.pem
 ROOT_CA_PEM=
 SUPERADMIN_EMAIL={admin_email}
-SUPERADMIN_PASSWORD_HASH={admin_hash}
+SUPERADMIN_PASSWORD_HASH='{admin_hash}'
+E2E_HASH_LETTER_SALT='pbkdf2_sha256$600000$abcdef0123456789abcdef0123456789$0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+E2E_HASH_DIGIT_SALT='pbkdf2_sha256$600000$0123456789abcdef0123456789abcdef$0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef'
+E2E_HASH_LETTER_DIGEST='pbkdf2_sha256$600000$0123456789abcdef0123456789abcdef$fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
+E2E_HASH_BOTH_LETTERS='pbkdf2_sha256$600000$abcdef0123456789abcdef0123456789$fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
 ADMIN_PATH=/admin
 ALLOWED_HOSTS=["locketgold.vuthanhluan.bond","mock.lab.vuthanhluan.bond","sub.lab.vuthanhluan.bond","localhost","127.0.0.1","[::1]"]
 LAB_DOMAIN=locketgold.vuthanhluan.bond
@@ -340,6 +356,27 @@ volumes:
         wait_for_container_healthy(mongo_cname, timeout_sec=60)
         wait_for_container_healthy(api_cname, timeout_sec=60)
 
+        # Verify inside container that PBKDF2 hashes with $-delimited letter/digit salt & digest
+        # survived Docker Compose interpolation intact (prints only PASS/FAIL, never logs hash/salt/digest)
+        hash_check_script = "\n".join([
+            "import os",
+            "from app.passwords import validate_password_hash",
+            "keys = (",
+            "    'SUPERADMIN_PASSWORD_HASH',",
+            "    'E2E_HASH_LETTER_SALT',",
+            "    'E2E_HASH_DIGIT_SALT',",
+            "    'E2E_HASH_LETTER_DIGEST',",
+            "    'E2E_HASH_BOTH_LETTERS',",
+            ")",
+            "for k in keys:",
+            "    val = os.environ.get(k, '')",
+            "    assert val.count('$') == 3, f'Corrupted $ count in {k}'",
+            "    validate_password_hash(val)",
+            "print('PBKDF2_ENV_INTEGRITY: PASS')",
+        ])
+        hc_res = run_cmd(["docker", "exec", api_cname, "python", "-c", hash_check_script])
+        assert hc_res.returncode == 0 and "PBKDF2_ENV_INTEGRITY: PASS" in hc_res.stdout
+
         print("=== [SCENARIO 3 & 4] Verifying /api/health and /api/ready ===", flush=True)
         st, _, body = http_req(f"{base_http}/api/health")
         assert st == 200, f"/api/health returned {st}"
@@ -354,7 +391,14 @@ volumes:
         ready_json = json.loads(body)
         assert ready_json["status"] == "ready" and ready_json["mongodb_connected"] is True
 
-        print("=== [SCENARIO 5] Verifying Admin login ===", flush=True)
+        print("=== [SCENARIO 5] Verifying Admin login (wrong password rejected, matching password accepted) ===", flush=True)
+        st_wrong, _, _ = http_req(
+            f"{base_http}/api/admin/login",
+            method="POST",
+            json_body={"email": admin_email, "password": "WrongPassword!NeverMatches999"},
+        )
+        assert st_wrong == 401, f"Expected 401 for wrong admin password, got {st_wrong}"
+
         st, _, body = http_req(
             f"{base_http}/api/admin/login",
             method="POST",
@@ -513,6 +557,18 @@ volumes:
         st_bad_q, _, _ = http_req(f"{base_http}/profile.mobileconfig?mode=scoped_lab&device_token={d2_token}")
         assert st_bad_q == 400, f"Expected 400 when passing device_token in URL query string, got {st_bad_q}"
 
+        # Exchange device_token via Authorization header for a dns_only ticket and verify mode escalation to lab_ca returns 403
+        st_tk_dns, _, body_tk_dns = http_req(
+            f"{base_http}/api/profile/download-ticket",
+            method="POST",
+            headers={"Authorization": f"Bearer {d2_token}"},
+            json_body={"mode": "dns_only"},
+        )
+        assert st_tk_dns == 200
+        dns_only_ticket = json.loads(body_tk_dns)["download_ticket"]
+        st_escalate, _, _ = http_req(f"{base_http}/profile.mobileconfig?mode=lab_ca&ticket={dns_only_ticket}")
+        assert st_escalate == 403, f"Expected 403 on ticket mode tampering (dns_only -> lab_ca), got {st_escalate}"
+
         # Exchange device_token via Authorization header for a short-lived single-use download ticket
         st_tk, _, body_tk = http_req(
             f"{base_http}/api/profile/download-ticket",
@@ -522,8 +578,9 @@ volumes:
         )
         assert st_tk == 200
         dl_ticket = json.loads(body_tk)["download_ticket"]
-        st_dl, _, body_dl = http_req(f"{base_http}/profile.mobileconfig?mode=scoped_lab&ticket={dl_ticket}")
+        st_dl, hdrs_dl, body_dl = http_req(f"{base_http}/profile.mobileconfig?mode=scoped_lab&ticket={dl_ticket}")
         assert st_dl == 200
+        assert "no-store" in hdrs_dl.get("cache-control", "")
         pl_dl = plistlib.loads(body_dl)
         assert pl_dl["PayloadContent"][0]["DNSSettings"]["ServerURL"] == f"https://mock.lab.vuthanhluan.bond/dns-query/{d2_id}"
 
@@ -604,9 +661,17 @@ volumes:
         st_rec, _, _ = http_req(f"{base_http}/api/ready", timeout=8.0)
         assert st_rec == 200
 
-        print("=== [SCENARIO 18] Restarting API container & verifying persistence ===", flush=True)
+        print("=== [SCENARIO 18] Restarting API container & verifying persistence and PBKDF2 hash integrity ===", flush=True)
         run_cmd(["docker", "restart", api_cname])
         wait_for_container_healthy(api_cname, timeout_sec=60)
+        hc_post = run_cmd(["docker", "exec", api_cname, "python", "-c", hash_check_script])
+        assert hc_post.returncode == 0 and "PBKDF2_ENV_INTEGRITY: PASS" in hc_post.stdout
+        st_relogin, _, _ = http_req(
+            f"{base_http}/api/admin/login",
+            method="POST",
+            json_body={"email": admin_email, "password": admin_password},
+        )
+        assert st_relogin == 200, f"Admin login after container restart failed ({st_relogin})"
         st_post_restart, _, body_post_restart = http_req(f"{base_http}/api/accounts/lookup?query=e2e_user_2")
         assert st_post_restart == 200 and json.loads(body_post_restart) == {"exists": True}
 

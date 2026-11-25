@@ -324,7 +324,32 @@ def test_one_time_download_ticket_security_and_url_token_rejection(monkeypatch, 
             doc['expires_at'] = datetime.now(timezone.utc) - timedelta(seconds=5)
         assert http.get(f'/profile.mobileconfig?mode=scoped_lab&ticket={ticket_exp}').status_code == 401
 
-        # 5. Admin-issued ticket for device that gets revoked before download -> 401
+        # 5. Ticket mode binding: a ticket issued for dns_only MUST NOT be usable for lab_ca or scoped_lab (returns 403)
+        tk_dns_res = http.post(
+            '/api/profile/download-ticket',
+            headers={'Authorization': f'Bearer {dev_token}'},
+            json={'mode': 'dns_only'},
+        )
+        assert tk_dns_res.status_code == 200
+        dns_ticket = tk_dns_res.json()['download_ticket']
+        assert http.get(f'/profile.mobileconfig?mode=lab_ca&ticket={dns_ticket}').status_code == 403
+        # Ticket was atomically consumed on the tampered attempt, so subsequent use returns 401
+        assert http.get(f'/profile.mobileconfig?mode=dns_only&ticket={dns_ticket}').status_code == 401
+
+        # Ticket issued for dns_only requested with default mode downloads dns_only (no Root CA payload)
+        tk_dns2_res = http.post(
+            '/api/profile/download-ticket',
+            headers={'Authorization': f'Bearer {dev_token}'},
+            json={'mode': 'dns_only'},
+        )
+        dns_ticket2 = tk_dns2_res.json()['download_ticket']
+        dl_dns2 = http.get(f'/profile.mobileconfig?ticket={dns_ticket2}')
+        assert dl_dns2.status_code == 200
+        assert 'no-store' in dl_dns2.headers.get('cache-control', '')
+        pl_dns2 = plistlib.loads(dl_dns2.content)
+        assert [p['PayloadType'] for p in pl_dns2['PayloadContent']] == ['com.apple.dnsSettings.managed']
+
+        # 6. Admin-issued ticket for device that gets revoked before download -> 401
         tk_adm_res = http.post(f'/admin/devices/{dev_id}/profile-ticket?mode=scoped_lab', headers=admin_headers)
         assert tk_adm_res.status_code == 200
         ticket_rev = tk_adm_res.json()['download_ticket']
@@ -436,3 +461,204 @@ def test_iphone_web_ui_distinguishes_dns_only_and_lab_ca(monkeypatch):
     finally:
         http.close()
         get_settings.cache_clear()
+
+
+def test_pbkdf2_hashes_with_letter_and_digit_salt_digest_and_dotenv_single_quotes(tmp_path):
+    """
+    Prompt 12 Section 3.4:
+      1. Hash with salt starting with letter [a-f].
+      2. Hash with salt starting with digit [0-9].
+      3. Hash with digest starting with letter [a-f].
+      4. Hash with multiple $ characters (exact 3 $ required; extra $ rejected).
+      5. Hash preserved intact through .env single-quoted format & Pydantic Settings.
+      6. verify_password accepts matching password and rejects wrong password.
+    """
+    from app.config import Settings
+    from app.passwords import ITERATIONS, validate_password_hash, verify_password
+
+    pw = 'TestPassword!Prompt12#2026'
+    for salt_hex in (
+        'abcdef0123456789abcdef0123456789',  # starts with letter 'a'
+        '0123456789abcdef0123456789abcdef',  # starts with digit '0'
+        'fedcba9876543210fedcba9876543210',  # starts with letter 'f'
+        '9876543210fedcba9876543210fedcba',  # starts with digit '9'
+    ):
+        salt_bytes = bytes.fromhex(salt_hex)
+        digest_bytes = hashlib.pbkdf2_hmac('sha256', pw.encode('utf-8'), salt_bytes, ITERATIONS)
+        encoded = f'pbkdf2_sha256${ITERATIONS}${salt_hex}${digest_bytes.hex()}'
+        it, sb, db = validate_password_hash(encoded)
+        assert it == ITERATIONS and sb == salt_bytes and db == digest_bytes
+        assert verify_password(pw, encoded) is True
+        assert verify_password('WrongPassword!12345', encoded) is False
+
+        # Verify Settings loads single-quoted hash from .env file without corrupting $-prefixed hex
+        env_file = tmp_path / f'.env.test_{salt_hex[:4]}'
+        env_file.write_text(
+            f"APP_ENV=staging\n"
+            f"MONGODB_URI=mongodb://127.0.0.1:27017\n"
+            f"MONGODB_DATABASE=locket_manager_staging\n"
+            f"SUPERADMIN_EMAIL=admin@example.test\n"
+            f"SUPERADMIN_PASSWORD_HASH='{encoded}'\n",
+            encoding='utf-8',
+        )
+        loaded_settings = Settings(_env_file=str(env_file))
+        assert loaded_settings.superadmin_password_hash.get_secret_value() == encoded
+
+    # Hash with explicit digest starting with letter 'f'
+    letter_digest_hash = (
+        f'pbkdf2_sha256${ITERATIONS}$'
+        'abcdef0123456789abcdef0123456789$'
+        'fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210'
+    )
+    assert validate_password_hash(letter_digest_hash)[0] == ITERATIONS
+
+    # Extra or missing $ segments MUST be rejected
+    for bad_hash in (
+        f'pbkdf2_sha256${ITERATIONS}$abcdef0123456789abcdef0123456789',
+        f'pbkdf2_sha256${ITERATIONS}$abcdef0123456789abcdef0123456789$' + 'a' * 64 + '$extra',
+        f'pbkdf2_sha256${ITERATIONS}$$' + 'a' * 64,
+    ):
+        with pytest.raises(ValueError, match='valid PBKDF2-SHA256'):
+            validate_password_hash(bad_hash)
+
+
+def test_root_ca_fail_closed_on_missing_corrupted_or_mismatched_files(tmp_path):
+    """
+    Prompt 12 Section 6.1:
+      - Public CA exists without private key -> RuntimeError (fail-closed, never overwrites).
+      - Private key exists without public CA -> RuntimeError.
+      - Corrupted CA file -> RuntimeError.
+      - Certificate does not match private key -> RuntimeError.
+      - Explicit rotate=True creates .bak backups before rotating.
+    """
+    domains = ['locketgold.vuthanhluan.bond', 'mock.lab.vuthanhluan.bond']
+
+    # 1. Public CA exists but private key is missing
+    pub1, priv1 = tmp_path / 'p1_pub', tmp_path / 'p1_priv'
+    generate_ca_and_leaf_files(pub1, priv1, domains)
+    (priv1 / 'lab_root_ca.key').unlink()
+    with pytest.raises(RuntimeError, match='Inconsistent Root CA state'):
+        generate_ca_and_leaf_files(pub1, priv1, domains)
+
+    # 2. Private key exists but public CA is missing
+    pub2, priv2 = tmp_path / 'p2_pub', tmp_path / 'p2_priv'
+    generate_ca_and_leaf_files(pub2, priv2, domains)
+    (pub2 / 'lab_root_ca.pem').unlink()
+    with pytest.raises(RuntimeError, match='Inconsistent Root CA state'):
+        generate_ca_and_leaf_files(pub2, priv2, domains)
+
+    # 3. Corrupted Root CA certificate file
+    pub3, priv3 = tmp_path / 'p3_pub', tmp_path / 'p3_priv'
+    generate_ca_and_leaf_files(pub3, priv3, domains)
+    (pub3 / 'lab_root_ca.pem').write_text('NOT A VALID PEM CERTIFICATE', encoding='utf-8')
+    with pytest.raises(RuntimeError, match='unreadable or corrupted'):
+        generate_ca_and_leaf_files(pub3, priv3, domains)
+
+    # 4. Certificate does not match private key
+    pub4, priv4 = tmp_path / 'p4_pub', tmp_path / 'p4_priv'
+    pub5, priv5 = tmp_path / 'p5_pub', tmp_path / 'p5_priv'
+    generate_ca_and_leaf_files(pub4, priv4, domains)
+    generate_ca_and_leaf_files(pub5, priv5, domains)
+    # Swap public cert from p5 into p4 so p4's cert and key mismatch
+    (pub4 / 'lab_root_ca.pem').write_bytes((pub5 / 'lab_root_ca.pem').read_bytes())
+    with pytest.raises(RuntimeError, match='does not match'):
+        generate_ca_and_leaf_files(pub4, priv4, domains)
+
+    # 5. Explicit rotate=True backs up existing CA before rotating
+    orig_key = (priv5 / 'lab_root_ca.key').read_bytes()
+    orig_pem = (pub5 / 'lab_root_ca.pem').read_bytes()
+    rotated = generate_ca_and_leaf_files(pub5, priv5, domains, rotate=True)
+    assert rotated['ca_reused'] is False
+    assert (priv5 / 'lab_root_ca.key.bak').read_bytes() == orig_key
+    assert (pub5 / 'lab_root_ca.pem.bak').read_bytes() == orig_pem
+
+
+def test_device_limit_10_concurrent_revoke_reenroll_and_legacy_slot_backfill():
+    """
+    Prompt 12 Section 5.2:
+      - 10 concurrent enrollments with max_devices=1 -> 1 succeeds, 9 return 409.
+      - Legacy active device without slot_index is backfilled and counted toward max_devices=2.
+    """
+    for max_dev in (1, 2):
+        app = FastAPI()
+        lid = f'user_max_{max_dev}'
+        accounts_v2 = AsyncMock()
+        accounts_v2.find_one.return_value = {
+            'locket_id': lid,
+            'status': 'active',
+            'max_devices': max_dev,
+            'expires_date': datetime.now(timezone.utc) + timedelta(days=30),
+        }
+        stored: list[dict] = []
+        if max_dev == 2:
+            # Seed 1 legacy active device WITHOUT slot_index
+            stored.append({
+                'device_id': 'dev_legacy_001',
+                'locket_id': lid,
+                'device_name': 'Legacy iPhone',
+                'ios_version': '18.0',
+                'token_hash': 'legacy_hash',
+                'token_prefix': 'lkg_dev_legacy',
+                'status': 'active',
+                'created_at': datetime.now(timezone.utc),
+            })
+
+        class FakeDevices:
+            def find(self, q, projection=None):
+                matching = [
+                    d.copy() for d in stored
+                    if d.get('locket_id') == q.get('locket_id')
+                    and (q.get('status') is None or d.get('status') == q.get('status'))
+                ]
+                c = MagicMock()
+                c.sort.return_value = c
+                c.to_list = AsyncMock(return_value=matching)
+                return c
+
+            async def update_one(self, q, u):
+                for d in stored:
+                    if d.get('device_id') == q.get('device_id'):
+                        if '$set' in u:
+                            d.update(u['$set'])
+                        if '$unset' in u:
+                            for k in u['$unset']:
+                                d.pop(k, None)
+
+            async def insert_one(self, doc):
+                await asyncio.sleep(0.002)
+                for existing in stored:
+                    if (
+                        existing.get('status') == 'active'
+                        and existing.get('locket_id') == doc.get('locket_id')
+                        and existing.get('slot_index') is not None
+                        and existing.get('slot_index') == doc.get('slot_index')
+                    ):
+                        raise DuplicateKeyError('Duplicate active (locket_id, slot_index)')
+                stored.append(doc.copy())
+
+            async def delete_one(self, q):
+                stored[:] = [d for d in stored if d.get('device_id') != q.get('device_id')]
+
+        app.state.accounts_v2 = accounts_v2
+        app.state.accounts = AsyncMock()
+        app.state.devices = FakeDevices()
+        req = MagicMock()
+        req.app = app
+
+        async def run_10():
+            return await asyncio.gather(
+                *[
+                    enroll_device(req, DeviceCreateInput(locket_id=lid, device_name=f'iPhone {i}', ios_version='18.2'))
+                    for i in range(10)
+                ],
+                return_exceptions=True,
+            )
+
+        res = asyncio.run(run_10())
+        ok = [r for r in res if isinstance(r, dict) and 'device_token' in r]
+        err = [r for r in res if isinstance(r, HTTPException) and r.status_code == 409]
+        # In both cases (max_devices=1 with 0 existing, or max_devices=2 with 1 legacy existing), only 1 new device can enroll!
+        assert len(ok) == 1
+        assert len(err) == 9
+        assert len(stored) == max_dev
+        assert sorted(d['slot_index'] for d in stored) == list(range(max_dev))

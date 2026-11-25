@@ -11,7 +11,7 @@ import os
 from pathlib import Path
 from cryptography import x509
 from cryptography.hazmat.primitives import serialization
-from cryptography.hazmat.primitives.serialization import Encoding
+from cryptography.hazmat.primitives.serialization import Encoding, PublicFormat
 from app.services.pki_service import (
     generate_lab_leaf_certificate,
     generate_lab_root_ca,
@@ -58,23 +58,81 @@ def generate_ca_and_leaf_files(
     ca_cert = None
     ca_reused = False
 
-    if not rotate and ca_key_path.is_file() and ca_pem_public_path.is_file():
-        try:
-            loaded_key = serialization.load_pem_private_key(ca_key_path.read_bytes(), password=None)
-            loaded_cert = x509.load_pem_x509_certificate(ca_pem_public_path.read_bytes())
+    key_exists = ca_key_path.exists()
+    cert_exists = ca_pem_public_path.exists()
+
+    if not rotate:
+        if key_exists != cert_exists:
+            raise RuntimeError(
+                'Inconsistent Root CA state: one of lab_root_ca.key or lab_root_ca.pem exists while the other is missing. '
+                'Refusing to overwrite existing Root CA state without --rotate.'
+            )
+        if key_exists and cert_exists:
+            if not ca_key_path.is_file() or not ca_pem_public_path.is_file():
+                raise RuntimeError(
+                    'Existing Root CA key or certificate path is not a regular file. '
+                    'Refusing to overwrite without --rotate.'
+                )
+            try:
+                key_raw = ca_key_path.read_bytes()
+                cert_raw = ca_pem_public_path.read_bytes()
+                loaded_key = serialization.load_pem_private_key(key_raw, password=None)
+                loaded_cert = x509.load_pem_x509_certificate(cert_raw)
+            except Exception as exc:
+                raise RuntimeError(
+                    'Existing Root CA key or certificate is unreadable or corrupted. '
+                    'Refusing to overwrite without --rotate.'
+                ) from exc
+
             existing_meta = inspect_certificate_metadata(loaded_cert)
-            if (
+            if not (
                 existing_meta.get('is_currently_valid')
                 and existing_meta.get('is_ca')
                 and existing_meta.get('is_self_signed')
             ):
-                ca_key = loaded_key
-                ca_cert = loaded_cert
-                ca_reused = True
-        except Exception:
-            ca_key = None
-            ca_cert = None
-            ca_reused = False
+                raise RuntimeError(
+                    'Existing Root CA certificate is expired, not a CA, or not self-signed. '
+                    'Refusing to overwrite without --rotate.'
+                )
+            try:
+                loaded_cert.verify_directly_issued_by(loaded_cert)
+            except Exception as exc:
+                raise RuntimeError(
+                    'Existing Root CA certificate self-signature verification failed. '
+                    'Refusing to overwrite without --rotate.'
+                ) from exc
+
+            cert_pub_bytes = loaded_cert.public_key().public_bytes(
+                Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+            )
+            key_pub_bytes = loaded_key.public_key().public_bytes(
+                Encoding.PEM, PublicFormat.SubjectPublicKeyInfo
+            )
+            if cert_pub_bytes != key_pub_bytes:
+                raise RuntimeError(
+                    'Existing Root CA certificate public key does not match lab_root_ca.key. '
+                    'Refusing to overwrite without --rotate.'
+                )
+
+            ca_key = loaded_key
+            ca_cert = loaded_cert
+            ca_reused = True
+    else:
+        # When explicitly rotating (--rotate), back up any existing Root CA files first
+        if ca_key_path.is_file():
+            bak_key = out_private / 'lab_root_ca.key.bak'
+            bak_key.write_bytes(ca_key_path.read_bytes())
+            try:
+                os.chmod(bak_key, 0o600)
+            except OSError:
+                pass
+        if ca_pem_public_path.is_file():
+            bak_pem = out_public / 'lab_root_ca.pem.bak'
+            bak_pem.write_bytes(ca_pem_public_path.read_bytes())
+            try:
+                os.chmod(bak_pem, 0o644)
+            except OSError:
+                pass
 
     if ca_key is None or ca_cert is None:
         ca_key, ca_cert = generate_lab_root_ca()
@@ -117,9 +175,9 @@ def generate_ca_and_leaf_files(
         )
     )
     try:
-        # 0o644 inside the 0700/0750 certs_private directory allows non-root Caddy container to read the leaf key
+        # 0o640 inside the 0750 certs_private directory restricts leaf key to owner and group (never world-readable)
         # while ca_key_path remains 0o600 (owner-only).
-        os.chmod(leaf_key_path, 0o644)
+        os.chmod(leaf_key_path, 0o640)
     except OSError:
         pass
     leaf_pem_bytes = leaf_cert.public_bytes(Encoding.PEM)

@@ -57,7 +57,26 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
         if len(active_list) >= max_devices:
             raise HTTPException(409, f'Account reached maximum active devices limit ({max_devices})')
 
-        used_slots = {d.get('slot_index') for d in active_list if isinstance(d.get('slot_index'), int)}
+        used_slots: set[int] = {
+            d['slot_index']
+            for d in active_list
+            if isinstance(d.get('slot_index'), int) and not isinstance(d.get('slot_index'), bool)
+        }
+        # Backfill deterministic slot_index for any active legacy device missing slot_index
+        for legacy_dev in active_list:
+            if not isinstance(legacy_dev.get('slot_index'), int) or isinstance(legacy_dev.get('slot_index'), bool):
+                for candidate_slot in range(max_devices):
+                    if candidate_slot not in used_slots:
+                        used_slots.add(candidate_slot)
+                        if hasattr(devices, 'update_one') and legacy_dev.get('device_id'):
+                            upd = devices.update_one(
+                                {'device_id': legacy_dev['device_id'], 'status': 'active'},
+                                {'$set': {'slot_index': candidate_slot}},
+                            )
+                            if hasattr(upd, '__await__'):
+                                await upd
+                        break
+
         chosen_slot = None
         for slot in range(max_devices):
             if slot not in used_slots:
@@ -69,6 +88,7 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
         now = datetime.now(timezone.utc)
         device_id = 'dev_' + secrets.token_hex(6)
         raw_token = 'lkg_dev_' + secrets.token_urlsafe(32)
+        token_hash = hash_device_token(raw_token)
         token_prefix = raw_token[:16]
 
         doc = {
@@ -77,7 +97,7 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
             'slot_index': chosen_slot,
             'device_name': data.device_name,
             'ios_version': data.ios_version,
-            'token_hash': hash_device_token(raw_token),
+            'token_hash': token_hash,
             'token_prefix': token_prefix,
             'status': 'active',
             'created_at': now,
@@ -89,12 +109,13 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
         except DuplicateKeyError as exc:
             raise HTTPException(409, f'Account reached maximum active devices limit ({max_devices})') from exc
 
-        # Post-insert verification in case an external process inserted concurrently without slot_index
+        # Post-insert verification in case an external process inserted concurrently without slot_index.
+        # Rollback strictly targets only the newly created (device_id, token_hash) from this request.
         verify_cur = devices.find({'locket_id': data.locket_id, 'status': 'active'}, {'_id': 0})
         after_list = await verify_cur.to_list(length=max_devices + 5)
         if isinstance(after_list, list) and len(after_list) > max_devices:
             if hasattr(devices, 'delete_one'):
-                del_res = devices.delete_one({'device_id': device_id})
+                del_res = devices.delete_one({'device_id': device_id, 'token_hash': token_hash})
                 if hasattr(del_res, '__await__'):
                     await del_res
             raise HTTPException(409, f'Account reached maximum active devices limit ({max_devices})')
@@ -121,14 +142,6 @@ async def verify_device_token(request, raw_token: str) -> dict | None:
     return doc
 
 
-def _get_in_memory_tickets(request) -> dict[str, dict]:
-    store = getattr(request.app.state, '_in_memory_download_tickets', None)
-    if store is None:
-        store = {}
-        request.app.state._in_memory_download_tickets = store
-    return store
-
-
 async def issue_profile_download_ticket(
     request,
     *,
@@ -139,9 +152,14 @@ async def issue_profile_download_ticket(
     """
     Issue a short-lived, single-use download ticket (`lkg_dl_*`) for Safari `.mobileconfig` downloads
     so long-lived Bearer/device tokens never appear in URLs, browser history, or access logs.
+    Requires MongoDB `download_tickets` collection (fail-closed; no multi-worker inconsistent in-memory fallback).
     """
     if not isinstance(device_doc, dict) or device_doc.get('status') != 'active':
         raise HTTPException(401, 'Device is not active')
+    tickets_col = getattr(request.app.state, 'download_tickets', None)
+    if tickets_col is None or not hasattr(tickets_col, 'insert_one'):
+        raise HTTPException(503, 'Download ticket storage unavailable')
+
     now = datetime.now(timezone.utc)
     expires_at = now + timedelta(seconds=max(30, min(ttl_seconds, 900)))
     raw_ticket = 'lkg_dl_' + secrets.token_urlsafe(24)
@@ -155,13 +173,9 @@ async def issue_profile_download_ticket(
         'created_at': now,
         'expires_at': expires_at,
     }
-    tickets_col = getattr(request.app.state, 'download_tickets', None)
-    if tickets_col is not None and hasattr(tickets_col, 'insert_one'):
-        res = tickets_col.insert_one(ticket_doc.copy())
-        if hasattr(res, '__await__'):
-            await res
-    else:
-        _get_in_memory_tickets(request)[ticket_hash] = ticket_doc.copy()
+    res = tickets_col.insert_one(ticket_doc.copy())
+    if hasattr(res, '__await__'):
+        await res
 
     return {
         'download_ticket': raw_ticket,
@@ -173,22 +187,32 @@ async def issue_profile_download_ticket(
     }
 
 
-async def consume_profile_download_ticket(request, raw_ticket: str) -> dict:
+async def consume_profile_download_ticket(
+    request,
+    raw_ticket: str,
+    *,
+    requested_mode: str | None = None,
+) -> dict:
     """
     Atomically consume a single-use profile download ticket (`lkg_dl_*`).
     Rejects malformed, expired, already-used (replay), or revoked-device tickets with HTTP 401.
+    Enforces strict ticket mode binding: if the client passes a `requested_mode` different from the
+    ticket's authorized `mode`, rejects with HTTP 403 (prevents URL mode tampering / privilege escalation).
     """
     if not isinstance(raw_ticket, str) or not raw_ticket.startswith('lkg_dl_') or not raw_ticket.isascii():
         raise HTTPException(401, 'Mã tải cấu hình (download ticket) không hợp lệ.')
+    tickets_col = getattr(request.app.state, 'download_tickets', None)
+    if tickets_col is None:
+        raise HTTPException(503, 'Download ticket storage unavailable')
+
     now = datetime.now(timezone.utc)
     ticket_hash = hash_device_token(raw_ticket)
 
     ticket_doc = None
-    tickets_col = getattr(request.app.state, 'download_tickets', None)
-    if tickets_col is not None and hasattr(tickets_col, 'find_one_and_delete'):
+    if hasattr(tickets_col, 'find_one_and_delete'):
         res = tickets_col.find_one_and_delete({'ticket_hash': ticket_hash})
         ticket_doc = await res if hasattr(res, '__await__') else res
-    elif tickets_col is not None and hasattr(tickets_col, 'find_one'):
+    elif hasattr(tickets_col, 'find_one'):
         res = tickets_col.find_one({'ticket_hash': ticket_hash})
         doc = await res if hasattr(res, '__await__') else res
         if isinstance(doc, dict):
@@ -196,8 +220,6 @@ async def consume_profile_download_ticket(request, raw_ticket: str) -> dict:
             if hasattr(del_res, '__await__'):
                 await del_res
             ticket_doc = doc
-    else:
-        ticket_doc = _get_in_memory_tickets(request).pop(ticket_hash, None)
 
     if not isinstance(ticket_doc, dict):
         raise HTTPException(401, 'Mã tải cấu hình không tồn tại hoặc đã được sử dụng (one-time ticket).')
@@ -205,6 +227,15 @@ async def consume_profile_download_ticket(request, raw_ticket: str) -> dict:
     exp = ticket_doc.get('expires_at')
     if not isinstance(exp, datetime) or exp <= now:
         raise HTTPException(401, 'Mã tải cấu hình đã hết hạn.')
+
+    # Enforce strict mode binding so a ticket issued for dns_only cannot be escalated to lab_ca/scoped_lab
+    authorized_mode = ticket_doc.get('mode') or 'scoped_lab'
+    if requested_mode is not None and requested_mode not in ('default', authorized_mode):
+        raise HTTPException(
+            403,
+            f"Mã tải cấu hình này chỉ được cấp quyền cho chế độ '{authorized_mode}', "
+            f"không được phép đổi sang chế độ '{requested_mode}'.",
+        )
 
     # Verify the associated device is still active and not revoked
     devices = getattr(request.app.state, 'devices', None)
@@ -214,4 +245,5 @@ async def consume_profile_download_ticket(request, raw_ticket: str) -> dict:
         if not isinstance(dev_doc, dict) or dev_doc.get('status') != 'active' or dev_doc.get('revoked_at') is not None:
             raise HTTPException(401, 'Thiết bị liên kết với mã tải này đã bị thu hồi.')
 
+    ticket_doc['mode'] = authorized_mode
     return ticket_doc

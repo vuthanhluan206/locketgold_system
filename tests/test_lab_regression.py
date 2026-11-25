@@ -255,10 +255,16 @@ def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
     audit.insert_one = AsyncMock(side_effect=lambda doc: audit_store.append(doc))
     lab_requests.insert_one = AsyncMock(side_effect=lambda doc: lab_req_store.append(doc))
 
+    tickets_store = {}
+    download_tickets = AsyncMock()
+    download_tickets.insert_one.side_effect = lambda doc: tickets_store.setdefault(doc['ticket_hash'], doc.copy())
+    download_tickets.find_one_and_delete.side_effect = lambda q: tickets_store.pop(q.get('ticket_hash'), None)
+
     app.dependency_overrides[get_accounts] = lambda: accounts
     app.state.accounts = accounts
     app.state.accounts_v2 = accounts_v2
     app.state.devices = devices
+    app.state.download_tickets = download_tickets
     app.state.admins = admins
     app.state.sessions = sessions
     app.state.audit = audit
