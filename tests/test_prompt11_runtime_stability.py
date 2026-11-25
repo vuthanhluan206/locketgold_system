@@ -1129,12 +1129,379 @@ def test_prompt17_groups_a_b_c_d_and_real_mobileconfig_file_verification(monkeyp
             assert sub_res.status_code == 200
             assert 'Gold' in sub_res.json()['subscriber']['entitlements']
 
-        # D09: Admin HTML contains Firebase UID display & dialog input IDs without extra tables or columns
+        # D09: Admin HTML contains Firebase UID display in Accounts table & automatic resolution message without manual UID input
         adm_html = client.get('/admin').text
-        assert 'id="accountFirebaseUid"' in adm_html
-        assert 'id="accountUsername"' in adm_html
+        assert 'id="accountFirebaseUid"' not in adm_html
+        assert 'Đang tìm Firebase UID...' in adm_html
         assert 'Chưa liên kết Firebase UID' in adm_html
         assert 'account-uid-meta' in adm_html
+    finally:
+        client.close()
+        get_settings.cache_clear()
+
+
+def test_prompt18_automatic_locket_id_to_firebase_uid_resolution_all_16_cases(monkeypatch, tmp_path):
+    """
+    Prompt 18 Section 7 — Mandatory 16 Test Scenarios for Automatic Locket ID -> Firebase UID Resolution:
+      1. Valid username resolves real 28-char Firebase UID via getUserByUsername.
+      2. Valid Locket share link (https://locket.cam/<username>) resolves real Firebase UID.
+      3. Direct 28-char Firebase UID input is verified against provider (fetchUserV2).
+      4. Nonexistent account -> not_found (HTTP 404), nothing saved to MongoDB.
+      5. Identity provider returns 401/403 -> auth_required (HTTP 502), nothing saved.
+      6. Identity provider returns 429 / RESOURCE_EXHAUSTED -> rate_limited (HTTP 429), nothing saved.
+      7. Timeout or network failure across retries -> lookup_unavailable (HTTP 503), nothing saved.
+      8. JSON missing UID field (or returning MongoDB ObjectId / UUIDv4 / placeholder) -> unverified (HTTP 422), nothing saved.
+      9. Returned UID/username does not match queried account -> conflict (HTTP 409), nothing saved.
+      10. Returned UID is already linked to a different account in MongoDB -> conflict (HTTP 409), nothing saved.
+      11. Returned UID differs from the account's existing verified UID in MongoDB -> conflict (HTTP 409), existing verified UID preserved.
+      12. End-to-end resolution & persistence in accounts_v2 (uid_resolved_at, uid_resolution_source, verification_status='verified_uid').
+      13. When no provider is configured (lookup_unavailable), no fake UID or record is saved.
+      14. Public lookup (/api/accounts/lookup) never leaks Firebase UID.
+      15. Staging environment cannot overwrite production database (locket_manager).
+      16. Root CA, DNS, and .mobileconfig generation remain 100% intact.
+    """
+    import json
+    import httpx
+    from pydantic import ValidationError
+    from app.config import Settings
+    from app.services.identity_service import is_valid_firebase_uid, resolve_locket_identity
+
+    # Verify helper rejects MongoDB ObjectId, 36-char UUID, and placeholders
+    assert is_valid_firebase_uid('507f1f77bcf86cd799439011') is False  # 24-char hex MongoDB ObjectId
+    assert is_valid_firebase_uid('550e8400-e29b-41d4-a716-446655440000') is False  # 36-char UUIDv4
+    assert is_valid_firebase_uid('UID_THUC_TE_TU_NGUON_TRA_CUU') is False
+    assert is_valid_firebase_uid('A' * 28) is False  # single repeated char
+    assert is_valid_firebase_uid('LocketRealUid9876543210AbCdE') is True
+
+    # Test 15: Staging environment strictly forbidden from using production database `locket_manager`
+    password = secrets.token_urlsafe(20)
+    encoded = hash_password(password)
+    with pytest.raises(ValidationError, match='locket_manager'):
+        Settings(
+            _env_file=None,
+            app_env='staging',
+            mongodb_database='locket_manager',
+            superadmin_email='admin@example.test',
+            superadmin_password_hash=encoded,
+            mongodb_uri='mongodb://127.0.0.1:27017',
+        )
+
+    pub_dir = tmp_path / 'p18_pub'
+    priv_dir = tmp_path / 'p18_priv'
+    domains = ['locketgold.vuthanhluan.bond', 'mock.lab.vuthanhluan.bond']
+    generate_ca_and_leaf_files(pub_dir, priv_dir, domains)
+    ca_pem_path = pub_dir / 'lab_root_ca.pem'
+
+    monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
+    monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
+    monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
+    monkeypatch.setenv('ALLOWED_HOSTS', '["localhost"]')
+    monkeypatch.setenv('REQUIRE_HTTPS', 'false')
+    monkeypatch.setenv('NEXTDNS_ID', 'a8b247')
+    monkeypatch.setenv('ROOT_CA_PATH', str(ca_pem_path))
+    monkeypatch.setenv('ROOT_CA_PEM', '')
+    monkeypatch.setenv('LOCKET_IDENTITY_LOOKUP_URL', '')
+    get_settings.cache_clear()
+
+    app = create_app()
+    v1_store: dict[str, dict] = {}
+    v2_store: dict[str, dict] = {}
+    sessions_store: dict[str, dict] = {}
+
+    class InMemoryAccountsV1:
+        async def find_one(self, q, projection=None):
+            return v1_store.get(q.get('locket_id'))
+
+        async def update_one(self, q, u, upsert=False):
+            lid = q['locket_id']
+            doc = v1_store.get(lid, {'locket_id': lid}).copy()
+            if '$set' in u:
+                doc.update(u['$set'])
+            v1_store[lid] = doc
+
+        def find(self, q, projection=None):
+            rows = sorted(v1_store.values(), key=lambda x: x['locket_id'])
+            c = MagicMock()
+            c.sort.return_value = c
+            c.skip.return_value = c
+            c.limit.return_value = c
+            c.to_list = AsyncMock(return_value=rows)
+            return c
+
+    class InMemoryAccountsV2:
+        async def find_one(self, q, projection=None):
+            for field in ('locket_id', 'username', 'firebase_uid'):
+                if field in q and q[field] is not None:
+                    for doc in v2_store.values():
+                        if doc.get(field) == q[field]:
+                            return doc.copy()
+            return None
+
+        async def update_one(self, q, u, upsert=False):
+            lid = q['locket_id']
+            doc = v2_store.get(lid, {'locket_id': lid}).copy()
+            if '$setOnInsert' in u and lid not in v2_store:
+                doc.update(u['$setOnInsert'])
+            if '$set' in u:
+                doc.update(u['$set'])
+            v2_store[lid] = doc
+
+        def find(self, q, projection=None):
+            rows = sorted(v2_store.values(), key=lambda x: x['locket_id'])
+            c = MagicMock()
+            c.sort.return_value = c
+            c.skip.return_value = c
+            c.limit.return_value = c
+            c.to_list = AsyncMock(return_value=rows)
+            return c
+
+    admin_doc = {
+        '_id': 'superadmin',
+        'email': 'admin@example.test',
+        'password_hash': encoded,
+        'auth_version': hashlib.sha256(encoded.encode()).hexdigest(),
+    }
+    admins = AsyncMock()
+    admins.find_one.return_value = admin_doc
+    sessions = AsyncMock()
+    sessions.insert_one.side_effect = lambda d: sessions_store.setdefault(d['_id'], d.copy())
+    sessions.find_one.side_effect = lambda q: sessions_store.get(q['_id'])
+    login_limits = AsyncMock()
+    login_limits.find_one_and_update.return_value = {'count': 1}
+
+    mem_v1 = InMemoryAccountsV1()
+    mem_v2 = InMemoryAccountsV2()
+    app.state.admins = admins
+    app.state.sessions = sessions
+    app.state.login_limits = login_limits
+    app.state.accounts = mem_v1
+    app.state.accounts_v2 = mem_v2
+    app.state.entitlements = AsyncMock()
+    app.state.profile = build_profile(get_settings())
+    app.dependency_overrides[get_accounts] = lambda: mem_v1
+
+    client = TestClient(app, base_url='http://localhost')
+    try:
+        login_res = client.post('/api/admin/login', json={'email': 'admin@example.test', 'password': password})
+        assert login_res.status_code == 200
+        auth_headers = {'Authorization': 'Bearer ' + login_res.json()['access_token']}
+        future_iso = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+
+        # Test 13: When no identity provider is configured (lookup_unavailable), adding account via UI (resolve_identity=True)
+        # or Locket link fails closed with HTTP 503 and writes NOTHING to MongoDB
+        r_unavail = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'no_provider_user', 'expires_date': future_iso, 'resolve_identity': True},
+        )
+        assert r_unavail.status_code == 503
+        assert 'lookup_unavailable' in r_unavail.json()['detail']
+        assert 'no_provider_user' not in v2_store and 'no_provider_user' not in v1_store
+
+        # Configure mock getUserByUsername / fetchUserV2 provider covering all response & error cases
+        uid_user_1 = 'RealFirebaseUidUserOne123456'
+        uid_link_2 = 'RealFirebaseUidLinkTwo654321'
+        uid_direct_3 = 'DirectInputFirebaseUid998877'
+        timeout_attempts = {'count': 0}
+
+        def mock_locket_provider(query: str, input_kind: str):
+            if query == 'example_user':
+                # Firebase Callable getUserByUsername response format
+                return (200, {'result': {'status': 200, 'data': {'uid': uid_user_1, 'username': 'example_user'}}})
+            if query == 'link_user':
+                return (200, {'result': {'status': 200, 'data': {'uid': uid_link_2, 'username': 'link_user'}}})
+            if query == uid_direct_3 and input_kind == 'firebase_uid':
+                return (200, {'result': {'status': 200, 'data': {'uid': uid_direct_3, 'username': 'direct_owner'}}})
+            if query == 'nonexistent_ghost':
+                return (404, {'result': {'status': 404, 'data': None}})
+            if query == 'auth_error_user':
+                return (401, {'error': {'code': 401, 'status': 'UNAUTHENTICATED', 'message': 'Expired token'}})
+            if query == 'rate_limited_user':
+                return (429, {'error': {'code': 429, 'status': 'RESOURCE_EXHAUSTED', 'message': 'Quota exceeded'}})
+            if query == 'timeout_user':
+                timeout_attempts['count'] += 1
+                raise httpx.TimeoutException('Simulated upstream timeout')
+            if query == 'missing_uid_user':
+                return (200, {'result': {'status': 200, 'data': {'username': 'missing_uid_user'}}})
+            if query == 'objectid_fake_user':
+                return (200, {'result': {'status': 200, 'data': {'uid': '507f1f77bcf86cd799439011', 'username': 'objectid_fake_user'}}})
+            if query == 'mismatch_user':
+                return (200, {'result': {'status': 200, 'data': {'uid': 'MismatchUidAbcdefghijklmn123', 'username': 'someone_else'}}})
+            if query == 'duplicate_uid_target':
+                # Returns uid_user_1 which is already bound to example_user!
+                return (200, {'result': {'status': 200, 'data': {'uid': uid_user_1, 'username': 'duplicate_uid_target'}}})
+            return (404, {'result': {'status': 404, 'data': None}})
+
+        app.state.identity_provider = mock_locket_provider
+
+        # Test 1 & Test 12: Valid username resolves UID automatically and persists in accounts_v2
+        r1 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'example_user', 'expires_date': future_iso},
+        )
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1['locket_id'] == 'example_user'
+        assert d1['username'] == 'example_user'
+        assert d1['firebase_uid'] == uid_user_1
+        assert d1['verification_status'] == 'verified_uid'
+        assert d1['verification_method'] == 'trusted_proof'
+        assert d1['verification_source'] == 'authorized_identity_provider'
+        assert d1['uid_resolution_source'] == 'getUserByUsername'
+        assert d1['uid_resolved_at'] is not None
+        assert v2_store['example_user']['_server_uid_proof'] is True
+        assert v2_store['example_user']['firebase_uid'] == uid_user_1
+
+        # Test 2: Valid Locket share link resolves UID automatically
+        r2 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'https://locket.cam/link_user', 'expires_date': future_iso},
+        )
+        assert r2.status_code == 200
+        d2 = r2.json()
+        assert d2['locket_id'] == 'link_user'
+        assert d2['username'] == 'link_user'
+        assert d2['firebase_uid'] == uid_link_2
+        assert d2['source_link'] == 'https://locket.cam/link_user'
+        assert d2['verification_status'] == 'verified_uid'
+
+        # Test 3: Direct 28-char Firebase UID input is verified via provider
+        r3 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': uid_direct_3, 'expires_date': future_iso},
+        )
+        assert r3.status_code == 200
+        d3 = r3.json()
+        assert d3['firebase_uid'] == uid_direct_3
+        assert d3['username'] == 'direct_owner'
+        assert d3['verification_status'] == 'verified_uid'
+        assert d3['uid_resolution_source'] == 'fetchUserV2'
+
+        # Test 4: Nonexistent account -> 404, not saved
+        r4 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'nonexistent_ghost', 'expires_date': future_iso},
+        )
+        assert r4.status_code == 404
+        assert 'nonexistent_ghost' not in v2_store
+
+        # Test 5: Provider returns 401/403 -> 502 (auth_required), not saved
+        r5 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'auth_error_user', 'expires_date': future_iso},
+        )
+        assert r5.status_code == 502
+        assert 'auth_required' in r5.json()['detail']
+        assert 'auth_error_user' not in v2_store
+
+        # Test 6: Provider returns 429 -> 429 (rate_limited), not saved
+        r6 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'rate_limited_user', 'expires_date': future_iso},
+        )
+        assert r6.status_code == 429
+        assert 'rate_limited' in r6.json()['detail']
+        assert 'rate_limited_user' not in v2_store
+
+        # Test 7: Timeout/network error retries up to max_retries and returns 503 (lookup_unavailable), not saved
+        r7 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'timeout_user', 'expires_date': future_iso},
+        )
+        assert r7.status_code == 503
+        assert timeout_attempts['count'] == 2  # Retried according to locket_identity_max_retries=2
+        assert 'timeout_user' not in v2_store
+
+        # Test 8: JSON missing UID field or containing MongoDB 24-hex ObjectId -> 422 (unverified), not saved
+        for bad_q in ('missing_uid_user', 'objectid_fake_user'):
+            r8 = client.post(
+                '/admin/add-account',
+                headers=auth_headers,
+                json={'locket_id': bad_q, 'expires_date': future_iso},
+            )
+            assert r8.status_code == 422
+            assert bad_q not in v2_store
+
+        # Test 9: Returned username/UID does not match queried account -> 409 (conflict), not saved
+        r9 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'mismatch_user', 'expires_date': future_iso},
+        )
+        assert r9.status_code == 409
+        assert 'mismatch_user' not in v2_store
+
+        # Test 10: UID already exists on another account in MongoDB -> 409 (conflict), not saved
+        r10 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'duplicate_uid_target', 'expires_date': future_iso},
+        )
+        assert r10.status_code == 409
+        assert 'duplicate_uid_target' not in v2_store
+
+        # Test 11: Provider returns a DIFFERENT UID for example_user than its already-verified UID in MongoDB -> 409 (conflict)
+        app.state.identity_provider = lambda q, k: (
+            200,
+            {'result': {'status': 200, 'data': {'uid': 'DifferentConflictingUid12345', 'username': 'example_user'}}},
+        )
+        r11 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'example_user', 'expires_date': future_iso},
+        )
+        assert r11.status_code == 409
+        # Existing verified UID in MongoDB MUST NOT be overwritten
+        assert v2_store['example_user']['firebase_uid'] == uid_user_1
+
+        # Also verify direct HTTP transport path of resolve_locket_identity with httpx.MockTransport
+        def mock_http_handler(request: httpx.Request) -> httpx.Response:
+            assert request.headers.get('Authorization') == 'Bearer test_locket_bearer_token'
+            body = json.loads(request.content.decode('utf-8'))
+            assert body == {'data': {'username': 'http_transport_user'}}
+            return httpx.Response(
+                200,
+                json={'result': {'status': 200, 'data': {'uid': 'HttpResolvedUid1234567890AbC', 'username': 'http_transport_user'}}},
+            )
+
+        s_http = Settings(
+            _env_file=None,
+            superadmin_email='admin@example.test',
+            superadmin_password_hash=encoded,
+            mongodb_uri='mongodb://127.0.0.1:27017',
+            locket_identity_lookup_url='https://api.locketcamera.com/getUserByUsername',
+            locket_identity_bearer_token='test_locket_bearer_token',
+        )
+        async def run_http_resolve():
+            transport = httpx.MockTransport(mock_http_handler)
+            async with httpx.AsyncClient(transport=transport) as hc:
+                return await resolve_locket_identity('http_transport_user', settings=s_http, accounts_v2=mem_v2, http_client=hc)
+
+        http_res = asyncio.run(run_http_resolve())
+        assert http_res.status == 'resolved'
+        assert http_res.firebase_uid == 'HttpResolvedUid1234567890AbC'
+
+        # Test 14: Public lookup returns ONLY {"exists": true/false} and never leaks firebase_uid
+        pub_res = client.get('/api/accounts/lookup?query=example_user')
+        assert pub_res.status_code == 200
+        assert pub_res.json() == {'exists': True}
+        assert uid_user_1 not in pub_res.text
+
+        # Test 16: Root CA, DNS, and .mobileconfig remain 100% intact
+        mc_res = client.get('/profile.mobileconfig')
+        assert mc_res.status_code == 200
+        pl = plistlib.loads(mc_res.content)
+        assert pl['PayloadIdentifier'] == 'bond.vuthanhluan.locketgold.profile'
+        assert len(pl['PayloadContent']) == 2
+        assert pl['PayloadContent'][0]['PayloadType'] == 'com.apple.dnsSettings.managed'
+        assert pl['PayloadContent'][1]['PayloadType'] == 'com.apple.security.root'
     finally:
         client.close()
         get_settings.cache_clear()

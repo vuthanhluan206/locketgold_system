@@ -39,7 +39,12 @@ from ..services.entitlement_service import (
     format_account_record,
     merge_canonical_and_legacy_account,
 )
-from ..services.identity_service import normalize_lookup_query, verify_account_link_or_identifier
+from ..services.identity_service import (
+    is_valid_firebase_uid,
+    normalize_lookup_query,
+    resolve_locket_identity,
+    verify_account_link_or_identifier,
+)
 from ..services.pki_service import inspect_certificate_metadata
 
 router = APIRouter()
@@ -476,73 +481,168 @@ async def upsert_account(
     admin: Annotated[dict, Depends(require_admin)],
 ):
     now = datetime.now(timezone.utc)
-    # 1. Maintain legacy document in `accounts` collection for backward compatibility (including status)
-    legacy_doc = {
-        'locket_id': data.locket_id,
-        'expires_date': data.expires_date,
-        'status': data.status,
-        'revoked_at': now if data.status == 'revoked' else None,
-    }
+    settings = get_settings()
     try:
-        await accounts.update_one({'locket_id': data.locket_id}, {'$set': legacy_doc}, upsert=True)
-    except DuplicateKeyError:
-        await accounts.update_one({'locket_id': data.locket_id}, {'$set': legacy_doc})
+        canonical_id, input_kind = normalize_lookup_query(data.locket_id)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
-    # 2. Write canonical v2 record to `accounts_v2` and `entitlements` (NEVER swallow write failures!)
-    # Enforce server-side verification honesty: Admin input can NEVER self-assert `verified_uid`
+    auto_source_link = f'https://locket.cam/{canonical_id}' if input_kind == 'locket_link' else data.source_link
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
+    provider = getattr(request.app.state, 'identity_provider', None)
+    has_provider = provider is not None or bool((getattr(settings, 'locket_identity_lookup_url', '') or '').strip())
+    must_resolve = bool(
+        data.resolve_identity
+        or has_provider
+        or getattr(settings, 'require_verified_uid_on_add', False)
+        or input_kind in {'locket_link', 'handle'}
+    )
+
     existing_v2 = None
     if accounts_v2 is not None and hasattr(accounts_v2, 'find_one'):
-        existing_res = accounts_v2.find_one({'locket_id': data.locket_id}, {'_id': 0})
+        existing_res = accounts_v2.find_one({'locket_id': canonical_id}, {'_id': 0})
         if hasattr(existing_res, '__await__'):
             existing_res = await existing_res
         if isinstance(existing_res, dict):
             existing_v2 = existing_res
 
-    is_28char_id = bool(len(data.locket_id) == 28 and data.locket_id.isalnum())
-    has_explicit_fb = bool(data.firebase_uid and data.firebase_uid.strip())
-    if has_explicit_fb or is_28char_id:
-        resolved_fb_uid = data.firebase_uid.strip() if has_explicit_fb else data.locket_id
-        # Preserve server-verified proof only if the existing record already had cryptographic proof for this exact UID
-        if (
+    uid_resolved_at = existing_v2.get('uid_resolved_at') if isinstance(existing_v2, dict) else None
+    uid_resolution_source = existing_v2.get('uid_resolution_source') if isinstance(existing_v2, dict) else None
+
+    if must_resolve:
+        resolution = await resolve_locket_identity(
+            data.locket_id,
+            settings=settings,
+            accounts_v2=accounts_v2,
+            provider=provider,
+        )
+        if resolution.status != 'resolved' or not resolution.firebase_uid:
+            status_map = {
+                'not_found': 404,
+                'auth_required': 502,
+                'rate_limited': 429,
+                'lookup_unavailable': 503,
+                'conflict': 409,
+                'unverified': 422,
+            }
+            http_code = status_map.get(resolution.status, 503)
+            await record_audit(
+                request,
+                admin,
+                'ACCOUNT_UID_RESOLUTION_FAILED',
+                canonical_id,
+                {'resolution_status': resolution.status, 'input_kind': input_kind},
+            )
+            raise HTTPException(http_code, resolution.message)
+
+        canonical_id = resolution.normalized_id
+        resolved_username = resolution.username or data.username
+        resolved_fb_uid = resolution.firebase_uid
+        auto_source_link = resolution.source_link or auto_source_link
+        safe_ver_status = 'verified_uid'
+        safe_ver_method = 'trusted_proof'
+        safe_ver_source = resolution.verification_source or 'authorized_identity_provider'
+        server_proof = True
+        uid_resolved_at = resolution.uid_resolved_at or now
+        uid_resolution_source = resolution.uid_resolution_source or 'authorized_identity_provider'
+    else:
+        is_28char_id = is_valid_firebase_uid(canonical_id)
+        has_explicit_fb = bool(data.firebase_uid and data.firebase_uid.strip())
+        resolved_username = data.username
+        if has_explicit_fb or is_28char_id:
+            resolved_fb_uid = data.firebase_uid.strip() if has_explicit_fb else canonical_id
+            # Conflict check 1: Never overwrite an existing verified UID with a different UID
+            if (
+                isinstance(existing_v2, dict)
+                and existing_v2.get('_server_uid_proof') is True
+                and existing_v2.get('verification_status') == 'verified_uid'
+                and existing_v2.get('firebase_uid')
+                and existing_v2.get('firebase_uid') != resolved_fb_uid
+            ):
+                raise HTTPException(
+                    409,
+                    'Không thể ghi đè Firebase UID đã được xác minh bằng một UID khác (conflict).',
+                )
+            # Conflict check 2: Never link a Firebase UID that is already attached to another account
+            if accounts_v2 is not None and hasattr(accounts_v2, 'find_one'):
+                try:
+                    owner_res = accounts_v2.find_one({'firebase_uid': resolved_fb_uid}, {'_id': 0})
+                    if hasattr(owner_res, '__await__'):
+                        owner_res = await owner_res
+                except KeyError:
+                    owner_res = None
+                if isinstance(owner_res, dict) and owner_res.get('locket_id') and owner_res.get('locket_id') != canonical_id:
+                    raise HTTPException(
+                        409,
+                        f'Firebase UID này đã được gắn với tài khoản "{owner_res.get("locket_id")}" trong MongoDB (conflict).',
+                    )
+            if (
+                isinstance(existing_v2, dict)
+                and existing_v2.get('_server_uid_proof') is True
+                and existing_v2.get('firebase_uid') == resolved_fb_uid
+                and existing_v2.get('verification_status') == 'verified_uid'
+            ):
+                safe_ver_status = 'verified_uid'
+                safe_ver_method = existing_v2.get('verification_method', 'trusted_proof')
+                safe_ver_source = existing_v2.get('verification_source', 'authorized_identity_provider')
+                server_proof = True
+            else:
+                safe_ver_status = 'unverified_uid'
+                safe_ver_method = 'format_only_uid'
+                safe_ver_source = 'admin_manual_input'
+                server_proof = False
+        elif (
             isinstance(existing_v2, dict)
             and existing_v2.get('_server_uid_proof') is True
-            and existing_v2.get('firebase_uid') == resolved_fb_uid
             and existing_v2.get('verification_status') == 'verified_uid'
+            and existing_v2.get('firebase_uid')
         ):
+            # Preserve existing verified UID when renewing expiry date
+            resolved_fb_uid = existing_v2['firebase_uid']
+            resolved_username = resolved_username or existing_v2.get('username')
             safe_ver_status = 'verified_uid'
             safe_ver_method = existing_v2.get('verification_method', 'trusted_proof')
-            safe_ver_source = existing_v2.get('verification_source', 'verified_subscriber_traffic')
+            safe_ver_source = existing_v2.get('verification_source', 'authorized_identity_provider')
             server_proof = True
-        else:
-            safe_ver_status = 'unverified_uid'
-            safe_ver_method = 'format_only_uid'
+        elif resolved_username or data.verification_status == 'unverified_handle':
+            safe_ver_status = 'unverified_handle'
+            safe_ver_method = 'link_handle_only'
             safe_ver_source = 'admin_manual_input'
+            resolved_fb_uid = None
             server_proof = False
-    elif data.username or data.verification_status == 'unverified_handle':
-        safe_ver_status = 'unverified_handle'
-        safe_ver_method = 'link_handle_only'
-        safe_ver_source = 'admin_manual_input'
-        resolved_fb_uid = None
-        server_proof = False
-    else:
-        safe_ver_status = 'manual_lab_id'
-        safe_ver_method = 'admin_manual_override'
-        safe_ver_source = 'admin_direct_input'
-        resolved_fb_uid = None
-        server_proof = False
+        else:
+            safe_ver_status = 'manual_lab_id'
+            safe_ver_method = 'admin_manual_override'
+            safe_ver_source = 'admin_direct_input'
+            resolved_fb_uid = None
+            server_proof = False
 
+    # 1. Maintain legacy document in `accounts` collection for backward compatibility (including status)
+    legacy_doc = {
+        'locket_id': canonical_id,
+        'expires_date': data.expires_date,
+        'status': data.status,
+        'revoked_at': now if data.status == 'revoked' else None,
+    }
+    try:
+        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc}, upsert=True)
+    except DuplicateKeyError:
+        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc})
+
+    # 2. Write canonical v2 record to `accounts_v2` and `entitlements` (NEVER swallow write failures!)
     v2_doc = {
         'schema_version': 2,
-        'account_id': data.locket_id,
-        'locket_id': data.locket_id,
-        'username': data.username,
+        'account_id': canonical_id,
+        'locket_id': canonical_id,
+        'username': resolved_username,
         'firebase_uid': resolved_fb_uid,
-        'source_link': data.source_link,
+        'source_link': auto_source_link,
         'verification_status': safe_ver_status,
         'verification_method': safe_ver_method,
         'verification_source': safe_ver_source,
         '_server_uid_proof': server_proof,
+        'uid_resolved_at': uid_resolved_at,
+        'uid_resolution_source': uid_resolution_source,
         'status': data.status,
         'product_identifier': 'com.locket.gold.yearly',
         'expires_date': data.expires_date,
@@ -554,21 +654,26 @@ async def upsert_account(
         'updated_by': admin.get('email', 'superadmin'),
     }
     if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
-        res = accounts_v2.update_one(
-            {'locket_id': data.locket_id},
-            {'$set': v2_doc, '$setOnInsert': {'created_at': now, 'purchase_date': now}},
-            upsert=True,
-        )
-        if hasattr(res, '__await__'):
-            await res
+        try:
+            res = accounts_v2.update_one(
+                {'locket_id': canonical_id},
+                {'$set': v2_doc, '$setOnInsert': {'created_at': now, 'purchase_date': now}},
+                upsert=True,
+            )
+            if hasattr(res, '__await__'):
+                await res
+        except DuplicateKeyError:
+            res = accounts_v2.update_one({'locket_id': canonical_id}, {'$set': v2_doc})
+            if hasattr(res, '__await__'):
+                await res
 
     entitlements = getattr(request.app.state, 'entitlements', None)
     if entitlements is not None and hasattr(entitlements, 'update_one'):
         res = entitlements.update_one(
-            {'account_id': data.locket_id, 'entitlement_key': 'Gold'},
+            {'account_id': canonical_id, 'entitlement_key': 'Gold'},
             {
                 '$set': {
-                    'account_id': data.locket_id,
+                    'account_id': canonical_id,
                     'entitlement_key': 'Gold',
                     'product_identifier': 'com.locket.gold.yearly',
                     'status': data.status,
@@ -587,8 +692,13 @@ async def upsert_account(
         request,
         admin,
         'ACCOUNT_UPSERT',
-        data.locket_id,
-        {'expires_date': data.expires_date.isoformat(), 'status': data.status},
+        canonical_id,
+        {
+            'expires_date': data.expires_date.isoformat(),
+            'status': data.status,
+            'firebase_uid': resolved_fb_uid,
+            'verification_status': safe_ver_status,
+        },
     )
     return format_account_record(v2_doc, now)
 

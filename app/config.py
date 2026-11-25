@@ -71,6 +71,15 @@ class Settings(BaseSettings):
     turnstile_secret_key: SecretStr = SecretStr('')
     turnstile_hostname: str = ''
     trusted_proxy_cidrs: Annotated[list[str], NoDecode] = Field(default_factory=list)
+    locket_identity_lookup_url: str = Field(default='', max_length=256)
+    locket_identity_uid_verify_url: str = Field(default='', max_length=256)
+    locket_identity_bearer_token: SecretStr = SecretStr('')
+    locket_firebase_app_check_token: SecretStr = SecretStr('')
+    locket_firebase_api_key: SecretStr = SecretStr('')
+    locket_firebase_refresh_token: SecretStr = SecretStr('')
+    locket_identity_timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
+    locket_identity_max_retries: int = Field(default=2, ge=1, le=5)
+    require_verified_uid_on_add: bool = Field(default=False)
 
     @model_validator(mode='before')
     @classmethod
