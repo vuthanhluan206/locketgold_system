@@ -67,13 +67,16 @@ def resolve_lab_dns_wireformat(
     *,
     allowed_domains: list[str],
     target_ipv4: str = '127.0.0.1',
+    target_ipv6: str = '',
     ttl: int = 60,
 ) -> tuple[bytes, dict]:
     """
     Resolve an RFC 8484 DNS wireformat query strictly for domains in `allowed_domains`.
     - If `qname` is in `allowed_domains` and `qtype == TYPE_A (1)`, returns `NOERROR` with the configured `target_ipv4`.
-    - If `qname` is in `allowed_domains` and `qtype != TYPE_A` (e.g. AAAA/HTTPS/SVCB), returns `NOERROR` with 0 answers (NODATA)
-      so dual-stack iOS clients do not bypass the IPv4 Lab listener via IPv6 or SVCB.
+    - If `qname` is in `allowed_domains` and `qtype == TYPE_AAAA (28)`:
+      - When `target_ipv6` is configured, returns `NOERROR` with the 16-byte AAAA record.
+      - When `target_ipv6` is empty, returns `NOERROR` with 0 answers (`NOERROR_NODATA`) so dual-stack iOS clients
+        cleanly fall back to the IPv4 Lab listener rather than failing or bypassing via IPv6.
     - If `qname` is NOT in `allowed_domains`, returns `REFUSED` (rcode=5) so the endpoint never operates as an open resolver.
     """
     txid, req_flags, qname, qtype, qclass, q_end = parse_dns_question(packet)
@@ -106,7 +109,19 @@ def resolve_lab_dns_wireformat(
             'answer_ip': target_ipv4,
         }
 
-    # Authoritative NODATA (0 answers) for AAAA / SVCB / HTTPS on lab-scoped domains
+    if qtype == TYPE_AAAA and qclass == CLASS_IN and target_ipv6.strip():
+        ip6_bytes = ipaddress.IPv6Address(target_ipv6.strip()).packed
+        resp_flags = 0x8480 | rd_bit | RCODE_NOERROR
+        header = struct.pack('!HHHHHH', txid, resp_flags, 1, 1, 0, 0)
+        answer = struct.pack('!HHHLH', 0xC00C, TYPE_AAAA, CLASS_IN, ttl, 16) + ip6_bytes
+        return header + question_bytes + answer, {
+            'qname': qname,
+            'qtype': qtype,
+            'rcode': 'NOERROR',
+            'answer_ip': target_ipv6.strip(),
+        }
+
+    # Authoritative NODATA (0 answers) for AAAA (when IPv6 not configured) / SVCB / HTTPS on lab-scoped domains
     resp_flags = 0x8480 | rd_bit | RCODE_NOERROR
     header = struct.pack('!HHHHHH', txid, resp_flags, 1, 0, 0, 0)
     return header + question_bytes, {

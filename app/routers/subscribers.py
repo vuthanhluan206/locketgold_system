@@ -179,6 +179,7 @@ async def doh_get_query(
                 packet,
                 allowed_domains=settings.lab_scoped_domains,
                 target_ipv4=settings.lab_dns_target_ip,
+                target_ipv6=getattr(settings, 'lab_dns_target_ipv6', ''),
             )
         except Exception as exc:
             raise HTTPException(400, 'Malformed RFC 8484 DNS query packet') from exc
@@ -193,11 +194,16 @@ async def doh_get_query(
                 content={'Status': 5, 'Comment': 'REFUSED: Domain outside controlled Research Lab scope', 'Question': [{'name': qname, 'type': 1}], 'Answer': []},
             )
         qtype_upper = type.strip().upper()
-        answers = (
-            [{'name': qname, 'type': 1, 'TTL': 60, 'data': settings.lab_dns_target_ip}]
-            if qtype_upper in {'A', '1'}
-            else []
-        )
+        target_v6 = getattr(settings, 'lab_dns_target_ipv6', '').strip()
+        if qtype_upper in {'A', '1'}:
+            answers = [{'name': qname, 'type': 1, 'TTL': 60, 'data': settings.lab_dns_target_ip}]
+            qtype_num = 1
+        elif qtype_upper in {'AAAA', '28'} and target_v6:
+            answers = [{'name': qname, 'type': 28, 'TTL': 60, 'data': target_v6}]
+            qtype_num = 28
+        else:
+            answers = []
+            qtype_num = 28 if qtype_upper in {'AAAA', '28'} else 65
         return JSONResponse(
             status_code=200,
             content={
@@ -207,7 +213,8 @@ async def doh_get_query(
                 'RA': True,
                 'AD': False,
                 'CD': False,
-                'Question': [{'name': qname, 'type': 1 if qtype_upper in {'A', '1'} else 28}],
+                'LabMode': getattr(settings, 'lab_mode', 'local'),
+                'Question': [{'name': qname, 'type': qtype_num}],
                 'Answer': answers,
             },
         )
@@ -225,6 +232,7 @@ async def doh_post_query(request: Request, device_label: str | None = None):
             body,
             allowed_domains=settings.lab_scoped_domains,
             target_ipv4=settings.lab_dns_target_ip,
+            target_ipv6=getattr(settings, 'lab_dns_target_ipv6', ''),
         )
     except Exception as exc:
         raise HTTPException(400, 'Malformed RFC 8484 DNS query packet') from exc

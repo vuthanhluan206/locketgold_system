@@ -331,13 +331,15 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
         assert "Gold" in sub_active.json()["subscriber"]["entitlements"]
 
         # Check 13: Client report clearly states simulated lab response vs official app
-        report_txt = format_entitlement_report(
-            "https://mock.lab.vuthanhluan.bond/v1/subscribers/auto_user",
+        report_dict = format_entitlement_report(
+            "auto_user",
             200,
             dict(sub_active.headers),
             sub_active.json(),
         )
-        assert "GOLD ACTIVE (Simulated in Lab)" in report_txt
+        assert report_dict["gold_active"] is True
+        assert report_dict["lab_entitlement_status"] == "active"
+        assert "SIMULATED_LAB_ENTITLEMENT_ONLY" in report_dict["scope_disclaimer"]
 
         # Check 11: Revoked account immediately denied Gold
         assert http.post("/admin/accounts/auto_user/revoke", headers=admin_hdr, json={"reason": "test"}).status_code == 200

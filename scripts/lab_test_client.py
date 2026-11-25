@@ -30,6 +30,7 @@ def format_entitlement_report(account_id: str, status_code: int, headers: dict, 
         'product_identifier': gold.get('product_identifier') if isinstance(gold, dict) else None,
         'expires_date': gold.get('expires_date') if isinstance(gold, dict) else None,
         'raw_entitlements': entitlements,
+        'scope_disclaimer': 'SIMULATED_LAB_ENTITLEMENT_ONLY (Not an official Locket or App Store purchase verification)',
     }
 
 

@@ -37,10 +37,10 @@ def create_app() -> FastAPI:
             headers=security_headers(request.state.csp_nonce, request.url.scheme == 'https'),
         )
 
+    app.include_router(subscribers.router)
     app.include_router(management.router)
     app.include_router(auth_router)
     app.include_router(management.admin_router)
-    app.include_router(subscribers.router)
     app.include_router(proxy_router)
     return app
 

@@ -1,106 +1,134 @@
-# HƯỚNG DẪN TRIỂN KHAI STAGING KHÔNG XUNG ĐỘT CỔNG (`DEPLOY_STAGING.md`)
+# HƯỚNG DẪN TRIỂN KHAI STAGING TRÊN UBUNTU VPS (`DEPLOY_STAGING.md`)
 
-Tài liệu này hướng dẫn triển khai và kiểm thử bản mã nguồn `locketgold_system` ở chế độ **Staging** ngay trên VPS `103.118.29.159` (~1 GB RAM) **trong khi hệ thống `locket.gold` cũ vẫn đang chạy bình thường trên cổng 80 và 443**.
-
----
-
-## 1. KIẾN TRÚC CÔ LẬP STAGING (`compose.staging.yaml`) & BẢO VỆ DATABASE PRODUCTION
-
-1. **Không xung đột cổng 80/443**:
-   - Container `locket_staging_api` chỉ bind vào loopback `127.0.0.1:18000:8000` (`mem_limit: 256m`).
-   - Container tùy chọn `locket_staging_lab_https` được đặt trong `profiles: ["lab"]` và chỉ bind vào loopback `127.0.0.1:18443:8443` và `127.0.0.1:18081:8081` (`mem_limit: 64m`). Khi chạy lệnh `docker compose -p locket_staging -f compose.staging.yaml up -d`, chỉ có `api` khởi động nên **không bắt buộc** phải tạo trước chứng chỉ Lab nếu chỉ kiểm thử API/DNS-only.
-2. **Bảo vệ tuyệt đối Database Production (`locket_manager`)**:
-   - **QUY TẮC BẮT BUỘC:** Khi chạy các bài kiểm thử Staging có thao tác ghi dữ liệu (thêm/sửa/xóa tài khoản thử nghiệm, enroll thiết bị, test rollback), **TUYỆT ĐỐI KHÔNG** đặt `MONGODB_DATABASE=locket_manager` (database production).
-   - Phải đặt tên database riêng cho Staging trong file `.env.staging` (hoặc `.env` của thư mục staging):
-     ```dotenv
-     MONGODB_DATABASE=locket_manager_staging
-     ```
-   - Chỉ khi chạy lệnh kiểm tra `scripts/migrate_db.py --dry-run` (chế độ chỉ đọc 100%, không ghi) hoặc khi thực hiện Cutover chính thức theo `DEPLOY_PRODUCTION.md` mới trỏ về `MONGODB_DATABASE=locket_manager`.
+**Dự án:** Locket Gold Research & Entitlement Lab (`locketgold_system`)
+**Hạ tầng mục tiêu:** Ubuntu VPS (`103.118.29.159`, ~1 GB RAM, tên miền production `locketgold.vuthanhluan.bond`, NextDNS ID `a8b247`, MongoDB Atlas)
+**Trạng thái các lệnh:** Toàn bộ cấu hình Docker Compose, quyền ghi UID `10001`, khởi tạo chứng chỉ `ca_init` và 20 bước E2E đã được kiểm chứng tự động trên Linux container runner (`ubuntu-latest`); các lệnh SSH trực tiếp trên VPS `103.118.29.159` được thiết kế sẵn sàng để người vận hành copy/paste thực thi (`READY FOR VPS TESTING`).
 
 ---
 
-## 2. CÁC BƯỚC TRIỂN KHAI STAGING TRÊN VPS
+## 1. NGUYÊN TẮC CÔ LẬP STAGING VỚI PRODUCTION ĐANG CHẠY TRÊN VPS
 
-### Bước 1: Clone mã nguồn vào thư mục Staging riêng
+1. **Không chạm cổng 80/443 của Production**: Container Caddy của hệ thống cũ đang giữ cổng `80` và `443`. Stack `compose.staging.yaml` chỉ bind vào loopback `127.0.0.1:18000:8000` (Core API) và tùy chọn `127.0.0.1:18443:8443` (`--profile lab`), tuyệt đối không gây xung đột cổng.
+2. **Không dùng nhầm `.env` hay Database `locket_manager` của Production**:
+   - `compose.staging.yaml` nạp biến môi trường từ `.env.staging` (`${STAGING_ENV_FILE:-.env.staging}`) và gắn cứng `APP_ENV=staging`.
+   - Khi `APP_ENV=staging`, ứng dụng sẽ **từ chối khởi động ngay lập tức** nếu `MONGODB_DATABASE=locket_manager`. Bắt buộc sử dụng `MONGODB_DATABASE=locket_manager_staging`.
+3. **Phân quyền tối thiểu UID `10001` (Không chạy FastAPI bằng root, không dùng `chmod 0777`)**:
+   - Container `api` chạy dưới user `appuser` (`10001:10001`), chỉ mount `./certs_public:/app/certs_public:ro` (chỉ đọc chứng chỉ công khai, **không mount** `certs_private`) và `./backups:/app/backups`.
+   - Chứng chỉ Root CA và Leaf được tạo trước bằng container one-shot `ca_init` (`--profile ca_init`, `user: "10001:10001"`).
+
+---
+
+## 2. QUY TRÌNH 12 BƯỚC COPY/PASTE TRIỂN KHAI STAGING TRÊN VPS
+
+### Bước 1: Kiểm tra RAM và các cổng đang sử dụng trên VPS
 
 ```bash
-sudo mkdir -p /opt/locketgold_v2
-sudo chown $USER:$USER /opt/locketgold_v2
-git clone -b fix/security-staging-readiness https://github.com/vuthanhluan206/locketgold_system.git /opt/locketgold_v2
-cd /opt/locketgold_v2
+free -m
+ss -tulpn | grep -E ':(80|443|18000|18443|18081)\b'
+docker ps --format "table {{.Names}}\t{{.Status}}\t{{.Ports}}"
+```
+
+### Bước 2: Clone mã nguồn vào thư mục `/opt/locketgold_staging` (Tách biệt khỏi thư mục Production)
+
+```bash
+sudo mkdir -p /opt/locketgold_staging
+sudo chown $USER:$USER /opt/locketgold_staging
+git clone --branch main https://github.com/vuthanhluan206/locketgold_system.git /opt/locketgold_staging
+cd /opt/locketgold_staging
+git rev-parse HEAD
+```
+
+### Bước 3: Tạo thư mục Volume với quyền tối thiểu cho UID `10001`
+
+```bash
 mkdir -p backups certs_public certs_private
+sudo chown -R 10001:10001 backups certs_public certs_private
+chmod 0755 backups certs_public
+chmod 0750 certs_private
 ```
 
-### Bước 2: Chuẩn bị file `.env` cho Staging (Cô lập Database Test)
+### Bước 4: Tạo file cấu hình `.env.staging` riêng biệt
 
 ```bash
-cp .env.example .env
-nano .env
+cp .env.staging.example .env.staging
+nano .env.staging
 ```
 
-Các thiết lập quan trọng trong `/opt/locketgold_v2/.env` khi chạy Staging:
-- `MONGODB_DATABASE=locket_manager_staging` (Cô lập hoàn toàn khỏi `locket_manager` production khi test ghi dữ liệu).
-- `REQUIRE_HTTPS=true` và `TRUSTED_PROXY_CIDRS=["127.0.0.1/32","172.16.0.0/12"]`:
-  - Các health/readiness probes từ loopback (`http://127.0.0.1:8000/api/health` và `/api/ready`) được phép đi qua HTTP nội bộ.
-  - Các request đi qua Caddy Reverse Proxy (kèm `X-Forwarded-Proto: https` từ dải IP `TRUSTED_PROXY_CIDRS`) được nhận diện là HTTPS hợp lệ và không bao giờ gặp lỗi HTTP `400` hay `502`.
-- `ENABLE_RESEARCH_PROXY=false` (mặc định tắt proxy bên thứ ba).
-- `ALLOWED_HOSTS=["locketgold.vuthanhluan.bond","localhost","127.0.0.1","[::1]"]`.
+Đảm bảo các giá trị sau trong `.env.staging`:
+- `APP_ENV=staging`
+- `MONGODB_DATABASE=locket_manager_staging` (Khuyến nghị tạo user MongoDB Atlas chỉ có quyền `readWrite` trên database `locket_manager_staging`).
+- `NEXTDNS_ID=a8b247`
+- Nếu kiểm thử Mode A (Core Staging qua loopback / SSH tunnel): `REQUIRE_HTTPS=false`, `TRUSTED_PROXY_CIDRS=[]`, `LAB_MODE=local`.
+- Nếu kiểm thử với iPhone thật từ bên ngoài (`LAB_MODE=real_device`): đặt `LAB_DNS_TARGET_IP=103.118.29.159` (không được đặt `127.0.0.1`).
 
-### Bước 3: Khởi chạy Core Staging Stack (Không cần bật Lab CA tùy chọn)
+### Bước 5: Build Docker Image Staging & Chạy Kiểm tra Preflight
 
 ```bash
-docker compose -p locket_staging -f compose.staging.yaml up -d --build
+docker compose -p locket_staging -f compose.staging.yaml build api ca_init
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.staging_preflight --ping --backup-dir /app/backups
 ```
 
-Kiểm tra trạng thái container và probes:
+*(Lệnh `staging_preflight` sẽ xác nhận `database: "locket_manager_staging"`, `production_database_protected: true`, `backup_dir_writable: true`, `mongodb_ping: "ok"` mà không in mật khẩu hay URI thật ra màn hình).*
+
+### Bước 6: Khởi động Core Staging API (`locket_staging_api`)
 
 ```bash
+docker compose -p locket_staging -f compose.staging.yaml up -d api
 docker compose -p locket_staging -f compose.staging.yaml ps
-curl -fsS http://127.0.0.1:18000/api/health | jq .
-curl -fsS http://127.0.0.1:18000/api/ready | jq .
 ```
 
-### Bước 4 (Tùy chọn): Sinh chứng chỉ Research Lab & Bật `--profile lab`
-
-Nếu muốn kiểm thử thêm listener HTTPS Lab trên `127.0.0.1:18443` và tải profile `?mode=lab_ca`:
-
-```bash
-# 1. Sinh Root CA (public: certs_public/, private: certs_private/)
-docker exec locket_staging_api python -m scripts.generate_lab_ca --out-public /app/certs_public --out-private /app/certs_private --domains locketgold.vuthanhluan.bond,mock.lab.vuthanhluan.bond,sub.lab.vuthanhluan.bond
-
-# 2. Khởi chạy thêm container lab_https qua profile "lab"
-docker compose -p locket_staging -f compose.staging.yaml --profile lab up -d
-```
-
----
-
-## 3. KIỂM THỬ XÁC MINH TRÊN STAGING (SMOKE TESTS)
-
-### 3.1. Kiểm tra Liveness (`/api/health`) và MongoDB Readiness (`/api/ready`)
+### Bước 7: Kiểm tra Health và Readiness Probes trên Loopback `127.0.0.1:18000`
 
 ```bash
 curl -fsS http://127.0.0.1:18000/api/health | jq .
 curl -fsS http://127.0.0.1:18000/api/ready | jq .
 ```
 
-### 3.2. Kiểm tra HTTPS Forwarding (Mô phỏng Caddy -> FastAPI với `REQUIRE_HTTPS=true`)
+### Bước 8: Nạp dữ liệu thử nghiệm mẫu vào `locket_manager_staging` & Kiểm thử Tra cứu
 
 ```bash
-curl -fsSI -H "Host: locketgold.vuthanhluan.bond" -H "X-Forwarded-Proto: https" http://127.0.0.1:18000/
-curl -fsSI -H "Host: locketgold.vuthanhluan.bond" -H "X-Forwarded-Proto: https" "http://127.0.0.1:18000/profile.mobileconfig?mode=dns_only"
-curl -fsS -H "Host: locketgold.vuthanhluan.bond" -H "X-Forwarded-Proto: https" "http://127.0.0.1:18000/api/accounts/lookup?query=https://locket.cam/testuser" | jq .
+docker exec locket_staging_api python -m scripts.seed_staging_db
+curl -fsS "http://127.0.0.1:18000/api/accounts/lookup?query=https://locket.cam/staging_active_user" | jq .
+curl -fsS "http://127.0.0.1:18000/api/accounts/lookup?query=nonexistent_user" | jq .
 ```
 
-### 3.3. Kiểm tra Sao lưu bền vững trên `./backups` (Không mất file sau khi container `--rm` kết thúc)
+### Bước 9 (Tùy chọn): Khởi tạo Chứng chỉ Lab bằng `ca_init` & Bật HTTPS Research Lab (`--profile lab`)
 
 ```bash
-docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --backup /app/backups/staging_test_backup.json --dry-run
-ls -lh ./backups/staging_test_backup.json
-docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --verify-backup /app/backups/staging_test_backup.json
+# 1. Chạy one-shot container ca_init (UID 10001) để sinh Root CA (certs_public/) và Leaf TLS (certs_private/)
+docker compose -p locket_staging -f compose.staging.yaml --profile ca_init run --rm ca_init
+ls -la certs_public/lab_root_ca.pem certs_private/lab_leaf.pem certs_private/lab_leaf.key
+
+# 2. Đặt ROOT_CA_PATH=/app/certs_public/lab_root_ca.pem trong .env.staging rồi bật cả api và lab_https
+sed -i 's|^ROOT_CA_PATH=.*|ROOT_CA_PATH=/app/certs_public/lab_root_ca.pem|' .env.staging
+docker compose -p locket_staging -f compose.staging.yaml --profile lab up -d api lab_https
 ```
 
-### 3.4. Dọn dẹp Staging sau khi kiểm thử
+### Bước 10: Kiểm tra Mobileconfig (3 chế độ) & Xác thực TLS SNI/Hostname của HTTPS Lab
 
 ```bash
-docker compose -p locket_staging -f compose.staging.yaml --profile lab down
+# 1. Tải thử 3 chế độ mobileconfig
+curl -fsSI "http://127.0.0.1:18000/profile.mobileconfig?mode=dns_only"
+curl -fsSI "http://127.0.0.1:18000/profile.mobileconfig?mode=lab_ca"
+curl -fsSI "http://127.0.0.1:18000/profile.mobileconfig?mode=scoped_lab"
+
+# 2. Kiểm tra kết nối HTTPS tới Caddy Lab (127.0.0.1:18443) với xác thực đầy đủ Root CA + SNI + SAN hostname (KHÔNG dùng -k!)
+curl -fsS --cacert ./certs_public/lab_root_ca.pem --resolve mock.lab.vuthanhluan.bond:18443:127.0.0.1 https://mock.lab.vuthanhluan.bond:18443/api/health | jq .
+```
+
+### Bước 11: Kiểm tra Sao lưu bền vững trên Host (`./backups`) & Reconciliation
+
+```bash
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --backup /app/backups/staging_snapshot.json --dry-run
+ls -lh ./backups/staging_snapshot.json
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --verify-backup /app/backups/staging_snapshot.json
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --reconcile --dry-run
+```
+
+### Bước 12: Dừng môi trường Staging an toàn (Không ảnh hưởng Production)
+
+> **Lưu ý an toàn:** Không bao giờ chạy `docker system prune --volumes` trên VPS. Chỉ hạ đúng project `locket_staging`:
+
+```bash
+docker compose -p locket_staging -f compose.staging.yaml --profile lab --profile ca_init down
 ```

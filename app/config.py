@@ -2,7 +2,7 @@ import json
 import os
 import re
 from functools import lru_cache
-from ipaddress import ip_network
+from ipaddress import ip_address, ip_network
 from typing import Annotated, Any, Literal
 from pydantic import AliasChoices, Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, NoDecode, SettingsConfigDict
@@ -37,7 +37,12 @@ class Settings(BaseSettings):
     mongodb_database: str = 'locket_manager'
     nextdns_id: str = Field(default='', pattern=r'^([a-fA-F0-9]{6})?$')
     doh_server_url: str = Field(default='', max_length=256)
+    lab_mode: Literal['local', 'real_device'] = Field(
+        default='local',
+        validation_alias=AliasChoices('lab_mode', 'LAB_MODE'),
+    )
     lab_dns_target_ip: str = Field(default='127.0.0.1', max_length=64)
+    lab_dns_target_ipv6: str = Field(default='', max_length=64)
     root_ca_path: str = ''
     root_ca_pem: str = Field(default='', max_length=65536, repr=False)
     lab_domain: str = Field(default='locketgold.vuthanhluan.bond', max_length=253)
@@ -113,6 +118,47 @@ class Settings(BaseSettings):
                 f"Staging environment (APP_ENV=staging) is strictly forbidden from using production database "
                 f"'{PRODUCTION_DATABASE_NAME}'. Set MONGODB_DATABASE=locket_manager_staging."
             )
+        try:
+            target_v4 = ip_address(self.lab_dns_target_ip.strip())
+            if target_v4.version != 4:
+                raise ValueError('LAB_DNS_TARGET_IP must be a valid IPv4 address')
+        except ValueError as exc:
+            raise ValueError('LAB_DNS_TARGET_IP must be a valid IPv4 address') from exc
+
+        if self.lab_dns_target_ipv6.strip():
+            try:
+                target_v6 = ip_address(self.lab_dns_target_ipv6.strip())
+                if target_v6.version != 6:
+                    raise ValueError('LAB_DNS_TARGET_IPV6 must be a valid IPv6 address')
+            except ValueError as exc:
+                raise ValueError('LAB_DNS_TARGET_IPV6 must be a valid IPv6 address') from exc
+        else:
+            target_v6 = None
+
+        if self.lab_mode == 'real_device':
+            if target_v4.is_loopback or target_v4.is_unspecified:
+                raise ValueError(
+                    f"Real Device Lab mode (LAB_MODE=real_device) cannot use loopback/unspecified IP "
+                    f"'{self.lab_dns_target_ip}' for LAB_DNS_TARGET_IP — a real iPhone outside the VPS would resolve "
+                    f"the lab domain to itself! Set LAB_DNS_TARGET_IP to a reachable server IPv4 (e.g. 103.118.29.159)."
+                )
+            if target_v6 is not None and (target_v6.is_loopback or target_v6.is_unspecified):
+                raise ValueError(
+                    'Real Device Lab mode (LAB_MODE=real_device) cannot use loopback/unspecified IPv6 for LAB_DNS_TARGET_IPV6.'
+                )
+            if self.doh_server_url:
+                from urllib.parse import urlparse
+                doh_host = (urlparse(self.doh_server_url).hostname or '').lower()
+                if doh_host in {'localhost', '127.0.0.1', '::1', '[::1]'}:
+                    raise ValueError(
+                        'Real Device Lab mode (LAB_MODE=real_device) requires a publicly resolvable HTTPS hostname '
+                        'in DOH_SERVER_URL, never localhost or 127.0.0.1.'
+                    )
+                if doh_host in {d.strip().lower() for d in self.lab_scoped_domains}:
+                    # Note: Bootstrap rule — if DOH_SERVER_URL hostname is also in SupplementalMatchDomains,
+                    # iOS resolves the DoH hostname via normal system DNS first before bootstrapping DoH,
+                    # so that hostname MUST have a public DNS A record pointing to LAB_DNS_TARGET_IP.
+                    pass
         if self.vercel == '1':
             for host in (self.vercel_url, self.vercel_branch_url):
                 if host:

@@ -261,7 +261,7 @@ async def download_profile(
 async def admin_login_custom(admin_slug: str, request: Request):
     settings = get_settings()
     configured_path = getattr(settings, 'admin_path', '/admin')
-    if f'/{admin_slug}' != configured_path:
+    if f'/{admin_slug}' != configured_path or admin_slug in {'dns-query'}:
         raise HTTPException(404, 'Not Found')
     return render_page(True, request)
 
