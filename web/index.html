@@ -2011,15 +2011,10 @@
               <button class="secondary" id="closeAccount" type="button" aria-label="Close dialog">×</button>
             </div>
             <div class="row">
-              <div class="field"><label for="accountId">Locket ID</label><input id="accountId" required maxlength="128"
-                  pattern="[A-Za-z0-9_$:@.\-]+" autocomplete="off"></div>
+              <div class="field"><label for="accountId">Locket ID</label><input id="accountId" required maxlength="256"
+                  autocomplete="off" placeholder="username hoặc https://locket.cam/username"></div>
               <div class="field"><label for="expiry">Expires at · local time</label><input id="expiry"
                   type="datetime-local" required></div>
-              <div class="field"><label for="accountUsername">Username (optional)</label><input id="accountUsername"
-                  maxlength="64" pattern="[A-Za-z0-9_.\-]*" autocomplete="off" placeholder="username"></div>
-              <div class="field"><label for="accountFirebaseUid">Firebase UID (optional)</label><input
-                  id="accountFirebaseUid" maxlength="128" pattern="[A-Za-z0-9_\-]*" autocomplete="off"
-                  placeholder="Chưa liên kết Firebase UID"></div>
             </div>
             <p class="status" id="accountMessage" role="status" aria-live="polite"></p>
             <div class="dialog-actions">
@@ -2210,8 +2205,6 @@
               $('accountId').value = row.locket_id;
               const date = new Date(row.expires_date);
               $('expiry').value = new Date(date - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
-              $('accountUsername').value = row.username || '';
-              $('accountFirebaseUid').value = row.firebase_uid || '';
               openAccountDialog(true);
             };
             const remove = document.createElement('button'); remove.type = 'button'; remove.className = 'secondary'; remove.textContent = 'Delete';
@@ -2279,19 +2272,21 @@
         };
         $('accountForm').onsubmit = async event => {
           event.preventDefault(); $('save').disabled = true;
-          $('accountMessage').textContent = '';
+          $('accountMessage').textContent = 'Đang tìm Firebase UID...';
           try {
-            const payload = {
-              locket_id: $('accountId').value.trim(),
-              expires_date: new Date($('expiry').value).toISOString(),
-            };
-            const uVal = $('accountUsername').value.trim();
-            const fVal = $('accountFirebaseUid').value.trim();
-            if (uVal) payload.username = uVal;
-            if (fVal) payload.firebase_uid = fVal;
-            await api('/admin/add-account', { method: 'POST', body: JSON.stringify(payload) });
+            const saved = await api('/admin/add-account', {
+              method: 'POST',
+              body: JSON.stringify({
+                locket_id: $('accountId').value.trim(),
+                expires_date: new Date($('expiry').value).toISOString(),
+                resolve_identity: true,
+              }),
+            });
             accountDialog.close();
-            $('adminMessage').textContent = 'Account saved.'; await load();
+            $('adminMessage').textContent = saved && saved.firebase_uid
+              ? 'Account saved · Firebase UID: ' + saved.firebase_uid
+              : 'Account saved.';
+            await load();
           } catch (error) {
             $(accountDialog.open ? 'accountMessage' : 'adminMessage').textContent = error.message;
           }

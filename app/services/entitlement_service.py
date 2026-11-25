@@ -12,6 +12,7 @@ SERVER_TRUSTED_UID_SOURCES = {
     'verified_subscriber_traffic',
     'firebase_admin_sdk',
     'cryptographic_id_token',
+    'authorized_identity_provider',
 }
 
 
@@ -159,6 +160,8 @@ def format_account_record(record: dict, now: datetime | None = None) -> dict:
         'verification_status': ver_status,
         'verification_method': ver_method,
         'verification_source': ver_source,
+        'uid_resolved_at': record.get('uid_resolved_at'),
+        'uid_resolution_source': record.get('uid_resolution_source'),
         'max_devices': int(record.get('max_devices') or 2),
         'revoked_at': record.get('revoked_at'),
         'revoke_reason': record.get('revoke_reason'),

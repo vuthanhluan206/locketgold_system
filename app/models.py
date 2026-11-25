@@ -7,6 +7,15 @@ AccountId = Annotated[str, Field(min_length=1, max_length=128, pattern=r'^[A-Za-
 EntitlementStatus = Literal['active', 'expired', 'revoked', 'pending', 'unauthorized']
 VerificationStatus = Literal['verified_uid', 'unverified_uid', 'unverified_handle', 'manual_lab_id']
 VerificationMethod = Literal['trusted_proof', 'direct_uid', 'format_only_uid', 'link_handle_only', 'admin_manual_override']
+IdentityResolutionStatus = Literal[
+    'resolved',
+    'not_found',
+    'auth_required',
+    'rate_limited',
+    'lookup_unavailable',
+    'conflict',
+    'unverified',
+]
 
 
 def normalize_expiry(value) -> datetime:
@@ -68,7 +77,7 @@ def compute_entitlement_status(account: dict | None, now: datetime | None = None
 
 class AccountInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    locket_id: AccountId
+    locket_id: str = Field(min_length=1, max_length=256)
     expires_date: AwareDatetime
     username: str | None = Field(default=None, max_length=64, pattern=r'^[A-Za-z0-9_.\-]*$')
     firebase_uid: str | None = Field(default=None, min_length=6, max_length=128, pattern=r'^[A-Za-z0-9_\-]+$')
@@ -79,6 +88,37 @@ class AccountInput(BaseModel):
     status: Literal['active', 'pending', 'revoked'] = 'active'
     max_devices: int = Field(default=2, ge=1, le=10)
     notes: str | None = Field(default=None, max_length=256)
+    resolve_identity: bool = False
+
+    @field_validator('locket_id')
+    @classmethod
+    def validate_locket_id_or_link(cls, value: str) -> str:
+        from urllib.parse import unquote, urlsplit
+        import re
+
+        candidate = value.strip()
+        if not candidate:
+            raise ValueError('locket_id must not be empty')
+        if '://' in candidate or '/' in candidate:
+            link = urlsplit(candidate if '://' in candidate else 'https://' + candidate)
+            allowed_hosts = {
+                'locket.cam',
+                'www.locket.cam',
+                'locket.camera',
+                'www.locket.camera',
+                'locketcamera.com',
+                'www.locketcamera.com',
+            }
+            if link.scheme not in ('http', 'https') or link.netloc.lower() not in allowed_hosts:
+                raise ValueError('Invalid Locket share URL host or scheme')
+            path_seg = unquote(link.path.strip('/')).removeprefix('@')
+            if not path_seg or '/' in path_seg or not re.fullmatch(ACCOUNT_ID_REGEX, path_seg):
+                raise ValueError('Invalid Locket username or identifier in URL path')
+            return candidate
+        cleaned = candidate.removeprefix('@')
+        if not re.fullmatch(ACCOUNT_ID_REGEX, cleaned):
+            raise ValueError('Invalid Locket ID or username format')
+        return candidate
 
     @field_validator('username', 'firebase_uid', mode='before')
     @classmethod
@@ -111,11 +151,29 @@ class AccountOutput(BaseModel):
     verification_status: VerificationStatus = 'manual_lab_id'
     verification_method: VerificationMethod = 'admin_manual_override'
     verification_source: str = 'admin_direct_input'
+    uid_resolved_at: AwareDatetime | None = None
+    uid_resolution_source: str | None = None
     max_devices: int = 2
     revoked_at: AwareDatetime | None = None
     revoke_reason: str | None = None
     notes: str | None = None
     updated_at: AwareDatetime | None = None
+
+
+class IdentityResolutionOutput(BaseModel):
+    status: IdentityResolutionStatus
+    normalized_id: str
+    input_kind: Literal['firebase_uid', 'locket_link', 'handle', 'custom_id', 'invalid']
+    username: str | None = None
+    firebase_uid: str | None = None
+    source_link: str | None = None
+    uid_verified: bool = False
+    verification_status: VerificationStatus = 'unverified_handle'
+    verification_method: VerificationMethod = 'link_handle_only'
+    verification_source: str = 'none'
+    uid_resolved_at: AwareDatetime | None = None
+    uid_resolution_source: str | None = None
+    message: str
 
 
 class PublicLookupOutput(BaseModel):
