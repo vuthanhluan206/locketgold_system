@@ -44,6 +44,7 @@ from ..services.identity_service import (
     is_valid_firebase_uid,
     normalize_lookup_query,
     resolve_locket_identity,
+    resolve_public_locket_share_link,
     verify_account_link_or_identifier,
 )
 from ..services.pki_service import inspect_certificate_metadata
@@ -544,6 +545,7 @@ async def upsert_account(
     has_public_resolver = public_fetcher is not None or public_http_client is not None
     must_resolve = bool(
         data.resolve_identity
+        or data.public_only
         or has_provider
         or has_session_provider
         or has_public_resolver
@@ -567,17 +569,18 @@ async def upsert_account(
     resolution_status_val = existing_v2.get('resolution_status') if isinstance(existing_v2, dict) else None
 
     if must_resolve:
-        resolution = await resolve_locket_identity(
-            data.locket_id,
-            settings=settings,
-            accounts_v2=accounts_v2,
-            provider=provider,
-            http_client=auth_http_client,
-            public_http_client=public_http_client,
-            public_fetcher=public_fetcher,
-            use_public_link=bool(has_public_resolver or (data.resolve_identity and not has_provider)),
-            session_provider=session_provider,
-        )
+        if data.public_only:
+            resolution = await resolve_public_locket_share_link(
+                data.locket_id, http_client=public_http_client, public_fetcher=public_fetcher,
+                check_dns=public_http_client is None and public_fetcher is None,
+            )
+        else:
+            resolution = await resolve_locket_identity(
+                data.locket_id, settings=settings, accounts_v2=accounts_v2, provider=provider,
+                http_client=auth_http_client, public_http_client=public_http_client,
+                public_fetcher=public_fetcher, session_provider=session_provider,
+                use_public_link=bool(has_public_resolver or (data.resolve_identity and not has_provider)),
+            )
         if resolution.status in {'resolved', 'resolved_uid', 'verified_uid'} and resolution.firebase_uid:
             canonical_id = resolution.normalized_id
             resolved_username = resolution.username or data.username
@@ -609,10 +612,10 @@ async def upsert_account(
             identity_lookup_at = resolution.identity_lookup_at or now
             identity_lookup_source = resolution.identity_lookup_source or 'locket_invite_lookup'
             resolution_status_val = 'uid_resolved'
-        elif resolution.status == 'invite_token_found' and resolution.invite_token:
+        elif resolution.status == 'invite_token_found' or (data.public_only and resolution.status == 'verification_required' and resolution.verification_source == 'locket_public_share_link'):
             canonical_id = resolution.normalized_id
             resolved_username = resolution.username or data.username or canonical_id
-            resolved_invite_token = resolution.invite_token
+            resolved_invite_token = resolution.invite_token or resolved_invite_token
             auto_source_link = resolution.source_link or auto_source_link
             identity_lookup_at = resolution.identity_lookup_at or now
             identity_lookup_source = resolution.identity_lookup_source or 'public_share_link'
@@ -622,7 +625,7 @@ async def upsert_account(
                 isinstance(existing_v2, dict)
                 and existing_v2.get('_server_uid_proof') is True
                 and existing_v2.get('verification_status') == 'verified_uid'
-                and is_valid_firebase_uid(existing_v2.get('firebase_uid'))
+                and extract_verified_uid_metadata(existing_v2)[1]
             ):
                 resolved_fb_uid = existing_v2['firebase_uid']
                 safe_ver_status = 'verified_uid'
@@ -636,7 +639,7 @@ async def upsert_account(
                 safe_ver_method = 'link_handle_only'
                 safe_ver_source = 'locket_public_share_link'
                 server_proof = False
-                resolution_status_val = 'invite_token_found'
+                resolution_status_val = resolution.status
         else:
             status_map = {
                 'not_found': 404,

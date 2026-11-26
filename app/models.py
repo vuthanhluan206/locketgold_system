@@ -115,6 +115,7 @@ class AccountInput(BaseModel):
     max_devices: int = Field(default=2, ge=1, le=10)
     notes: str | None = Field(default=None, max_length=256)
     resolve_identity: bool = False
+    public_only: bool = False
 
     @field_validator('locket_id')
     @classmethod

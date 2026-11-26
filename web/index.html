@@ -2025,18 +2025,6 @@
             </div>
           </form>
         </dialog>
-        <dialog id="locketSessionDialog" aria-labelledby="locketSessionTitle">
-          <form id="locketSessionForm">
-            <h3 id="locketSessionTitle">Liên kết phiên Locket kiểm thử</h3>
-            <p>Phiên chỉ giữ trong bộ nhớ máy chủ, mất khi khởi động lại.</p>
-            <label>Username của phiên<input id="locketSessionUsername" required maxlength="128" autocomplete="off"></label>
-            <label>Firebase ID token<input id="locketSessionToken" type="password" required autocomplete="off"></label>
-            <label>Refresh token (tuỳ chọn)<input id="locketSessionRefresh" type="password" autocomplete="off"></label>
-            <p id="locketSessionMessage" role="status"></p>
-            <button id="cancelLocketSession" type="button">Đóng</button>
-            <button id="saveLocketSession" type="submit">Liên kết</button>
-          </form>
-        </dialog>
         <section class="directory-panel" aria-labelledby="directoryTitle">
           <div class="directory-heading">
             <div class="section-title"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2048,10 +2036,6 @@
             <button id="addAccount" type="button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">
                 <path d="M12 5v14M5 12h14" />
               </svg>Add account</button>
-          </div>
-          <div class="row">
-            <button id="connectLocketSession" class="secondary" type="button">Liên kết phiên Locket</button>
-            <button id="disconnectLocketSession" class="secondary" type="button">Ngắt phiên Locket</button>
           </div>
           <p class="status" id="adminMessage" role="status" aria-live="polite"></p>
           <div class="scroll">
@@ -2211,8 +2195,8 @@
                     ? 'Verification: Verified (Firebase UID đã xác minh)'
                     : 'Verification: Unverified (Đã tìm được UID — cần xác minh)';
                 } else if (row.invite_token) {
-                  uidMeta.textContent = 'Invite token: ' + row.invite_token;
-                  verMeta.textContent = 'Đã lấy invite token — chưa xác minh Firebase UID (Phiên Locket chưa được liên kết)';
+                  uidMeta.textContent = 'Firebase UID: Chưa có trong dữ liệu công khai';
+                  verMeta.textContent = 'Đã có invite token, nhưng chưa có UID được chứng minh từ nguồn công khai';
                 } else {
                   uidMeta.textContent = 'Firebase UID: Chưa liên kết Firebase UID';
                   verMeta.textContent = 'Verification: Unverified';
@@ -2298,7 +2282,7 @@
         };
         $('accountForm').onsubmit = async event => {
           event.preventDefault(); $('save').disabled = true;
-          $('accountMessage').textContent = 'Đang tìm Firebase UID... Đang lấy invite token · Đang tra cứu Firebase UID...';
+          $('accountMessage').textContent = 'Đang tìm Firebase UID... Đang kiểm tra trang Locket công khai.';
           try {
             const saved = await api('/admin/add-account', {
               method: 'POST',
@@ -2306,6 +2290,7 @@
                 locket_id: $('accountId').value.trim(),
                 expires_date: new Date($('expiry').value).toISOString(),
                 resolve_identity: true,
+                public_only: true,
               }),
             });
             const summary = saved && saved.firebase_uid && saved.verification_status === 'verified_uid'
@@ -2313,43 +2298,16 @@
               : saved && saved.firebase_uid
                 ? 'Đã tìm được UID — cần xác minh: ' + saved.firebase_uid
                 : saved && saved.invite_token
-                  ? 'Đã lấy invite token — chưa xác minh Firebase UID'
-                  : 'Account saved.';
+                  ? 'Đã lấy invite token — chưa xác minh Firebase UID.'
+                  : 'Đã lưu tài khoản; chưa có Firebase UID từ dữ liệu công khai.';
             $('accountMessage').textContent = summary;
             accountDialog.close();
-            $('adminMessage').textContent = 'Account saved · ' + summary;
+            $('adminMessage').textContent = 'Đã thêm tài khoản · ' + summary;
             await load();
           } catch (error) {
             $(accountDialog.open ? 'accountMessage' : 'adminMessage').textContent = 'Tra cứu thất bại: ' + error.message;
           }
           finally { $('save').disabled = false; }
-        };
-        const locketSessionDialog = $('locketSessionDialog');
-        locketSessionDialog.addEventListener('close', () => $('locketSessionForm').reset());
-        $('connectLocketSession').onclick = () => locketSessionDialog.showModal();
-        $('cancelLocketSession').onclick = () => locketSessionDialog.close();
-        $('locketSessionForm').onsubmit = async event => {
-          event.preventDefault();
-          $('saveLocketSession').disabled = true;
-          try {
-            await api('/admin/locket-session', { method: 'POST', body: JSON.stringify({
-              username: $('locketSessionUsername').value.trim(),
-              id_token: $('locketSessionToken').value,
-              refresh_token: $('locketSessionRefresh').value || null,
-            }) });
-            $('adminMessage').textContent = 'Đã liên kết phiên; API Locket sẽ kiểm tra token khi tra cứu.';
-            locketSessionDialog.close();
-          } catch (error) { $('locketSessionMessage').textContent = error.message; }
-          finally {
-            $('locketSessionToken').value = ''; $('locketSessionRefresh').value = '';
-            $('saveLocketSession').disabled = false;
-          }
-        };
-        $('disconnectLocketSession').onclick = async () => {
-          try {
-            await api('/admin/locket-session', { method: 'DELETE' });
-            $('adminMessage').textContent = 'Đã ngắt phiên Locket.';
-          } catch (error) { $('adminMessage').textContent = error.message; }
         };
         $('previous').onclick = async () => { skip = Math.max(0, skip - limit); try { await load(); } catch (error) { $('adminMessage').textContent = error.message; } };
         $('next').onclick = async () => { skip += limit; try { await load(); } catch (error) { $('adminMessage').textContent = error.message; } };
