@@ -500,7 +500,7 @@ def test_02_06_07_08_09_10_auto_public_resolver_and_verified_uid_preservation(pr
 
 
 # Tests 11, 12, 13, 14, 15, 16, 17, 18, 19, 23: Gold Management SSOT & CRUD Synchronized by Verified UID
-def test_11_to_19_and_23_gold_entitlement_ssot_and_crud_by_verified_uid(prompt26_env):
+def test_11_to_19_and_23_gold_entitlement_ssot_and_crud_by_verified_uid(prompt26_env, monkeypatch):
     http = prompt26_env['http']
     app = prompt26_env['app']
     v1_store = prompt26_env['v1_store']
@@ -577,6 +577,14 @@ def test_11_to_19_and_23_gold_entitlement_ssot_and_crud_by_verified_uid(prompt26
     assert sub_ok.status_code == 200
     assert sub_ok.headers['x-lab-entitlement-status'] == 'active'
     assert 'Gold' in sub_ok.json()['subscriber']['entitlements']
+    async def unavailable(*args, **kwargs):
+        raise ConnectionError('database unavailable')
+
+    with monkeypatch.context() as patch:
+        patch.setattr(app.state.entitlements, 'find_one', unavailable)
+        outage = http.get(f'/v1/subscribers/{verified_uid}', headers=service_headers)
+        assert outage.status_code == 503
+        assert 'subscriber' not in outage.json()
 
     lab_sub_ok = http.get(f'/api/lab/subscribers/{verified_uid}', headers=service_headers)
     assert lab_sub_ok.status_code == 200

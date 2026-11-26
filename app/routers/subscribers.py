@@ -49,8 +49,8 @@ async def _resolve_account_and_build_response(
                 ):
                     eff_account['status'] = 'revoked'
                     eff_account['revoked_at'] = ent_doc.get('revoked_at') or now
-            except Exception:
-                pass
+            except Exception as exc:
+                raise HTTPException(503, 'Entitlement lookup unavailable') from exc
 
         raw_status, _ = compute_entitlement_status(eff_account, now)
         if raw_status not in {'revoked', 'expired'}:
