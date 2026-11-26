@@ -138,6 +138,9 @@ def _setup_app_with_stores(monkeypatch, *, require_https: bool = False, enable_p
         entitlements_store[key] = doc
 
     entitlements.update_one.side_effect = ent_update
+    entitlements.find_one.side_effect = lambda query, projection: entitlements_store.get(
+        (query['account_id'], query['entitlement_key'])
+    )
     entitlements.delete_many = AsyncMock()
 
     async def dev_insert(doc):
@@ -584,6 +587,12 @@ def test_blocker_b_canonical_expiry_precedence_and_partial_write_failures(monkey
 
         # Seed user in both stores with mismatched expiry: legacy has past_exp, v2 has future_long
         diverged_uid = 'DivergedExpVerifiedUid123456'
+        awaitable_grant = app.state.entitlements.update_one
+        import asyncio
+        asyncio.run(awaitable_grant(
+            {'account_id': diverged_uid, 'entitlement_key': 'Gold'},
+            {'$set': {'status': 'active', 'expires_date': future_long}}, upsert=True,
+        ))
         accounts_store['diverged_exp_user'] = {'locket_id': 'diverged_exp_user', 'expires_date': past_exp}
         accounts_v2_store['diverged_exp_user'] = {
             'locket_id': 'diverged_exp_user',

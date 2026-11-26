@@ -1124,6 +1124,10 @@ def test_prompt17_groups_a_b_c_d_and_real_mobileconfig_file_verification(monkeyp
         assert pub_miss.json() == {'exists': False}
 
         # D03: Subscriber entitlement endpoint ONLY grants active Gold to the verified Firebase UID
+        app.state.entitlements = AsyncMock()
+        app.state.entitlements.find_one.return_value = {
+            'account_id': verified_fb_uid, 'entitlement_key': 'Gold', 'status': 'active', 'expires_date': future_iso,
+        }
         sub_ver = client.get(f'/v1/subscribers/{verified_fb_uid}', headers=auth_headers)
         assert sub_ver.status_code == 200
         assert 'Gold' in sub_ver.json()['subscriber']['entitlements']

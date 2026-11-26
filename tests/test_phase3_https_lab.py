@@ -88,11 +88,16 @@ def test_sensitive_data_redaction_in_headers_and_payloads():
         'locket_id': '4Vee1rBLoJN9TDjql9xPzDEuf5D2',
         'password': 'my_super_secret_password',
         'nested': {
+            'sessions': [{'refreshToken': 'firebase-refresh-credential',
+                          'private_key': 'private-key-material'}],
             'device_token': 'lkg_dev_SuperSecretDeviceTokenValue1234567890',
             'note': 'Using Bearer secret_inline_token_987654321 in text',
         },
     }
     redacted_b = redact_payload(raw_body)
+    assert redacted_b['nested']['sessions'] == [
+        {'refreshToken': '***REDACTED***', 'private_key': '***REDACTED***'}
+    ]
     assert redacted_b['locket_id'] == '4Vee1rBLoJN9TDjql9xPzDEuf5D2'
     assert 'my_super_secret_password' not in redacted_b['password']
     assert 'SuperSecretDeviceTokenValue1234567890' not in redacted_b['nested']['device_token']
@@ -184,6 +189,10 @@ def test_https_lab_four_states_inspector_and_test_client(monkeypatch):
     try:
         auth_headers = {'Authorization': f'Bearer {service_token}'}
 
+        app.state.entitlements = AsyncMock()
+        app.state.entitlements.find_one.return_value = {
+            'account_id': active_uid, 'entitlement_key': 'Gold', 'status': 'active', 'expires_date': accounts_store[active_uid]['expires_date'],
+        }
         # 1. Verify 4 distinct entitlement states: active, expired, revoked, none
         for uid, expected_state, expected_gold in [
             (active_uid, 'active', True),
