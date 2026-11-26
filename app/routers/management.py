@@ -490,10 +490,14 @@ async def upsert_account(
     auto_source_link = f'https://locket.cam/{canonical_id}' if input_kind == 'locket_link' else data.source_link
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     provider = getattr(request.app.state, 'identity_provider', None)
+    public_fetcher = getattr(request.app.state, 'public_link_fetcher', None)
+    public_http_client = getattr(request.app.state, 'public_http_client', None)
     has_provider = provider is not None or bool((getattr(settings, 'locket_identity_lookup_url', '') or '').strip())
+    has_public_resolver = public_fetcher is not None or public_http_client is not None
     must_resolve = bool(
         data.resolve_identity
         or has_provider
+        or has_public_resolver
         or getattr(settings, 'require_verified_uid_on_add', False)
         or input_kind in {'locket_link', 'handle'}
     )
@@ -508,6 +512,10 @@ async def upsert_account(
 
     uid_resolved_at = existing_v2.get('uid_resolved_at') if isinstance(existing_v2, dict) else None
     uid_resolution_source = existing_v2.get('uid_resolution_source') if isinstance(existing_v2, dict) else None
+    identity_lookup_at = existing_v2.get('identity_lookup_at') if isinstance(existing_v2, dict) else None
+    identity_lookup_source = existing_v2.get('identity_lookup_source') if isinstance(existing_v2, dict) else None
+    resolved_invite_token = existing_v2.get('invite_token') if isinstance(existing_v2, dict) else None
+    resolution_status_val = existing_v2.get('resolution_status') if isinstance(existing_v2, dict) else None
 
     if must_resolve:
         resolution = await resolve_locket_identity(
@@ -515,13 +523,61 @@ async def upsert_account(
             settings=settings,
             accounts_v2=accounts_v2,
             provider=provider,
+            public_http_client=public_http_client,
+            public_fetcher=public_fetcher,
+            use_public_link=bool(has_public_resolver or (data.resolve_identity and not has_provider)),
         )
-        if resolution.status != 'resolved' or not resolution.firebase_uid:
+        if resolution.status in {'resolved', 'resolved_uid'} and resolution.firebase_uid:
+            canonical_id = resolution.normalized_id
+            resolved_username = resolution.username or data.username
+            resolved_fb_uid = resolution.firebase_uid
+            resolved_invite_token = resolution.invite_token or resolved_invite_token
+            auto_source_link = resolution.source_link or auto_source_link
+            safe_ver_status = 'verified_uid'
+            safe_ver_method = 'trusted_proof'
+            safe_ver_source = resolution.verification_source or 'authorized_identity_provider'
+            server_proof = True
+            uid_resolved_at = resolution.uid_resolved_at or now
+            uid_resolution_source = resolution.uid_resolution_source or 'authorized_identity_provider'
+            identity_lookup_at = resolution.identity_lookup_at or now
+            identity_lookup_source = resolution.identity_lookup_source or uid_resolution_source
+            resolution_status_val = 'resolved_uid'
+        elif resolution.status == 'invite_token_found' and resolution.invite_token:
+            canonical_id = resolution.normalized_id
+            resolved_username = resolution.username or data.username or canonical_id
+            resolved_invite_token = resolution.invite_token
+            auto_source_link = resolution.source_link or auto_source_link
+            identity_lookup_at = resolution.identity_lookup_at or now
+            identity_lookup_source = resolution.identity_lookup_source or 'public_share_link'
+            # Strictly separate invite_token from firebase_uid: NEVER store invite_token as firebase_uid!
+            # However, if this account already had a verified firebase_uid in MongoDB, preserve it.
+            if (
+                isinstance(existing_v2, dict)
+                and existing_v2.get('_server_uid_proof') is True
+                and existing_v2.get('verification_status') == 'verified_uid'
+                and is_valid_firebase_uid(existing_v2.get('firebase_uid'))
+            ):
+                resolved_fb_uid = existing_v2['firebase_uid']
+                safe_ver_status = 'verified_uid'
+                safe_ver_method = existing_v2.get('verification_method', 'trusted_proof')
+                safe_ver_source = existing_v2.get('verification_source', 'authorized_identity_provider')
+                server_proof = True
+                resolution_status_val = 'resolved_uid'
+            else:
+                resolved_fb_uid = None
+                safe_ver_status = 'unverified_handle'
+                safe_ver_method = 'link_handle_only'
+                safe_ver_source = 'locket_public_share_link'
+                server_proof = False
+                resolution_status_val = 'invite_token_found'
+        else:
             status_map = {
                 'not_found': 404,
                 'auth_required': 502,
                 'rate_limited': 429,
                 'lookup_unavailable': 503,
+                'invalid_link': 422,
+                'verification_required': 422,
                 'conflict': 409,
                 'unverified': 422,
             }
@@ -534,17 +590,6 @@ async def upsert_account(
                 {'resolution_status': resolution.status, 'input_kind': input_kind},
             )
             raise HTTPException(http_code, resolution.message)
-
-        canonical_id = resolution.normalized_id
-        resolved_username = resolution.username or data.username
-        resolved_fb_uid = resolution.firebase_uid
-        auto_source_link = resolution.source_link or auto_source_link
-        safe_ver_status = 'verified_uid'
-        safe_ver_method = 'trusted_proof'
-        safe_ver_source = resolution.verification_source or 'authorized_identity_provider'
-        server_proof = True
-        uid_resolved_at = resolution.uid_resolved_at or now
-        uid_resolution_source = resolution.uid_resolution_source or 'authorized_identity_provider'
     else:
         is_28char_id = is_valid_firebase_uid(canonical_id)
         has_explicit_fb = bool(data.firebase_uid and data.firebase_uid.strip())
@@ -635,14 +680,18 @@ async def upsert_account(
         'account_id': canonical_id,
         'locket_id': canonical_id,
         'username': resolved_username,
+        'invite_token': resolved_invite_token,
         'firebase_uid': resolved_fb_uid,
         'source_link': auto_source_link,
         'verification_status': safe_ver_status,
         'verification_method': safe_ver_method,
         'verification_source': safe_ver_source,
         '_server_uid_proof': server_proof,
+        'identity_lookup_source': identity_lookup_source,
+        'identity_lookup_at': identity_lookup_at,
         'uid_resolved_at': uid_resolved_at,
         'uid_resolution_source': uid_resolution_source,
+        'resolution_status': resolution_status_val,
         'status': data.status,
         'product_identifier': 'com.locket.gold.yearly',
         'expires_date': data.expires_date,

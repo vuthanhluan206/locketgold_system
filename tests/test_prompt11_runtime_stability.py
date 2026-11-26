@@ -1289,11 +1289,16 @@ def test_prompt18_automatic_locket_id_to_firebase_uid_resolution_all_16_cases(mo
 
         # Test 13: When no identity provider is configured (lookup_unavailable), adding account via UI (resolve_identity=True)
         # or Locket link fails closed with HTTP 503 and writes NOTHING to MongoDB
+        def _offline_public_fetcher(url: str):
+            raise ConnectionError('Simulated offline lookup_unavailable')
+
+        app.state.public_link_fetcher = _offline_public_fetcher
         r_unavail = client.post(
             '/admin/add-account',
             headers=auth_headers,
             json={'locket_id': 'no_provider_user', 'expires_date': future_iso, 'resolve_identity': True},
         )
+        app.state.public_link_fetcher = None
         assert r_unavail.status_code == 503
         assert 'lookup_unavailable' in r_unavail.json()['detail']
         assert 'no_provider_user' not in v2_store and 'no_provider_user' not in v1_store
@@ -1502,6 +1507,341 @@ def test_prompt18_automatic_locket_id_to_firebase_uid_resolution_all_16_cases(mo
         assert len(pl['PayloadContent']) == 2
         assert pl['PayloadContent'][0]['PayloadType'] == 'com.apple.dnsSettings.managed'
         assert pl['PayloadContent'][1]['PayloadType'] == 'com.apple.security.root'
+    finally:
+        client.close()
+        get_settings.cache_clear()
+
+
+def test_prompt19_public_link_resolver_invite_token_vs_uid_and_ssrf_protection(monkeypatch, tmp_path):
+    """
+    Prompt 19 Section 7 — Mandatory 14 Test Scenarios for Public Link Resolver (Zero-Env-Var):
+      1. Valid username resolves public share link https://locket.cam/<username>.
+      2. Valid public Locket link (https://locket.cam/<username>) resolves.
+      3. Page containing /invites/<token> returns invite_token_found.
+      4. Page without /invites/<token> returns verification_required (HTTP 422), does not save fake data.
+      5. Redirect URL (302 to https://locket.camera/invites/<token> or locket://invites/<token>) extracts invite_token; >5 redirects rejected.
+      6. URL encoding (/invites/Token%2DWith%5FEncoding and double-encoded Dynamic Links) decoded properly.
+      7. Timeout (8s limit) returns lookup_unavailable (HTTP 503).
+      8. HTTP 404 -> not_found (HTTP 404); HTTP 429 & 500 -> lookup_unavailable (HTTP 503).
+      9. SSRF and redirects to private/loopback/link-local IPs or untrusted hosts blocked with invalid_link.
+      10. Never confuses a 28-character invite_token with a firebase_uid (firebase_uid=None, verification_status='unverified_handle').
+      11. Persists locket_id, username, invite_token, firebase_uid=None, verification_status, identity_lookup_source, identity_lookup_at in MongoDB accounts_v2.
+      12. Never overwrites an already-verified firebase_uid in MongoDB when updating an account via public link lookup.
+      13. Root CA and .mobileconfig remain 100% unaffected.
+      14. Original locketgoldmanager UI remains intact and displays "Đã lấy invite token — chưa xác minh Firebase UID".
+    """
+    import httpx
+    from app.services.identity_service import (
+        extract_invite_token_from_text_or_url,
+        resolve_public_locket_share_link,
+        validate_safe_locket_public_url,
+    )
+
+    # Test 6: Direct unit check on URL encoding & double-encoded Firebase Dynamic Links
+    assert extract_invite_token_from_text_or_url('https://locket.cam/invites/Tok%2D2026%5FAbC?foo=1') == 'Tok-2026_AbC'
+    assert (
+        extract_invite_token_from_text_or_url(
+            'https://locket.cam/?link=https%3A%2F%2Flocket.camera%2Finvites%2FNestedTok987654'
+        )
+        == 'NestedTok987654'
+    )
+
+    # Test 9: Direct SSRF & private IP protection checks
+    for bad_ssrf_url in (
+        'http://locket.cam/alice',
+        'https://localhost/invites/tok123456',
+        'https://127.0.0.1/invites/tok123456',
+        'https://192.168.1.1/invites/tok123456',
+        'https://10.0.0.1/invites/tok123456',
+        'https://172.16.0.1/invites/tok123456',
+        'https://169.254.169.254/latest/meta-data',
+        'https://[::1]/invites/tok123456',
+        'https://evil.example.com/invites/tok123456',
+        'https://user:pass@locket.cam/alice',
+    ):
+        with pytest.raises(ValueError):
+            validate_safe_locket_public_url(bad_ssrf_url)
+        res_bad = asyncio.run(resolve_public_locket_share_link(bad_ssrf_url))
+        assert res_bad.status == 'invalid_link'
+
+    pub_dir = tmp_path / 'p19_pub'
+    priv_dir = tmp_path / 'p19_priv'
+    domains = ['locketgold.vuthanhluan.bond', 'mock.lab.vuthanhluan.bond']
+    generate_ca_and_leaf_files(pub_dir, priv_dir, domains)
+    ca_pem_path = pub_dir / 'lab_root_ca.pem'
+
+    password = secrets.token_urlsafe(20)
+    encoded = hash_password(password)
+    monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
+    monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
+    monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
+    monkeypatch.setenv('ALLOWED_HOSTS', '["localhost"]')
+    monkeypatch.setenv('REQUIRE_HTTPS', 'false')
+    monkeypatch.setenv('NEXTDNS_ID', 'a8b247')
+    monkeypatch.setenv('ROOT_CA_PATH', str(ca_pem_path))
+    monkeypatch.setenv('ROOT_CA_PEM', '')
+    monkeypatch.setenv('LOCKET_IDENTITY_LOOKUP_URL', '')
+    get_settings.cache_clear()
+
+    app = create_app()
+    v1_store: dict[str, dict] = {}
+    v2_store: dict[str, dict] = {}
+    sessions_store: dict[str, dict] = {}
+
+    class InMemoryAccountsV1:
+        async def find_one(self, q, projection=None):
+            return v1_store.get(q.get('locket_id'))
+
+        async def update_one(self, q, u, upsert=False):
+            lid = q['locket_id']
+            doc = v1_store.get(lid, {'locket_id': lid}).copy()
+            if '$set' in u:
+                doc.update(u['$set'])
+            v1_store[lid] = doc
+
+        def find(self, q, projection=None):
+            rows = sorted(v1_store.values(), key=lambda x: x['locket_id'])
+            c = MagicMock()
+            c.sort.return_value = c
+            c.skip.return_value = c
+            c.limit.return_value = c
+            c.to_list = AsyncMock(return_value=rows)
+            return c
+
+    class InMemoryAccountsV2:
+        async def find_one(self, q, projection=None):
+            for field in ('locket_id', 'username', 'firebase_uid', 'invite_token'):
+                if field in q and q[field] is not None:
+                    for doc in v2_store.values():
+                        if doc.get(field) == q[field]:
+                            return doc.copy()
+            return None
+
+        async def update_one(self, q, u, upsert=False):
+            lid = q['locket_id']
+            doc = v2_store.get(lid, {'locket_id': lid}).copy()
+            if '$setOnInsert' in u and lid not in v2_store:
+                doc.update(u['$setOnInsert'])
+            if '$set' in u:
+                doc.update(u['$set'])
+            v2_store[lid] = doc
+
+        def find(self, q, projection=None):
+            rows = sorted(v2_store.values(), key=lambda x: x['locket_id'])
+            c = MagicMock()
+            c.sort.return_value = c
+            c.sort.return_value = c
+            c.skip.return_value = c
+            c.limit.return_value = c
+            c.to_list = AsyncMock(return_value=rows)
+            return c
+
+    admin_doc = {
+        '_id': 'superadmin',
+        'email': 'admin@example.test',
+        'password_hash': encoded,
+        'auth_version': hashlib.sha256(encoded.encode()).hexdigest(),
+    }
+    admins = AsyncMock()
+    admins.find_one.return_value = admin_doc
+    sessions = AsyncMock()
+    sessions.insert_one.side_effect = lambda d: sessions_store.setdefault(d['_id'], d.copy())
+    sessions.find_one.side_effect = lambda q: sessions_store.get(q['_id'])
+    login_limits = AsyncMock()
+    login_limits.find_one_and_update.return_value = {'count': 1}
+
+    mem_v1 = InMemoryAccountsV1()
+    mem_v2 = InMemoryAccountsV2()
+    app.state.admins = admins
+    app.state.sessions = sessions
+    app.state.login_limits = login_limits
+    app.state.accounts = mem_v1
+    app.state.accounts_v2 = mem_v2
+    app.state.entitlements = AsyncMock()
+    app.state.profile = build_profile(get_settings())
+    app.dependency_overrides[get_accounts] = lambda: mem_v1
+
+    # Mock public share link HTTP responses without any external network call
+    invite_28_char = 'InviteTokenExactly28CharsAbC'  # 28 chars, MUST NOT be mistaken for firebase_uid!
+    assert len(invite_28_char) == 28
+
+    def mock_public_transport_handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == '/user_html_invite':
+            return httpx.Response(
+                200,
+                text=f'<html><head><meta property="og:url" content="https://locket.cam/invites/{invite_28_char}"></head></html>',
+            )
+        if path == '/user_redirect_invite':
+            return httpx.Response(
+                302,
+                headers={'Location': 'https://locket.camera/invites/RedirectedInviteTok99'},
+            )
+        if path == '/user_encoded_invite':
+            return httpx.Response(
+                200,
+                text='<a href="https://locket.cam/?link=https%3A%2F%2Flocket.cam%2Finvites%2FEncoded%252DTok%255F2026">Add</a>',
+            )
+        if path == '/user_no_invite':
+            return httpx.Response(200, text='<html><body>Welcome to Locket homepage</body></html>')
+        if path == '/user_404':
+            return httpx.Response(404, text='Not Found')
+        if path == '/user_429':
+            return httpx.Response(429, text='Too Many Requests')
+        if path == '/user_500':
+            return httpx.Response(500, text='Internal Server Error')
+        if path == '/user_timeout':
+            raise httpx.TimeoutException('Simulated 8s public link timeout')
+        if path == '/user_ssrf_redirect':
+            return httpx.Response(302, headers={'Location': 'https://127.0.0.1/invites/SecretInternalTok'})
+        if path == '/user_private_ip_redirect':
+            return httpx.Response(302, headers={'Location': 'https://192.168.1.50/invites/SecretLanTok'})
+        if path == '/user_verified_preserve':
+            return httpx.Response(200, text='<a href="https://locket.cam/invites/NewInviteForVerifiedUser">Add</a>')
+        return httpx.Response(404, text='Not Found')
+
+    app.state.public_link_fetcher = lambda url: mock_public_transport_handler(httpx.Request('GET', url))
+    client = TestClient(app, base_url='http://localhost')
+    try:
+        login_res = client.post('/api/admin/login', json={'email': 'admin@example.test', 'password': password})
+        assert login_res.status_code == 200
+        auth_headers = {'Authorization': 'Bearer ' + login_res.json()['access_token']}
+        future_iso = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+
+        # Tests 1, 3, 10, 11: Valid username resolves 28-char invite_token from HTML,
+        # stores it in invite_token, leaves firebase_uid=None, verification_status='unverified_handle'
+        r1 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'user_html_invite', 'expires_date': future_iso, 'resolve_identity': True},
+        )
+        assert r1.status_code == 200
+        d1 = r1.json()
+        assert d1['locket_id'] == 'user_html_invite'
+        assert d1['username'] == 'user_html_invite'
+        assert d1['invite_token'] == invite_28_char
+        assert d1['firebase_uid'] is None  # Test 10: NEVER stores 28-char invite_token as firebase_uid!
+        assert d1['verification_status'] == 'unverified_handle'
+        assert d1['identity_lookup_source'] == 'public_share_link'
+        assert d1['identity_lookup_at'] is not None
+        assert d1['resolution_status'] == 'invite_token_found'
+
+        # Tests 2 & 5: Valid public link with 302 redirect extracts invite_token
+        r2 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={
+                'locket_id': 'https://locket.cam/user_redirect_invite',
+                'expires_date': future_iso,
+                'resolve_identity': True,
+            },
+        )
+        assert r2.status_code == 200
+        d2 = r2.json()
+        assert d2['locket_id'] == 'user_redirect_invite'
+        assert d2['invite_token'] == 'RedirectedInviteTok99'
+        assert d2['firebase_uid'] is None
+        assert d2['verification_status'] == 'unverified_handle'
+
+        # Test 6: Double URL-encoded invite token in HTML
+        r_enc = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'user_encoded_invite', 'expires_date': future_iso, 'resolve_identity': True},
+        )
+        assert r_enc.status_code == 200
+        assert r_enc.json()['invite_token'] == 'Encoded-Tok_2026'
+
+        # Test 4: Page without invite token -> verification_required (HTTP 422), not saved
+        r_no_inv = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'user_no_invite', 'expires_date': future_iso, 'resolve_identity': True},
+        )
+        assert r_no_inv.status_code == 422
+        assert 'verification_required' in r_no_inv.json()['detail']
+        assert 'user_no_invite' not in v2_store
+
+        # Test 7: Timeout -> lookup_unavailable (HTTP 503), not saved
+        r_to = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'user_timeout', 'expires_date': future_iso, 'resolve_identity': True},
+        )
+        assert r_to.status_code == 503
+        assert 'lookup_unavailable' in r_to.json()['detail']
+        assert 'user_timeout' not in v2_store
+
+        # Test 8: HTTP 404 -> 404 (not_found); HTTP 429 & 500 -> 503 (lookup_unavailable)
+        r_404 = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'user_404', 'expires_date': future_iso, 'resolve_identity': True},
+        )
+        assert r_404.status_code == 404
+        for err_u in ('user_429', 'user_500'):
+            r_err = client.post(
+                '/admin/add-account',
+                headers=auth_headers,
+                json={'locket_id': err_u, 'expires_date': future_iso, 'resolve_identity': True},
+            )
+            assert r_err.status_code == 503
+            assert err_u not in v2_store
+
+        # Test 9: Redirect to 127.0.0.1 or 192.168.1.50 blocked with 422 (invalid_link), not saved
+        for ssrf_u in ('user_ssrf_redirect', 'user_private_ip_redirect'):
+            r_ssrf = client.post(
+                '/admin/add-account',
+                headers=auth_headers,
+                json={'locket_id': ssrf_u, 'expires_date': future_iso, 'resolve_identity': True},
+            )
+            assert r_ssrf.status_code == 422
+            assert 'invalid_link' in r_ssrf.json()['detail']
+            assert ssrf_u not in v2_store
+
+        # Test 12: Account with existing verified firebase_uid in MongoDB is NEVER overwritten by public link lookup
+        existing_real_uid = 'VerifiedRealFirebaseUid12345'
+        v2_store['user_verified_preserve'] = {
+            'schema_version': 2,
+            'account_id': 'user_verified_preserve',
+            'locket_id': 'user_verified_preserve',
+            'username': 'user_verified_preserve',
+            'firebase_uid': existing_real_uid,
+            'verification_status': 'verified_uid',
+            'verification_method': 'trusted_proof',
+            'verification_source': 'authorized_identity_provider',
+            '_server_uid_proof': True,
+            'status': 'active',
+            'expires_date': datetime.now(timezone.utc) + timedelta(days=30),
+        }
+        r_pres = client.post(
+            '/admin/add-account',
+            headers=auth_headers,
+            json={'locket_id': 'user_verified_preserve', 'expires_date': future_iso, 'resolve_identity': True},
+        )
+        assert r_pres.status_code == 200
+        d_pres = r_pres.json()
+        assert d_pres['firebase_uid'] == existing_real_uid
+        assert d_pres['verification_status'] == 'verified_uid'
+        assert d_pres['invite_token'] == 'NewInviteForVerifiedUser'
+
+        # Also verify direct httpx.MockTransport path of resolve_public_locket_share_link in a single event loop
+        async def _verify_transport():
+            transport = httpx.MockTransport(mock_public_transport_handler)
+            async with httpx.AsyncClient(transport=transport, follow_redirects=False) as hc:
+                return await resolve_public_locket_share_link('user_redirect_invite', http_client=hc)
+
+        tr_res = asyncio.run(_verify_transport())
+        assert tr_res.status == 'invite_token_found'
+        assert tr_res.invite_token == 'RedirectedInviteTok99'
+
+        # Test 13 & 14: Root CA/mobileconfig and original UI remain intact
+        mc_res = client.get('/profile.mobileconfig')
+        assert mc_res.status_code == 200
+        assert len(plistlib.loads(mc_res.content)['PayloadContent']) == 2
+        adm_html = client.get('/admin').text
+        assert 'Đã lấy invite token — chưa xác minh Firebase UID' in adm_html
+        assert 'id="accountFirebaseUid"' not in adm_html
     finally:
         client.close()
         get_settings.cache_clear()

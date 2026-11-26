@@ -155,13 +155,17 @@ def format_account_record(record: dict, now: datetime | None = None) -> dict:
         'expires_date': expiry,
         'status': status,
         'username': record.get('username'),
+        'invite_token': record.get('invite_token'),
         'firebase_uid': fb_uid,
         'source_link': record.get('source_link'),
         'verification_status': ver_status,
         'verification_method': ver_method,
         'verification_source': ver_source,
+        'identity_lookup_source': record.get('identity_lookup_source') or record.get('uid_resolution_source'),
+        'identity_lookup_at': record.get('identity_lookup_at') or record.get('uid_resolved_at'),
         'uid_resolved_at': record.get('uid_resolved_at'),
         'uid_resolution_source': record.get('uid_resolution_source'),
+        'resolution_status': record.get('resolution_status'),
         'max_devices': int(record.get('max_devices') or 2),
         'revoked_at': record.get('revoked_at'),
         'revoke_reason': record.get('revoke_reason'),
@@ -187,7 +191,7 @@ async def find_canonical_account(request, account_id: str, accounts_col=None) ->
         if isinstance(res, dict):
             doc_v2 = res
         else:
-            for field in ('username', 'firebase_uid'):
+            for field in ('username', 'firebase_uid', 'invite_token'):
                 try:
                     res_alt = accounts_v2.find_one({field: account_id}, {'_id': 0})
                     if hasattr(res_alt, '__await__'):
