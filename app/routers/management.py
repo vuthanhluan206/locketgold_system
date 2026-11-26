@@ -553,8 +553,31 @@ async def upsert_account(
             )
         if resolution.status in {'resolved', 'resolved_uid', 'verified_uid'} and resolution.firebase_uid:
             canonical_id = resolution.normalized_id
-            resolved_username = resolution.username or data.username
+            resolved_username = resolution.username or data.username or canonical_id
             resolved_fb_uid = resolution.firebase_uid
+            if (
+                isinstance(existing_v2, dict)
+                and existing_v2.get('_server_uid_proof') is True
+                and existing_v2.get('verification_status') == 'verified_uid'
+                and existing_v2.get('firebase_uid')
+                and existing_v2.get('firebase_uid') != resolved_fb_uid
+            ):
+                raise HTTPException(
+                    409,
+                    'Không thể ghi đè Firebase UID đã được xác minh bằng một UID khác (conflict).',
+                )
+            if accounts_v2 is not None and hasattr(accounts_v2, 'find_one'):
+                try:
+                    owner_res = accounts_v2.find_one({'firebase_uid': resolved_fb_uid}, {'_id': 0})
+                    if hasattr(owner_res, '__await__'):
+                        owner_res = await owner_res
+                except KeyError:
+                    owner_res = None
+                if isinstance(owner_res, dict) and owner_res.get('locket_id') and owner_res.get('locket_id') != canonical_id:
+                    raise HTTPException(
+                        409,
+                        f'Firebase UID này đã được gắn với tài khoản "{owner_res.get("locket_id")}" trong MongoDB (conflict).',
+                    )
             resolved_invite_token = resolution.invite_token or resolved_invite_token
             auto_source_link = resolution.source_link or auto_source_link
             safe_ver_status = 'verified_uid'

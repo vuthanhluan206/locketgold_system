@@ -14,6 +14,7 @@ SERVER_TRUSTED_UID_SOURCES = {
     'cryptographic_id_token',
     'authorized_identity_provider',
     'owner_localid_match',
+    'locket_public_share_link',
 }
 
 
