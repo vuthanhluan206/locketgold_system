@@ -15,6 +15,7 @@ from ..models import (
     AccountOutput,
     ActivateAccountInput,
     AdminAccountLookupOutput,
+    AdminResolveUidOutput,
     DeviceCreateInput,
     DeviceOutput,
     LinkVerifyInput,
@@ -518,6 +519,159 @@ async def disconnect_locket_session(request: Request, admin: Annotated[dict, Dep
     return {'connected': False}
 
 
+def _get_active_locket_session_provider(request: Request, admin: dict):
+    sessions = getattr(request.app.state, 'locket_sessions', None)
+    if isinstance(sessions, dict) and admin.get('session_id') in sessions:
+        return sessions[admin['session_id']]
+    return getattr(request.app.state, 'locket_session_provider', None)
+
+
+@router.get('/api/admin/locket/resolve-uid', response_model=AdminResolveUidOutput)
+@admin_router.get('/locket/resolve-uid', response_model=AdminResolveUidOutput)
+async def admin_resolve_locket_uid_endpoint(
+    request: Request,
+    admin: Annotated[dict, Depends(require_admin)],
+    username: str = Query(min_length=1, max_length=256),
+    persist: bool = Query(False),
+):
+    """
+    Automatic Locket Username / Share Link -> Invite Token -> Firebase UID Resolver for Admin.
+    Does not require manual ID Token, Refresh Token, or UID input per lookup:
+      1. Normalizes username / Locket share link.
+      2. Checks MongoDB `accounts_v2` for an already-verified Firebase UID (returns from cache if found).
+      3. Resolves public invite token via `resolve_public_locket_share_link()`.
+      4. Uses the authorized backend `LocketSessionProvider` (if connected) to call `fetchUserForInviteToken`.
+      5. Verifies username/UID match and owner proof, optionally persists to `accounts_v2`, and returns structured status.
+    """
+    from ..services.locket_authenticated_identity import resolve_and_verify_locket_uid
+
+    try:
+        canonical_id, input_kind = normalize_lookup_query(username)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+    now = datetime.now(timezone.utc)
+    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
+    existing_v2 = None
+    if accounts_v2 is not None and hasattr(accounts_v2, 'find_one'):
+        res_v2 = accounts_v2.find_one({'locket_id': canonical_id}, {'_id': 0})
+        if hasattr(res_v2, '__await__'):
+            res_v2 = await res_v2
+        if isinstance(res_v2, dict):
+            existing_v2 = res_v2
+        elif input_kind != 'firebase_uid':
+            try:
+                res_alt = accounts_v2.find_one({'username': canonical_id}, {'_id': 0})
+                if hasattr(res_alt, '__await__'):
+                    res_alt = await res_alt
+                if isinstance(res_alt, dict):
+                    existing_v2 = res_alt
+            except KeyError:
+                pass
+
+    # Step 2 & 3: Return immediately from MongoDB cache if already verified
+    if isinstance(existing_v2, dict):
+        cached_uid, cached_verified, _, _, cached_source = extract_verified_uid_metadata(existing_v2)
+        if cached_verified and cached_uid:
+            return AdminResolveUidOutput(
+                username=str(existing_v2.get('username') or canonical_id),
+                invite_token=existing_v2.get('invite_token'),
+                firebase_uid=cached_uid,
+                status='verified_uid',
+                verification_status='verified_uid',
+                source=cached_source or 'owner_localid_match',
+                cached=True,
+                message=f'Đã đọc Firebase UID đã xác minh từ MongoDB: {cached_uid}.',
+            )
+
+    session_provider = _get_active_locket_session_provider(request, admin)
+    auth_http_client = getattr(request.app.state, 'locket_api_http_client', None)
+    public_fetcher = getattr(request.app.state, 'public_link_fetcher', None)
+    public_http_client = getattr(request.app.state, 'public_http_client', None)
+
+    resolution = await resolve_and_verify_locket_uid(
+        username,
+        session_provider=session_provider,
+        accounts_v2=accounts_v2,
+        http_client=auth_http_client,
+        public_http_client=public_http_client,
+        public_fetcher=public_fetcher,
+    )
+
+    if resolution.status == 'auth_required':
+        return AdminResolveUidOutput(
+            username=resolution.username or canonical_id,
+            invite_token=resolution.invite_token,
+            firebase_uid=None,
+            status='auth_required',
+            verification_status='unverified_handle',
+            source='public_share_link' if resolution.invite_token else None,
+            cached=False,
+            message='Nguồn tra cứu UID yêu cầu phiên xác thực hợp lệ.',
+        )
+
+    if resolution.status in {'uid_resolved', 'verified_uid'} and resolution.firebase_uid:
+        is_ver = resolution.status == 'verified_uid'
+        source_label = 'owner_localid_match' if is_ver else 'authenticated_locket_api'
+        if (persist or existing_v2 is not None) and accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
+            update_fields = {
+                'locket_id': canonical_id,
+                'username': resolution.username or canonical_id,
+                'invite_token': resolution.invite_token,
+                'firebase_uid': resolution.firebase_uid,
+                'resolution_status': resolution.status,
+                'verification_status': 'verified_uid' if is_ver else 'unverified_uid',
+                'verification_method': 'trusted_proof' if is_ver else 'authenticated_lookup',
+                'verification_source': 'owner_localid_match' if is_ver else 'locket_invite_lookup',
+                'uid_resolution_source': 'owner_localid_match' if is_ver else 'locket_invite_lookup',
+                'identity_lookup_source': 'locket_invite_lookup',
+                'identity_lookup_at': now,
+                'uid_resolved_at': now,
+                '_server_uid_proof': is_ver,
+                'updated_at': now,
+                'updated_by': admin.get('email', 'superadmin'),
+            }
+            res_up = accounts_v2.update_one(
+                {'locket_id': canonical_id},
+                {
+                    '$set': update_fields,
+                    '$setOnInsert': {'schema_version': 2, 'account_id': canonical_id, 'created_at': now},
+                },
+                upsert=bool(persist),
+            )
+            if hasattr(res_up, '__await__'):
+                await res_up
+
+        await record_audit(
+            request,
+            admin,
+            'ADMIN_LOCKET_RESOLVE_UID',
+            canonical_id,
+            {'status': resolution.status, 'verification_status': resolution.verification_status},
+        )
+        return AdminResolveUidOutput(
+            username=resolution.username or canonical_id,
+            invite_token=resolution.invite_token,
+            firebase_uid=resolution.firebase_uid,
+            status=resolution.status,
+            verification_status=resolution.verification_status,
+            source=source_label,
+            cached=False,
+            message=resolution.message,
+        )
+
+    return AdminResolveUidOutput(
+        username=resolution.username or canonical_id,
+        invite_token=resolution.invite_token,
+        firebase_uid=None,
+        status=resolution.status,
+        verification_status=resolution.verification_status,
+        source=resolution.identity_lookup_source,
+        cached=False,
+        message=resolution.message,
+    )
+
+
 @admin_router.post('/add-account', response_model=AccountOutput)
 async def upsert_account(
     data: AccountInput,
@@ -535,7 +689,7 @@ async def upsert_account(
     auto_source_link = f'https://locket.cam/{canonical_id}' if input_kind == 'locket_link' else data.source_link
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     provider = getattr(request.app.state, 'identity_provider', None)
-    session_provider = getattr(request.app.state, 'locket_sessions', {}).get(admin['session_id'])
+    session_provider = _get_active_locket_session_provider(request, admin)
     auth_http_client = getattr(request.app.state, 'locket_api_http_client', None)
     public_fetcher = getattr(request.app.state, 'public_link_fetcher', None)
     public_http_client = getattr(request.app.state, 'public_http_client', None)

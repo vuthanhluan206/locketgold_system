@@ -5,8 +5,10 @@ Usage:
   python -m scripts.test_locket_uid_resolution --username vt.l --dry-run
 
 Security Invariants:
+  - Normal mode NEVER prompts the user to paste an ID Token or Refresh Token in the terminal.
+  - Checks MongoDB `accounts_v2` cache first when `--use-cache` is enabled.
   - Uses `resolve_public_locket_share_link()` to extract `invite_token` from `https://locket.cam/<username>`.
-  - Checks if an authorized Locket test session is provided (via optional environment/prompts in memory only).
+  - Uses the configured backend `LocketSessionProvider` (if present); otherwise reports `auth_required`.
   - Never prints Bearer tokens, refresh tokens, or passwords.
   - Never modifies MongoDB when `--dry-run` is active.
   - Never fabricates or guesses a fake Firebase UID.
@@ -17,19 +19,18 @@ import argparse
 import asyncio
 import os
 import sys
-from getpass import getpass
 
-from app.services.identity_service import resolve_public_locket_share_link
+from app.config import get_settings
+from app.services.entitlement_service import extract_verified_uid_metadata
+from app.services.identity_service import normalize_lookup_query, resolve_public_locket_share_link
 from app.services.locket_authenticated_identity import resolve_and_verify_locket_uid
 from app.services.locket_session_provider import LocketSessionProvider, firebase_token_refresher
-from app.config import get_settings
 
 
 def build_session_provider_from_opt_in_env() -> LocketSessionProvider | None:
     """
-    Build an in-memory LocketSessionProvider ONLY if the operator has explicitly provided
-    an opt-in test session in memory/environment for the test run.
-    Never logs or prints any token values.
+    Build an in-memory LocketSessionProvider ONLY if the backend environment has an authorized
+    test session configured. Never prompts interactively in normal mode and never logs tokens.
     """
     id_tok = (os.environ.get('LOCKET_TEST_ID_TOKEN') or '').strip()
     ref_tok = (os.environ.get('LOCKET_TEST_REFRESH_TOKEN') or '').strip()
@@ -38,7 +39,10 @@ def build_session_provider_from_opt_in_env() -> LocketSessionProvider | None:
     is_owner = (os.environ.get('LOCKET_TEST_IS_TARGET_OWNER') or '').strip().lower() in {'1', 'true', 'yes'}
     if not id_tok and not ref_tok:
         return None
-    api_key = get_settings().locket_firebase_api_key.get_secret_value()
+    try:
+        api_key = get_settings().locket_firebase_api_key.get_secret_value()
+    except Exception:
+        api_key = (os.environ.get('LOCKET_FIREBASE_API_KEY') or '').strip()
     return LocketSessionProvider(
         id_token=id_tok or None,
         refresh_token=ref_tok or None,
@@ -50,17 +54,60 @@ def build_session_provider_from_opt_in_env() -> LocketSessionProvider | None:
     )
 
 
-async def run_cli(username: str, *, dry_run: bool = True, import_session: bool = False) -> int:
-    if import_session:
-        api_key = get_settings().locket_firebase_api_key.get_secret_value()
-        session_provider = LocketSessionProvider(
-            id_token=getpass('Locket Firebase ID token: '),
-            refresh_token=getpass('Refresh token (optional): ') or None,
-            username=username, firebase_api_key=api_key,
-            token_refresher=firebase_token_refresher(api_key),
+async def _lookup_cached_account(canonical_id: str) -> dict | None:
+    """Optionally query MongoDB staging `accounts_v2` for an already-cached UID."""
+    try:
+        from pymongo import AsyncMongoClient
+        settings = get_settings()
+        client = AsyncMongoClient(
+            settings.mongodb_uri.get_secret_value(),
+            serverSelectionTimeoutMS=3000,
+            connectTimeoutMS=3000,
         )
-    else:
-        session_provider = build_session_provider_from_opt_in_env()
+        try:
+            db = client[settings.mongodb_database]
+            doc = await db.accounts_v2.find_one({'locket_id': canonical_id}, {'_id': 0})
+            if not isinstance(doc, dict):
+                doc = await db.accounts_v2.find_one({'username': canonical_id}, {'_id': 0})
+            return doc if isinstance(doc, dict) else None
+        finally:
+            await client.close()
+    except Exception:
+        return None
+
+
+async def run_cli(
+    username: str,
+    *,
+    dry_run: bool = True,
+    use_cache: bool = False,
+) -> int:
+    try:
+        canonical_id, _ = normalize_lookup_query(username)
+    except ValueError as exc:
+        print('STATUS: invalid_link')
+        print(f'USERNAME: {username}')
+        print('INVITE TOKEN FOUND: False')
+        print('FIREBASE UID: None')
+        print('VERIFICATION: unverified')
+        print('SOURCE: none')
+        print(f'MESSAGE: {exc}')
+        return 1
+
+    if use_cache:
+        cached_doc = await _lookup_cached_account(canonical_id)
+        if isinstance(cached_doc, dict) and cached_doc.get('firebase_uid'):
+            fb_uid, is_ver, ver_status, _, ver_source = extract_verified_uid_metadata(cached_doc)
+            if fb_uid:
+                print(f'STATUS: {"verified_uid" if is_ver else "uid_resolved"}')
+                print(f'USERNAME: {cached_doc.get("username") or canonical_id}')
+                print(f'INVITE TOKEN FOUND: {bool(cached_doc.get("invite_token"))}')
+                print(f'FIREBASE UID: {fb_uid}')
+                print(f'VERIFICATION: {ver_status}')
+                print(f'SOURCE: mongodb_cache ({ver_source})')
+                return 0
+
+    session_provider = build_session_provider_from_opt_in_env()
     if session_provider is None or not session_provider.is_connected:
         pub_res = await resolve_public_locket_share_link(username)
         has_invite = bool(pub_res.invite_token)
@@ -69,14 +116,16 @@ async def run_cli(username: str, *, dry_run: bool = True, import_session: bool =
             print(f'USERNAME: {pub_res.normalized_id}')
             print('INVITE TOKEN FOUND: True')
             print('FIREBASE UID: None')
-            print('VERIFICATION: unverified')
-            print('MESSAGE: Chưa có phiên Locket hợp lệ để tra cứu UID.')
+            print('VERIFICATION: unverified_handle')
+            print('SOURCE: public_share_link')
+            print('MESSAGE: Nguồn tra cứu UID yêu cầu phiên xác thực hợp lệ.')
             return 0
         print(f'STATUS: {pub_res.status}')
         print(f'USERNAME: {pub_res.normalized_id}')
         print('INVITE TOKEN FOUND: False')
         print('FIREBASE UID: None')
-        print('VERIFICATION: unverified')
+        print('VERIFICATION: unverified_handle')
+        print('SOURCE: public_share_link')
         print(f'MESSAGE: {pub_res.message}')
         return 1
 
@@ -90,7 +139,7 @@ async def run_cli(username: str, *, dry_run: bool = True, import_session: bool =
         print(f'USERNAME: {res.username or res.normalized_id}')
         print(f'INVITE TOKEN FOUND: {has_invite}')
         print(f'FIREBASE UID: {res.firebase_uid}')
-        print('VERIFICATION: verified')
+        print('VERIFICATION: verified_uid')
         print(f'SOURCE: {res.verification_source}')
         return 0
 
@@ -99,7 +148,8 @@ async def run_cli(username: str, *, dry_run: bool = True, import_session: bool =
         print(f'USERNAME: {res.username or res.normalized_id}')
         print(f'INVITE TOKEN FOUND: {has_invite}')
         print(f'FIREBASE UID: {res.firebase_uid}')
-        print('VERIFICATION: unverified')
+        print('VERIFICATION: unverified_uid')
+        print('SOURCE: authenticated_locket_api')
         print('MESSAGE: Cần xác minh quyền sở hữu tài khoản.')
         return 0
 
@@ -107,20 +157,21 @@ async def run_cli(username: str, *, dry_run: bool = True, import_session: bool =
     print(f'USERNAME: {res.username or res.normalized_id}')
     print(f'INVITE TOKEN FOUND: {has_invite}')
     print('FIREBASE UID: None')
-    print('VERIFICATION: unverified')
+    print(f'VERIFICATION: {res.verification_status}')
+    print(f'SOURCE: {res.identity_lookup_source or "locket_invite_lookup"}')
     print(f'MESSAGE: {res.message}')
     return 0 if res.status == 'auth_required' else 1
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description='Verify Locket public invite token & authenticated Firebase UID resolution without modifying production data.'
+        description='Verify Locket public invite token & authenticated Firebase UID resolution without manual token prompts.'
     )
     parser.add_argument('--username', required=True, help='Locket username or https://locket.cam/<username> share link')
     parser.add_argument('--dry-run', action='store_true', default=True, help='Run in read-only dry-run mode (no MongoDB writes)')
-    parser.add_argument('--import-session', action='store_true', help='Read an authorized test session using hidden prompts; never persist it')
+    parser.add_argument('--use-cache', action='store_true', default=False, help='Check MongoDB accounts_v2 cache before querying network')
     args = parser.parse_args(argv)
-    return asyncio.run(run_cli(args.username, dry_run=args.dry_run, import_session=args.import_session))
+    return asyncio.run(run_cli(args.username, dry_run=args.dry_run, use_cache=args.use_cache))
 
 
 if __name__ == '__main__':

@@ -2019,6 +2019,7 @@
             <p class="status" id="accountMessage" role="status" aria-live="polite"></p>
             <div class="dialog-actions">
               <button class="secondary" id="cancelAccount" type="button">Cancel</button>
+              <button class="secondary" id="searchUidBtn" type="button">Tìm UID</button>
               <button id="save" type="submit"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">
                   <path d="m5 12 4 4L19 6" />
                 </svg>&nbsp; Save account</button>
@@ -2294,6 +2295,33 @@
           finally {
             password = ''; $('signIn').disabled = false; turnstileToken = '';
             if (widgetId !== undefined) window.turnstile.reset(widgetId);
+          }
+        };
+        $('searchUidBtn').onclick = async () => {
+          const q = $('accountId').value.trim();
+          if (!q) {
+            $('accountMessage').textContent = 'Vui lòng nhập Locket ID, username hoặc link Locket.';
+            $('accountId').focus();
+            return;
+          }
+          $('searchUidBtn').disabled = true;
+          $('accountMessage').textContent = 'Đang tìm Firebase UID...';
+          try {
+            const res = await api('/api/admin/locket/resolve-uid?username=' + encodeURIComponent(q));
+            if (res.username) $('accountId').value = res.username;
+            const invLabel = res.invite_token ? 'Found (' + res.invite_token + ')' : 'None';
+            const uidLabel = res.firebase_uid ? res.firebase_uid : 'None';
+            $('accountMessage').textContent =
+              'Username: ' + res.username +
+              ' · Invite token: ' + invLabel +
+              ' · Firebase UID: ' + uidLabel +
+              ' · Verification: ' + res.verification_status +
+              ' (' + res.status + ')' +
+              (res.message ? ' — ' + res.message : '');
+          } catch (error) {
+            $('accountMessage').textContent = 'Tra cứu thất bại: ' + error.message;
+          } finally {
+            $('searchUidBtn').disabled = false;
           }
         };
         $('accountForm').onsubmit = async event => {

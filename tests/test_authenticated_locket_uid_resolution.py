@@ -307,3 +307,116 @@ def test_admin_sessions_cannot_disconnect_each_other(lookup_env):
     assert a.is_connected and not b.is_connected
     assert http.post('/api/admin/logout', headers=first).status_code == 204
     assert not a.is_connected and not app.state.locket_sessions
+
+
+def test_prompt22_admin_resolve_uid_endpoint_and_cli_no_manual_token(lookup_env, monkeypatch, capsys):
+    """
+    Prompt 22 Sections 5, 6, 7, 8, 9, 10 & 11:
+      - Verifies GET /api/admin/locket/resolve-uid?username=vt.l (requires Admin auth, 401 without token).
+      - Without backend Locket session: extracts invite_token via public link and returns status='auth_required',
+        firebase_uid=None, verification_status='unverified_handle'.
+      - With backend Locket session: resolves real Firebase UID via fetchUserForInviteToken, returns
+        status='uid_resolved', verification_status='unverified_uid', source='authenticated_locket_api',
+        and persists to accounts_v2 when persist=true.
+      - When account already has a verified Firebase UID in MongoDB cache: returns immediately from cache
+        with status='verified_uid', verification_status='verified_uid', cached=True.
+      - CLI `python -m scripts.test_locket_uid_resolution --username vt.l --dry-run` never prompts for
+        ID Token or Refresh Token in normal mode and outputs structured STATUS / USERNAME / INVITE TOKEN FOUND / FIREBASE UID / VERIFICATION / SOURCE.
+    """
+    from app.security import token_digest
+    from scripts.test_locket_uid_resolution import main as cli_main
+
+    http, app, accounts, accounts_v2, v1, v2, headers = lookup_env
+
+    # 1. Requires Admin authentication
+    assert http.get('/api/admin/locket/resolve-uid?username=vt.l').status_code == 401
+
+    app.state.public_link_fetcher = AsyncMock(
+        return_value=httpx.Response(
+            200,
+            text=f'<a href="https://locket.camera/invites/{INVITE}">vt.l</a>',
+            headers={'Content-Type': 'text/html'},
+        )
+    )
+
+    # 2. No backend Locket session connected -> status='auth_required', invite_token found, firebase_uid=None
+    r_no_sess = http.get('/api/admin/locket/resolve-uid?username=vt.l', headers=headers)
+    assert r_no_sess.status_code == 200
+    d_no_sess = r_no_sess.json()
+    assert d_no_sess['username'] == 'vt.l'
+    assert d_no_sess['invite_token'] == INVITE
+    assert d_no_sess['firebase_uid'] is None
+    assert d_no_sess['status'] == 'auth_required'
+    assert d_no_sess['verification_status'] == 'unverified_handle'
+
+    # 3. Connect authorized backend Locket session -> resolves UID without any token input in the lookup request
+    app.state.locket_sessions = {token_digest(headers['Authorization'].split()[1]): provider()}
+    app.state.locket_api_http_client = httpx.AsyncClient(
+        transport=httpx.MockTransport(
+            lambda req: httpx.Response(200, json={'result': {'data': {'user': {'uid': UID, 'username': 'vt.l'}}}})
+        )
+    )
+    try:
+        r_resolved = http.get('/api/admin/locket/resolve-uid?username=https://locket.cam/vt.l&persist=true', headers=headers)
+        assert r_resolved.status_code == 200
+        d_res = r_resolved.json()
+        assert d_res['username'] == 'vt.l'
+        assert d_res['invite_token'] == INVITE
+        assert d_res['firebase_uid'] == UID
+        assert d_res['status'] == 'uid_resolved'
+        assert d_res['verification_status'] == 'unverified_uid'
+        assert d_res['source'] == 'authenticated_locket_api'
+        assert d_res['cached'] is False
+        assert v2['vt.l']['firebase_uid'] == UID
+        assert v2['vt.l']['invite_token'] == INVITE
+        assert v2['vt.l']['resolution_status'] == 'uid_resolved'
+        assert v2['vt.l']['verification_status'] == 'unverified_uid'
+
+        # 4. When account in MongoDB has a verified UID, resolve-uid returns immediately from cache
+        v2['vt.l']['verification_status'] = 'verified_uid'
+        v2['vt.l']['verification_method'] = 'trusted_proof'
+        v2['vt.l']['verification_source'] = 'owner_localid_match'
+        v2['vt.l']['_server_uid_proof'] = True
+
+        r_cached = http.get('/api/admin/locket/resolve-uid?username=vt.l', headers=headers)
+        assert r_cached.status_code == 200
+        d_cached = r_cached.json()
+        assert d_cached['status'] == 'verified_uid'
+        assert d_cached['verification_status'] == 'verified_uid'
+        assert d_cached['firebase_uid'] == UID
+        assert d_cached['cached'] is True
+        assert d_cached['source'] == 'owner_localid_match'
+
+        # 5. Admin HTML includes `#searchUidBtn` ("Tìm UID") and `/api/admin/locket/resolve-uid`
+        adm_html = http.get('/admin').text
+        assert 'id="searchUidBtn"' in adm_html
+        assert '/api/admin/locket/resolve-uid' in adm_html
+    finally:
+        run(app.state.locket_api_http_client.aclose())
+
+    # 6. CLI `python -m scripts.test_locket_uid_resolution --username vt.l --dry-run` never prompts for token
+    monkeypatch.delenv('LOCKET_TEST_ID_TOKEN', raising=False)
+    monkeypatch.delenv('LOCKET_TEST_REFRESH_TOKEN', raising=False)
+    monkeypatch.setattr(
+        'scripts.test_locket_uid_resolution.resolve_public_locket_share_link',
+        AsyncMock(
+            return_value=type(
+                'PubRes',
+                (),
+                {
+                    'status': 'invite_token_found',
+                    'normalized_id': 'vt.l',
+                    'invite_token': INVITE,
+                    'message': 'Đã lấy invite token.',
+                },
+            )()
+        ),
+    )
+    rc = cli_main(['--username', 'vt.l', '--dry-run'])
+    assert rc == 0
+    out = capsys.readouterr().out
+    assert 'STATUS: auth_required' in out
+    assert 'USERNAME: vt.l' in out
+    assert 'INVITE TOKEN FOUND: True' in out
+    assert 'FIREBASE UID: None' in out
+    assert 'Locket Firebase ID token:' not in out
