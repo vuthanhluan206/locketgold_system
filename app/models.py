@@ -209,6 +209,17 @@ class IdentityResolutionOutput(BaseModel):
     message: str
 
 
+class AdminResolveUidOutput(BaseModel):
+    username: str
+    invite_token: str | None = None
+    firebase_uid: str | None = None
+    status: IdentityResolutionStatus
+    verification_status: VerificationStatus = 'unverified_handle'
+    source: str | None = None
+    cached: bool = False
+    message: str | None = None
+
+
 class PublicLookupOutput(BaseModel):
     exists: bool
 
