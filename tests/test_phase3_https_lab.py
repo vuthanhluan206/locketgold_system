@@ -119,9 +119,16 @@ def test_https_lab_four_states_inspector_and_test_client(monkeypatch):
 
     app = create_app()
     now = datetime.now(timezone.utc)
+    active_uid = '4Vee1rBLoJN9TDjql9xPzDEuf5D2'
     accounts_store = {
-        'user_active': {
-            'locket_id': 'user_active',
+        active_uid: {
+            'locket_id': active_uid,
+            'account_id': active_uid,
+            'firebase_uid': active_uid,
+            'verification_status': 'verified_uid',
+            'verification_method': 'trusted_proof',
+            'verification_source': 'verified_subscriber_traffic',
+            '_server_uid_proof': True,
             'expires_date': now + timedelta(days=90),
             'status': 'active',
         },
@@ -179,7 +186,7 @@ def test_https_lab_four_states_inspector_and_test_client(monkeypatch):
 
         # 1. Verify 4 distinct entitlement states: active, expired, revoked, none
         for uid, expected_state, expected_gold in [
-            ('user_active', 'active', True),
+            (active_uid, 'active', True),
             ('user_expired', 'expired', False),
             ('user_revoked', 'revoked', False),
             ('user_nonexistent', 'none', False),

@@ -440,6 +440,7 @@ volumes:
         assert adm_lookup["verification_status"] == "unverified_handle"
 
         print("=== [SCENARIO 9] Verifying data persistence & mandatory unique indexes directly in MongoDB ===", flush=True)
+        e2e_verified_uid_1 = "E2eVerifiedFirebaseUidUser01"
         mongo_verify_script = "\n".join([
             "import asyncio",
             "from pymongo import AsyncMongoClient",
@@ -449,7 +450,20 @@ volumes:
             "    d2 = await db.accounts_v2.find_one({'locket_id': 'e2e_user_1'})",
             "    d1 = await db.accounts.find_one({'locket_id': 'e2e_user_1'})",
             "    assert d2 is not None and d2.get('locket_id') == 'e2e_user_1', 'Missing accounts_v2 record'",
+            "    assert d2.get('status') == 'pending', 'Unverified username-only account must start as pending'",
             "    assert d1 is not None and d1.get('locket_id') == 'e2e_user_1', 'Missing accounts record'",
+            "    await db.accounts_v2.update_one(",
+            "        {'locket_id': 'e2e_user_1'},",
+            "        {'$set': {",
+            f"            'account_id': '{e2e_verified_uid_1}',",
+            f"            'firebase_uid': '{e2e_verified_uid_1}',",
+            "            'verification_status': 'verified_uid',",
+            "            'verification_method': 'trusted_proof',",
+            "            'verification_source': 'verified_subscriber_traffic',",
+            "            '_server_uid_proof': True,",
+            "            'status': 'active',",
+            "        }},",
+            "    )",
             "    v2_idx = await db.accounts_v2.index_information()",
             "    dev_idx = await db.devices.index_information()",
             "    tk_idx = await db.download_tickets.index_information()",
@@ -482,10 +496,10 @@ volumes:
         st_cross, _, _ = http_req(f"{base_http}/v1/subscribers/e2e_user_2", headers=dev_headers)
         assert st_cross == 403, f"Expected 403 on cross-account access, got {st_cross}"
 
-        # Concurrent automatic entitlement processing (8 concurrent requests)
+        # Concurrent automatic entitlement processing by verified Firebase UID (8 concurrent requests)
         with ThreadPoolExecutor(max_workers=8) as pool:
             futures = [
-                pool.submit(http_req, f"{base_http}/v1/subscribers/e2e_user_1", headers=dev_headers)
+                pool.submit(http_req, f"{base_http}/v1/subscribers/{e2e_verified_uid_1}", headers=dev_headers)
                 for _ in range(8)
             ]
             for fut in futures:
@@ -503,7 +517,7 @@ volumes:
         )
         assert st_rev == 200
 
-        st_after, hdrs_after, body_after = http_req(f"{base_http}/v1/subscribers/e2e_user_1", headers=dev_headers)
+        st_after, hdrs_after, body_after = http_req(f"{base_http}/v1/subscribers/{e2e_verified_uid_1}", headers=dev_headers)
         assert st_after == 200
         assert hdrs_after.get("x-lab-entitlement-status") == "revoked"
         assert json.loads(body_after)["subscriber"]["entitlements"] == {}
@@ -515,7 +529,7 @@ volumes:
             headers=admin_headers,
         )
         assert st_dev_rev == 200
-        st_unauth, _, _ = http_req(f"{base_http}/v1/subscribers/e2e_user_1", headers=dev_headers)
+        st_unauth, _, _ = http_req(f"{base_http}/v1/subscribers/{e2e_verified_uid_1}", headers=dev_headers)
         assert st_unauth == 401
 
         print("=== [SCENARIO 16] Verifying Mobileconfig modes, 1-time download ticket & STRICT TLS SNI/Hostname Verification ===", flush=True)

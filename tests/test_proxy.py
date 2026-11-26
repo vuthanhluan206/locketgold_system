@@ -105,18 +105,19 @@ def test_upload_boundary_and_admin_limit(proxy):
 def test_proxy_uses_admin_account_expiry_and_preserves_other_entitlements(proxy):
     http, app, transport, _ = proxy
     expiry = datetime.now(timezone.utc) + timedelta(days=10)
-    app.state.accounts.find_one.return_value = {'locket_id': 'alice', 'expires_date': expiry}
-    response = http.get('/proxy/v1/subscribers/alice', headers={'Authorization': 'Bearer upstream-token',
+    verified_uid = '4Vee1rBLoJN9TDjql9xPzDEuf5D2'
+    app.state.accounts.find_one.return_value = {'locket_id': verified_uid, 'expires_date': expiry}
+    response = http.get(f'/proxy/v1/subscribers/{verified_uid}', headers={'Authorization': 'Bearer upstream-token',
                         'Cookie': 'admin=secret', 'X-Forwarded-Host': 'attacker.example'})
     subscriber = response.json()['subscriber']
     assert subscriber['entitlements']['Gold']['expires_date'] == expiry.isoformat().replace('+00:00', 'Z')
     assert 'Other' in subscriber['entitlements']
-    app.state.accounts.find_one.assert_awaited_once_with({'locket_id': 'alice'}, {'_id': 0})
+    app.state.accounts.find_one.assert_awaited_once_with({'locket_id': verified_uid}, {'_id': 0})
     headers = transport.call_args.args[2]
     assert headers['Host'] == 'mock.lab.vuthanhluan.bond'
     assert 'cookie' not in headers and 'x-forwarded-host' not in headers
     app.state.accounts.find_one.return_value['expires_date'] = expiry - timedelta(days=20)
-    assert 'Gold' not in http.get('/proxy/v1/subscribers/alice', headers={'Authorization': 'Bearer upstream-token'}).json()['subscriber']['entitlements']
+    assert 'Gold' not in http.get(f'/proxy/v1/subscribers/{verified_uid}', headers={'Authorization': 'Bearer upstream-token'}).json()['subscriber']['entitlements']
 
 
 def test_viewers_datetime_and_database_failure(proxy):

@@ -1,14 +1,6 @@
 from datetime import date, datetime, time, timezone
 from typing import Annotated, Literal
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, field_validator
-
-
-class LocketSessionInput(BaseModel):
-    model_config = ConfigDict(extra='forbid', hide_input_in_errors=True)
-    id_token: SecretStr
-    refresh_token: SecretStr | None = None
-    username: str = Field(min_length=1, max_length=128)
-    expires_in_seconds: int = Field(default=3600, ge=1, le=3600)
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
 
 ACCOUNT_ID_REGEX = r'^[A-Za-z0-9_$:@.\-]{1,128}$'
 AccountId = Annotated[str, Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_$:@.\-]+$')]
@@ -94,11 +86,22 @@ def compute_entitlement_status(account: dict | None, now: datetime | None = None
     if expiry is None:
         return 'expired', None
 
+    eff_expiry = None
     if expiry > now:
-        return 'active', expiry
-    if grace_expiry is not None and grace_expiry > now:
-        return 'active', grace_expiry
-    return 'expired', expiry
+        eff_expiry = expiry
+    elif grace_expiry is not None and grace_expiry > now:
+        eff_expiry = grace_expiry
+    else:
+        return 'expired', expiry
+
+    if explicit_status == 'pending':
+        return 'pending', eff_expiry
+
+    if 'verification_status' in account or '_server_uid_proof' in account:
+        if account.get('verification_status') != 'verified_uid' or account.get('_server_uid_proof') is not True:
+            return 'pending', eff_expiry
+
+    return 'active', eff_expiry
 
 
 class AccountInput(BaseModel):
@@ -115,6 +118,7 @@ class AccountInput(BaseModel):
     max_devices: int = Field(default=2, ge=1, le=10)
     notes: str | None = Field(default=None, max_length=256)
     resolve_identity: bool = False
+    public_only: bool = False
 
     @field_validator('locket_id')
     @classmethod
@@ -207,17 +211,6 @@ class IdentityResolutionOutput(BaseModel):
     uid_resolved_at: AwareDatetime | None = None
     uid_resolution_source: str | None = None
     message: str
-
-
-class AdminResolveUidOutput(BaseModel):
-    username: str
-    invite_token: str | None = None
-    firebase_uid: str | None = None
-    status: IdentityResolutionStatus
-    verification_status: VerificationStatus = 'unverified_handle'
-    source: str | None = None
-    cached: bool = False
-    message: str | None = None
 
 
 class PublicLookupOutput(BaseModel):

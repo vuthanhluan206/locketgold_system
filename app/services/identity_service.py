@@ -365,6 +365,7 @@ def extract_invite_token_from_text_or_url(raw_text: str) -> str | None:
             candidates_to_scan.append(decoded_twice)
 
     reserved = {'invites', 'invite', 'login', 'signup', 'download', 'null', 'undefined', 'none'}
+    asset_suffixes = ('.png', '.jpg', '.jpeg', '.webp', '.gif', '.svg', '.ico', '.css', '.js', '.html', '.json', '.otf', '.ttf', '.woff', '.woff2')
     for text_variant in candidates_to_scan:
         for match in INVITE_PATH_REGEX.findall(text_variant):
             cleaned = unquote(match).strip().strip('\'"<>\\/')
@@ -374,6 +375,7 @@ def extract_invite_token_from_text_or_url(raw_text: str) -> str | None:
             if (
                 cleaned
                 and cleaned.lower() not in reserved
+                and not cleaned.lower().endswith(asset_suffixes)
                 and '%' not in cleaned
                 and INVITE_TOKEN_CLEAN_PATTERN.fullmatch(cleaned)
             ):
@@ -793,31 +795,6 @@ async def _find_in_accounts_v2(accounts_v2: Any, query: dict) -> dict | None:
         return None
 
 
-async def _exchange_firebase_refresh_token(
-    api_key: str,
-    refresh_token: str,
-    timeout: float,
-    http_client: AsyncClient | None = None,
-) -> str | None:
-    """Exchange a configured Firebase refresh_token for a short-lived id_token without logging credentials."""
-    url = f'https://securetoken.googleapis.com/v1/token?key={api_key}'
-    body = {'grant_type': 'refresh_token', 'refresh_token': refresh_token}
-    try:
-        if http_client is not None:
-            resp = await http_client.post(url, data=body, timeout=timeout)
-        else:
-            async with AsyncClient(timeout=timeout) as client:
-                resp = await client.post(url, data=body)
-        if resp.status_code == 200:
-            data = resp.json()
-            token = data.get('id_token') or data.get('access_token')
-            if isinstance(token, str) and token.strip():
-                return token.strip()
-    except Exception:
-        logger.warning('IDENTITY_TOKEN_REFRESH_FAILED')
-    return None
-
-
 async def _call_remote_identity_provider(
     lookup_query: str,
     input_kind: str,
@@ -827,8 +804,8 @@ async def _call_remote_identity_provider(
     http_client: AsyncClient | None = None,
 ) -> tuple[str, dict | None, str, str]:
     """
-    Call the injected provider callable or configured HTTPS identity lookup endpoint (`getUserByUsername` / `fetchUserV2`)
-    with strict timeout and bounded retries.
+    Call the injected provider callable with strict timeout and bounded retries.
+    Never uses Locket session tokens, Firebase refresh tokens, or unapproved external auth tokens.
     Returns `(parse_status, user_dict_or_none, message, provider_source_label)`.
     """
     max_retries = max(1, int(getattr(settings, 'locket_identity_max_retries', 2) or 2))
@@ -864,68 +841,12 @@ async def _call_remote_identity_provider(
                 break
         return ('lookup_unavailable', None, last_err, 'authorized_identity_provider')
 
-    lookup_url = (getattr(settings, 'locket_identity_lookup_url', '') or '').strip()
-    uid_verify_url = (getattr(settings, 'locket_identity_uid_verify_url', '') or '').strip() or lookup_url
-    target_url = uid_verify_url if input_kind == 'firebase_uid' else lookup_url
-    if not target_url:
-        return (
-            'lookup_unavailable',
-            None,
-            'Chưa cấu hình nguồn tra cứu danh tính Locket được phép sử dụng (lookup_unavailable).',
-            'none',
-        )
-
-    def _secret(attr_name: str) -> str:
-        val = getattr(settings, attr_name, None)
-        if val is None:
-            return ''
-        return (val.get_secret_value() if hasattr(val, 'get_secret_value') else str(val)).strip()
-
-    bearer = _secret('locket_identity_bearer_token')
-    api_key = _secret('locket_firebase_api_key')
-    refresh_tok = _secret('locket_firebase_refresh_token')
-    app_check = _secret('locket_firebase_app_check_token')
-
-    if not bearer and api_key and refresh_tok:
-        bearer = await _exchange_firebase_refresh_token(api_key, refresh_tok, timeout, http_client) or ''
-
-    headers = {'Content-Type': 'application/json', 'Accept': 'application/json'}
-    if bearer:
-        headers['Authorization'] = f'Bearer {bearer}'
-    if app_check:
-        headers['X-Firebase-AppCheck'] = app_check
-
-    req_body = (
-        {'data': {'uid': lookup_query, 'user_uid': lookup_query}}
-        if input_kind == 'firebase_uid'
-        else {'data': {'username': lookup_query}}
+    return (
+        'lookup_unavailable',
+        None,
+        'Chưa cấu hình nguồn tra cứu danh tính Locket được phép sử dụng (lookup_unavailable).',
+        'none',
     )
-
-    last_err = 'Không thể kết nối nguồn tra cứu danh tính Locket (lookup_unavailable).'
-    for attempt in range(max_retries):
-        try:
-            if http_client is not None:
-                resp = await http_client.post(target_url, json=req_body, headers=headers, timeout=timeout)
-            else:
-                async with AsyncClient(timeout=timeout) as client:
-                    resp = await client.post(target_url, json=req_body, headers=headers)
-            if resp.status_code in (502, 503, 504) and attempt + 1 < max_retries:
-                continue
-            try:
-                body = resp.json()
-            except Exception:
-                body = None
-            p_status, user_obj, msg = _parse_provider_payload(resp.status_code, body)
-            return (p_status, user_obj, msg, 'authorized_identity_provider')
-        except (TimeoutError, asyncio.TimeoutError, TimeoutException, TransportError, ConnectionError):
-            last_err = 'Hết thời gian chờ hoặc lỗi mạng khi gọi nguồn tra cứu danh tính (lookup_unavailable).'
-            if attempt + 1 < max_retries:
-                continue
-        except Exception:
-            last_err = 'Lỗi kết nối nguồn tra cứu danh tính Locket (lookup_unavailable).'
-            break
-
-    return ('lookup_unavailable', None, last_err, 'authorized_identity_provider')
 
 
 async def resolve_locket_identity(
@@ -938,18 +859,14 @@ async def resolve_locket_identity(
     public_http_client: AsyncClient | None = None,
     public_fetcher: Callable | None = None,
     use_public_link: bool = False,
-    session_provider: Any = None,
-    owner_identity_proof: dict | None = None,
 ) -> IdentityResolutionOutput:
     """
-    Automatic Locket ID / Username / Share Link Resolver.
-    Priority Order (Prompt 20 Section 8):
+    Automatic Public-First Locket ID / Username / Share Link Resolver (Prompt 26 Section 4).
+    Strictly public-only (never uses LocketSessionProvider, Firebase ID Token, or Refresh Token):
       1. Read already-verified Firebase UID if present in MongoDB `accounts_v2`.
-      2. Extract `invite_token` via `resolve_public_locket_share_link()`.
-      3. If an authenticated Locket `session_provider` is available, call `resolve_and_verify_locket_uid()`
-         (`fetchUserForInviteToken` + `verify_target_firebase_uid`).
-      4. If an authorized legacy/direct `provider` is configured, call `_call_remote_identity_provider()`.
-      5. Never fabricate a fake UID if no session or provider is available.
+      2. Query public share link (`https://locket.cam/<username>`) via `resolve_public_locket_share_link()`.
+      3. Optionally invoke injected `provider` in controlled unit tests.
+      4. Never fabricate a fake UID or treat `invite_token` / username as `firebase_uid`.
     """
     now = datetime.now(timezone.utc)
     if not isinstance(raw_input, str) or not raw_input.strip():
@@ -992,38 +909,13 @@ async def resolve_locket_identity(
     existing_doc = await _find_in_accounts_v2(accounts_v2, {'locket_id': normalized_id})
     if existing_doc is None and input_kind != 'firebase_uid':
         existing_doc = await _find_in_accounts_v2(accounts_v2, {'username': normalized_id})
+    if existing_doc is None and input_kind == 'firebase_uid':
+        existing_doc = await _find_in_accounts_v2(accounts_v2, {'firebase_uid': normalized_id})
 
-    # 2. If an authenticated Locket session_provider is provided, execute the 2-step invite -> fetchUserForInviteToken flow
-    if session_provider is not None:
-        from .entitlement_service import extract_verified_uid_metadata
-        cached_uid, cached_verified, _, _, cached_source = extract_verified_uid_metadata(existing_doc or {})
-        if cached_verified:
-            return IdentityResolutionOutput(
-                status='verified_uid', normalized_id=str(existing_doc.get('locket_id') or normalized_id),
-                input_kind=input_kind, username=existing_doc.get('username') or normalized_id,
-                firebase_uid=cached_uid, invite_token=existing_doc.get('invite_token'),
-                source_link=existing_doc.get('source_link'), uid_verified=True,
-                verification_status='verified_uid', verification_method='trusted_proof',
-                verification_source=cached_source, identity_lookup_source='mongodb_verified_cache',
-                identity_lookup_at=now, message='Đã đọc Firebase UID đã xác minh từ hệ thống.',
-            )
-        from .locket_authenticated_identity import resolve_and_verify_locket_uid
-        return await resolve_and_verify_locket_uid(
-            candidate_raw,
-            session_provider=session_provider,
-            accounts_v2=accounts_v2,
-            http_client=http_client,
-            public_http_client=public_http_client,
-            public_fetcher=public_fetcher,
-            owner_identity_proof=owner_identity_proof,
-        )
-
-    has_remote_provider = provider is not None or bool(
-        settings is not None and (getattr(settings, 'locket_identity_lookup_url', '') or '').strip()
-    )
+    has_remote_provider = provider is not None
     has_public_resolver = bool(use_public_link or public_http_client is not None or public_fetcher is not None)
 
-    # 2. If no remote API provider is configured, use the zero-env-var Public Link Resolver if enabled,
+    # 2. If no test provider is injected, use the zero-env-var Public Link Resolver,
     #    while preserving any already-verified Firebase UID in MongoDB!
     if not has_remote_provider:
         existing_verified_uid = (
@@ -1043,13 +935,13 @@ async def resolve_locket_identity(
                 public_fetcher=public_fetcher,
                 check_dns=(public_http_client is None and public_fetcher is None),
             )
-            if existing_verified_uid and pub_res.status == 'invite_token_found':
+            if existing_verified_uid and pub_res.status in {'invite_token_found', 'verification_required'}:
                 return IdentityResolutionOutput(
                     status='resolved_uid',
                     normalized_id=str(existing_doc.get('locket_id') or normalized_id),
                     input_kind=input_kind,
                     username=existing_doc.get('username') or normalized_id,
-                    invite_token=pub_res.invite_token,
+                    invite_token=pub_res.invite_token or existing_doc.get('invite_token'),
                     firebase_uid=existing_verified_uid,
                     source_link=pub_res.source_link or existing_doc.get('source_link'),
                     uid_verified=True,
@@ -1060,7 +952,7 @@ async def resolve_locket_identity(
                     identity_lookup_at=now,
                     uid_resolved_at=existing_doc.get('uid_resolved_at') or now,
                     uid_resolution_source=str(existing_doc.get('uid_resolution_source') or 'mongodb_verified_cache'),
-                    message=f'Đã giữ nguyên Firebase UID đã xác minh ({existing_verified_uid}) và cập nhật invite token.',
+                    message=f'Đã giữ nguyên Firebase UID đã xác minh ({existing_verified_uid}) và cập nhật dữ liệu công khai.',
                 )
             return pub_res
 

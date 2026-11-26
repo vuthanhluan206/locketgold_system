@@ -20,6 +20,8 @@ from pymongo import AsyncMongoClient
 from app.config import get_settings
 from app.database import _fetch_all_documents, run_controlled_migration
 from app.models import normalize_expiry
+from app.services.entitlement_service import extract_verified_uid_metadata
+from app.services.identity_service import is_valid_firebase_uid
 
 
 def _json_default(obj):
@@ -298,6 +300,9 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
 
         # Check entitlements projection drift
         if getattr(db, 'entitlements', None) is not None:
+            fb_uid, uid_ver, *_ = extract_verified_uid_metadata(v2_doc)
+            target_ent_id = fb_uid if (uid_ver and fb_uid) else lid
+            ent_doc = ent_map.get(target_ent_id) or ent_map.get(lid)
             ent_exp = None
             if isinstance(ent_doc, dict) and ent_doc.get('expires_date') is not None:
                 try:
@@ -305,14 +310,14 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
                 except Exception:
                     ent_exp = None
             ent_status = str(ent_doc.get('status') or '').lower() if isinstance(ent_doc, dict) else ''
-            if ent_doc is None or ent_exp != auth_expiry or ent_status != auth_status:
+            if ent_doc is None or ent_doc.get('account_id') != target_ent_id or ent_exp != auth_expiry or ent_status != auth_status:
                 drifts.append({'locket_id': lid, 'target': 'entitlements', 'reason': 'Entitlement projection out of sync with accounts_v2'})
                 if not dry_run:
                     await db.entitlements.update_one(
-                        {'account_id': lid, 'entitlement_key': 'Gold'},
+                        {'account_id': target_ent_id, 'entitlement_key': 'Gold'},
                         {
                             '$set': {
-                                'account_id': lid,
+                                'account_id': target_ent_id,
                                 'entitlement_key': 'Gold',
                                 'product_identifier': 'com.locket.gold.yearly',
                                 'status': auth_status,
@@ -334,6 +339,167 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
     }
 
 
+async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True) -> dict:
+    """
+    Controlled UID-Key Entitlement Audit & Migration (Prompt 26 Section 10):
+      1. Lists accounts currently using username as key (`username_keyed_accounts`).
+      2. Lists accounts with a verified Firebase UID (`verified_uid_accounts`).
+      3. Detects duplicate UIDs across different accounts (`duplicate_uids`) and orphan entitlements (`orphan_entitlements`).
+      4. Generates an old-key -> new-verified-UID mapping report (`old_to_new_mapping`).
+      5. Never auto-converts username-only accounts into `verified_uid` and never overwrites verified UIDs.
+      6. Halts immediately (`aborted_on_conflict=True`) without writing if any UID conflict is detected.
+    """
+    now = datetime.now(timezone.utc)
+    v2_list = await _fetch_all_documents(getattr(db, 'accounts_v2', None), {}, {'_id': 0})
+    ent_list = await _fetch_all_documents(getattr(db, 'entitlements', None), {'entitlement_key': 'Gold'}, {'_id': 0})
+
+    username_keyed_accounts: list[dict] = []
+    verified_uid_accounts: list[dict] = []
+    old_to_new_mapping: list[dict] = []
+    duplicate_uids: list[dict] = []
+    orphan_entitlements: list[dict] = []
+    unverified_active_entitlements: list[dict] = []
+
+    uid_owners: dict[str, list[str]] = {}
+    known_locket_ids: set[str] = set()
+    known_verified_uids: set[str] = set()
+    v2_by_lid: dict[str, dict] = {}
+
+    for doc in v2_list:
+        if not isinstance(doc, dict):
+            continue
+        lid = str(doc.get('locket_id') or '').strip()
+        if not lid:
+            continue
+        known_locket_ids.add(lid)
+        v2_by_lid[lid] = doc
+
+        raw_uid = doc.get('firebase_uid')
+        if isinstance(raw_uid, str) and raw_uid.strip():
+            uid_owners.setdefault(raw_uid.strip(), []).append(lid)
+
+        fb_uid, uid_verified, ver_status, _, ver_source = extract_verified_uid_metadata(doc)
+        if uid_verified and fb_uid and is_valid_firebase_uid(fb_uid):
+            known_verified_uids.add(fb_uid)
+            verified_uid_accounts.append({
+                'locket_id': lid,
+                'username': doc.get('username') or lid,
+                'firebase_uid': fb_uid,
+                'account_id': doc.get('account_id'),
+                'verification_source': ver_source,
+                'status': doc.get('status'),
+            })
+            if doc.get('account_id') != fb_uid or lid != fb_uid:
+                old_to_new_mapping.append({
+                    'locket_id': lid,
+                    'old_key': str(doc.get('account_id') or lid),
+                    'new_verified_uid': fb_uid,
+                    'status': doc.get('status', 'active'),
+                })
+        else:
+            username_keyed_accounts.append({
+                'locket_id': lid,
+                'username': doc.get('username') or lid,
+                'firebase_uid': fb_uid,
+                'verification_status': ver_status,
+                'status': doc.get('status', 'pending'),
+            })
+
+    for uid_val, owners in sorted(uid_owners.items()):
+        if len(owners) > 1:
+            duplicate_uids.append({'firebase_uid': uid_val, 'locket_ids': owners})
+
+    for ent in ent_list:
+        if not isinstance(ent, dict):
+            continue
+        ent_aid = str(ent.get('account_id') or '').strip()
+        ent_status = str(ent.get('status') or '').lower()
+        if not ent_aid:
+            continue
+        if ent_aid not in known_verified_uids and ent_aid not in known_locket_ids:
+            orphan_entitlements.append({
+                'account_id': ent_aid,
+                'status': ent_status,
+                'reason': 'No matching account in accounts_v2',
+            })
+        elif ent_aid not in known_verified_uids and ent_status == 'active':
+            # Matched a username/locket_id rather than a verified UID
+            v2_match = v2_by_lid.get(ent_aid)
+            fb_uid, uid_ver, *_ = extract_verified_uid_metadata(v2_match) if isinstance(v2_match, dict) else (None, False, '', '', '')
+            if not uid_ver or not fb_uid:
+                unverified_active_entitlements.append({
+                    'account_id': ent_aid,
+                    'status': ent_status,
+                    'reason': 'Active entitlement keyed by unverified username/handle',
+                })
+
+    has_conflicts = len(duplicate_uids) > 0
+    migrated_entitlements = 0
+    downgraded_pending = 0
+
+    if not dry_run and not has_conflicts:
+        for item in old_to_new_mapping:
+            lid = item['locket_id']
+            fb_uid = item['new_verified_uid']
+            v2_doc = v2_by_lid.get(lid, {})
+            if getattr(db, 'accounts_v2', None) is not None:
+                await db.accounts_v2.update_one(
+                    {'locket_id': lid, 'firebase_uid': fb_uid, '_server_uid_proof': True},
+                    {'$set': {'account_id': fb_uid, 'updated_at': now}},
+                )
+            if getattr(db, 'entitlements', None) is not None:
+                raw_exp = v2_doc.get('expires_date')
+                try:
+                    eff_exp = normalize_expiry(raw_exp) if raw_exp else datetime(1970, 1, 1, tzinfo=timezone.utc)
+                except Exception:
+                    eff_exp = datetime(1970, 1, 1, tzinfo=timezone.utc)
+                eff_st = str(v2_doc.get('status') or 'active').lower()
+                await db.entitlements.update_one(
+                    {'account_id': fb_uid, 'entitlement_key': 'Gold'},
+                    {
+                        '$set': {
+                            'account_id': fb_uid,
+                            'locket_id': lid,
+                            'entitlement_key': 'Gold',
+                            'product_identifier': 'com.locket.gold.yearly',
+                            'status': eff_st,
+                            'expires_date': eff_exp,
+                            'revoked_at': v2_doc.get('revoked_at'),
+                            'updated_at': now,
+                        }
+                    },
+                    upsert=True,
+                )
+                migrated_entitlements += 1
+
+        for item in username_keyed_accounts:
+            lid = item['locket_id']
+            if item['status'] == 'active' and getattr(db, 'accounts_v2', None) is not None:
+                await db.accounts_v2.update_one(
+                    {'locket_id': lid, '_server_uid_proof': {'$ne': True}},
+                    {'$set': {'status': 'pending', 'updated_at': now}},
+                )
+                downgraded_pending += 1
+
+    return {
+        'dry_run': dry_run,
+        'aborted_on_conflict': has_conflicts,
+        'username_keyed_count': len(username_keyed_accounts),
+        'verified_uid_count': len(verified_uid_accounts),
+        'duplicate_uid_count': len(duplicate_uids),
+        'orphan_entitlement_count': len(orphan_entitlements),
+        'unverified_active_entitlement_count': len(unverified_active_entitlements),
+        'username_keyed_accounts': username_keyed_accounts,
+        'verified_uid_accounts': verified_uid_accounts,
+        'old_to_new_mapping': old_to_new_mapping,
+        'duplicate_uids': duplicate_uids,
+        'orphan_entitlements': orphan_entitlements,
+        'unverified_active_entitlements': unverified_active_entitlements,
+        'migrated_entitlements': migrated_entitlements,
+        'downgraded_to_pending': downgraded_pending,
+    }
+
+
 async def run_migration_cli(
     dry_run: bool = False,
     backup_path: str | None = None,
@@ -342,6 +508,7 @@ async def run_migration_cli(
     rollback_mode: Literal['partial', 'full'] = 'partial',
     confirm_destructive: bool = False,
     reconcile: bool = False,
+    uid_entitlements: bool = False,
 ):
     if verify_backup_path:
         info = verify_backup_file_on_disk(verify_backup_path)
@@ -361,6 +528,10 @@ async def run_migration_cli(
     try:
         await client.admin.command('ping')
         db = client[settings.mongodb_database]
+        if uid_entitlements:
+            uid_report = await inspect_and_migrate_uid_entitlements(db, dry_run=dry_run)
+            print(f"UID Entitlement Migration report (dry_run={dry_run}): {json.dumps(uid_report)}")
+            return uid_report
         if reconcile:
             rec_report = await reconcile_collections(db, dry_run=dry_run)
             print(f"Reconciliation report (dry_run={dry_run}): {json.dumps(rec_report)}")
@@ -439,6 +610,11 @@ if __name__ == '__main__':
         action='store_true',
         help='Detect and repair collection drift across accounts_v2, accounts, and entitlements',
     )
+    parser.add_argument(
+        '--uid-entitlements',
+        action='store_true',
+        help='Inspect and migrate Gold entitlements to verified Firebase UID keys',
+    )
     args = parser.parse_args()
     is_dry_run = args.dry_run or not (args.apply or args.rollback or args.verify_backup)
     asyncio.run(
@@ -450,5 +626,6 @@ if __name__ == '__main__':
             rollback_mode=args.mode,
             confirm_destructive=args.confirm_destructive,
             reconcile=args.reconcile,
+            uid_entitlements=args.uid_entitlements,
         )
     )

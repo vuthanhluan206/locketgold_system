@@ -259,8 +259,12 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
         v2_store.setdefault(q["locket_id"], {"locket_id": q["locket_id"]}).update(u.get("$set", {}))
 
     async def v2_find(q, proj=None):
-        d = v2_store.get(q.get("locket_id"))
-        return d.copy() if d else None
+        for field in ("locket_id", "username", "firebase_uid"):
+            if field in q:
+                for doc in v2_store.values():
+                    if doc.get(field) == q[field]:
+                        return doc.copy()
+        return None
 
     async def dev_ins(d):
         dev_store[d["device_id"]] = d.copy()
@@ -315,7 +319,12 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
         assert res_doh_post.status_code == 200
         assert res_doh_post.content[-4:] == bytes([127, 0, 0, 1])
 
-        # Automatic processing with enrolled device
+        # Automatic processing with enrolled device and verified Firebase UID
+        verified_auto_uid = "AutoUserVerifiedUid123456789"
+        app.state.identity_provider = lambda q, k: (
+            200,
+            {"result": {"status": 200, "data": {"uid": verified_auto_uid, "username": "auto_user"}}},
+        )
         login_res = http.post("/api/admin/login", json={"email": "admin@example.test", "password": password})
         admin_hdr = {"Authorization": "Bearer " + login_res.json()["access_token"]}
         future_iso = (datetime.now(timezone.utc) + timedelta(days=30)).isoformat()
@@ -324,13 +333,13 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
         dev_res = http.post("/admin/devices", headers=admin_hdr, json={"locket_id": "auto_user", "device_name": "iPhone Lab", "ios_version": "18.2"}).json()
         dev_hdr = {"Authorization": "Bearer " + dev_res["device_token"]}
 
-        sub_active = http.get("/v1/subscribers/auto_user", headers=dev_hdr)
+        sub_active = http.get(f"/v1/subscribers/{verified_auto_uid}", headers=dev_hdr)
         assert sub_active.status_code == 200
         assert "Gold" in sub_active.json()["subscriber"]["entitlements"]
 
         # Check 13: Client report clearly states simulated lab response vs official app
         report_dict = format_entitlement_report(
-            "auto_user",
+            verified_auto_uid,
             200,
             dict(sub_active.headers),
             sub_active.json(),
@@ -341,13 +350,13 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
 
         # Check 11: Revoked account immediately denied Gold
         assert http.post("/admin/accounts/auto_user/revoke", headers=admin_hdr, json={"reason": "test"}).status_code == 200
-        sub_rev = http.get("/v1/subscribers/auto_user", headers=dev_hdr)
+        sub_rev = http.get(f"/v1/subscribers/{verified_auto_uid}", headers=dev_hdr)
         assert sub_rev.status_code == 200
         assert sub_rev.json()["subscriber"]["entitlements"] == {}
 
         # Check 12: Revoked device rejected with 401
         assert http.post(f"/admin/devices/{dev_res['device_id']}/revoke", headers=admin_hdr).status_code == 200
-        assert http.get("/v1/subscribers/auto_user", headers=dev_hdr).status_code == 401
+        assert http.get(f"/v1/subscribers/{verified_auto_uid}", headers=dev_hdr).status_code == 401
     finally:
         http.close()
         get_settings.cache_clear()
