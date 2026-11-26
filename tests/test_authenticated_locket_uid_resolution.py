@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import json
 from datetime import datetime, timedelta, timezone
 from unittest.mock import AsyncMock
@@ -254,12 +254,12 @@ def test_admin_session_import_disconnect_and_no_token_storage(lookup_env):
     assert response.status_code == 200
     assert 'private-' not in response.text
     assert not v1 and not v2
-    linked = app.state.locket_session_provider
+    linked = next(iter(app.state.locket_sessions.values()))
     assert linked.is_connected
     assert linked.get_owner_identity_proof() is None
     response = http.delete('/admin/locket-session', headers=headers)
     assert response.status_code == 200
-    assert app.state.locket_session_provider is None
+    assert not app.state.locket_sessions
     assert not linked.is_connected
     audit_args = str(app.state.audit.insert_one.call_args_list)
     assert 'private-id-token' not in audit_args
@@ -268,7 +268,8 @@ def test_admin_session_import_disconnect_and_no_token_storage(lookup_env):
 
 def test_admin_authenticated_uid_saved_without_owner_claim(lookup_env):
     http, app, accounts, accounts_v2, v1, v2, headers = lookup_env
-    app.state.locket_session_provider = provider()
+    from app.security import token_digest
+    app.state.locket_sessions = {token_digest(headers['Authorization'].split()[1]): provider()}
     app.state.public_link_fetcher = AsyncMock(return_value=httpx.Response(
         200, text=f'<a href="https://locket.camera/invites/{INVITE}">invite</a>',
         headers={'Content-Type': 'text/html'},
@@ -287,3 +288,22 @@ def test_admin_authenticated_uid_saved_without_owner_claim(lookup_env):
     assert 'authorized-test-token' not in str(v2)
     assert http.get('/api/accounts/lookup?query=vt.l').json() == {'exists': True}
     run(app.state.locket_api_http_client.aclose())
+
+def test_admin_sessions_cannot_disconnect_each_other(lookup_env):
+    from secrets import token_urlsafe
+    from app.security import token_digest
+
+    http, app, _, _, _, _, first = lookup_env
+    token = token_urlsafe(48)
+    second = {'Authorization': 'Bearer ' + token}
+    session = dict(app.state.sessions.insert_one.call_args.args[0], _id=token_digest(token))
+    run(app.state.sessions.insert_one(session))
+    for headers, username in [(first, 'first.user'), (second, 'second.user')]:
+        response = http.post('/admin/locket-session', headers=headers,
+                             json={'username': username, 'id_token': 'test-' + username})
+        assert response.status_code == 200
+    a, b = app.state.locket_sessions.values()
+    assert http.delete('/admin/locket-session', headers=second).status_code == 200
+    assert a.is_connected and not b.is_connected
+    assert http.post('/api/admin/logout', headers=first).status_code == 204
+    assert not a.is_connected and not app.state.locket_sessions
