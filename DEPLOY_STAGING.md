@@ -132,3 +132,55 @@ docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m 
 ```bash
 docker compose -p locket_staging -f compose.staging.yaml --profile lab --profile ca_init down
 ```
+
+### Tra cứu UID bằng phiên Locket được cấp quyền
+
+Luồng mới giữ public resolver hiện có, sau đó gọi HTTPS cố định
+`POST https://api.locketcamera.com/fetchUserForInviteToken` với Bearer ID token
+và body `{"data":{"invite_token":"..."}}`. Cách gọi được đối chiếu với
+[LocketLam friends.py](https://github.com/leanhminh2104/locketlam/blob/main/locketlam/modules/friends.py)
+và [client.py](https://github.com/leanhminh2104/locketlam/blob/main/locketlam/client.py).
+Không sao chép analytics giả lập thiết bị, App Check hoặc token mẫu từ thư viện.
+Hai envelope `result.data.user` và `data.user` được kiểm tra bằng mock, chưa phải
+bằng chứng response thực tế của Locket. Nếu API trả cấu trúc khác, cần lấy mẫu
+đã loại thông tin nhạy cảm trước khi sửa parser.
+
+Trên staging, đăng nhập Admin, chọn **Liên kết phiên Locket**, nhập username
+của phiên và ID token hợp lệ do chủ tài khoản kiểm thử cấp; refresh token là
+tuỳ chọn. Sau đó Add account bằng username/link và ngày hết hạn như trước.
+Không đưa token vào URL, Git, log, file JSON hoặc localStorage. Nút **Ngắt phiên
+Locket** huỷ token trong bộ nhớ. Phiên nhập dùng chung cho superadmin của tiến
+trình, mất khi restart; triển khai staging phải giữ một worker như Dockerfile.
+Không dùng cơ chế này trên deployment nhiều worker/serverless.
+
+`uid_resolved` / `unverified_uid` nghĩa là API trả UID và username khớp, chưa
+xác minh chủ tài khoản. Để xác minh, backend dùng cấu hình **đã có**
+`LOCKET_FIREBASE_API_KEY` của đúng dự án Locket gọi Firebase `accounts:lookup`
+bằng ID token, rồi đối chiếu `localId` với UID và username của lookup Locket.
+Xem [Firebase REST account lookup](https://firebase.google.com/docs/reference/rest/auth#section-get-account-info).
+Không cấu hình key thì vẫn có thể tra cứu UID bằng phiên hợp lệ nhưng chưa
+xác minh ownership và không tự refresh được. Cờ owner hoặc localId nhập từ
+client/biến môi trường không được dùng làm bằng chứng xác minh.
+
+Index `unique_firebase_uid_string` ngăn hai account giữ cùng UID; null được
+bỏ qua. Nếu staging có UID trùng từ dữ liệu cũ, startup sẽ báo lỗi index;
+kiểm tra và xử lý conflict thủ công, không tự xoá dữ liệu. Conditional update
+chặn ghi đè/hạ trạng thái verified khi có ghi đồng thời.
+
+Kiểm tra read-only trong container staging đã có source mới:
+
+```bash
+docker compose -p locket_staging -f compose.staging.yaml exec api python -m scripts.test_locket_uid_resolution --username vt.l --dry-run
+# Nhập phiên riêng cho CLI qua prompt ẩn (không dùng phiên trong tiến trình Admin):
+docker compose -p locket_staging -f compose.staging.yaml exec api python -m scripts.test_locket_uid_resolution --username vt.l --dry-run --import-session
+```
+
+CLI không ghi MongoDB và không kích hoạt entitlement. Khi chưa có phiên nó
+báo `auth_required`, không sinh UID. Không chạy CLI với tài khoản ngoài phạm
+vi cho phép. Backend staging vẫn phải dùng `locket_manager_staging`; cấu hình
+staging bị chặn nếu chọn database production.
+
+Chưa có kiểm chứng API thật, đối chiếu localId thật hoặc ghi MongoDB thật cho
+luồng mới. Việc nhập phiên trong Admin là bước kiểm thử tiếp theo trên staging;
+không tự merge/deploy production, không đổi DNS, CA, mobileconfig hay subscription
+của Locket. Chạy `python -m pytest -q` để kiểm tra offline trước khi đưa lên VPS.

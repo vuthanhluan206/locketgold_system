@@ -13,6 +13,7 @@ SERVER_TRUSTED_UID_SOURCES = {
     'firebase_admin_sdk',
     'cryptographic_id_token',
     'authorized_identity_provider',
+    'owner_localid_match',
 }
 
 
@@ -112,12 +113,22 @@ def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, 
         )
 
     if candidate_uid is not None:
+        eff_method = (
+            str(rec_method)
+            if rec_method in {'authenticated_lookup', 'format_only_uid', 'direct_uid'}
+            else 'format_only_uid'
+        )
+        eff_source = (
+            str(rec_source)
+            if isinstance(rec_source, str) and rec_source.strip() and rec_source != 'admin_direct_input'
+            else ('admin_manual_input' if not has_server_proof else str(rec_source or 'db_stored_unverified_uid'))
+        )
         return (
             candidate_uid,
             False,
             'unverified_uid',
-            'format_only_uid',
-            'admin_manual_input' if not has_server_proof else str(rec_source or 'db_stored_unverified_uid'),
+            eff_method,
+            eff_source,
         )
 
     if record.get('username') or rec_status == 'unverified_handle':
