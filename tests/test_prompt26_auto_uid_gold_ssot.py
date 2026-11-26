@@ -589,6 +589,11 @@ def test_11_to_19_and_23_gold_entitlement_ssot_and_crud_by_verified_uid(prompt26
     lab_sub_ok = http.get(f'/api/lab/subscribers/{verified_uid}', headers=service_headers)
     assert lab_sub_ok.status_code == 200
     assert 'Gold' in lab_sub_ok.json()['subscriber']['entitlements']
+    with monkeypatch.context() as patch:
+        patch.delitem(ent_store, (verified_uid, 'Gold'))
+        for prefix in ('/v1', '/api/lab'):
+            missing = http.get(f'{prefix}/subscribers/{verified_uid}', headers=service_headers)
+            assert missing.json()['subscriber']['entitlements'] == {}
 
     # Querying by username 'vt.l' MUST NOT grant active Gold
     sub_by_username = http.get('/v1/subscribers/vt.l', headers=service_headers)

@@ -352,6 +352,10 @@ def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
         replay_res = http.get(f'/profile.mobileconfig?mode=scoped_lab&ticket={download_ticket}')
         assert replay_res.status_code == 401
 
+        app.state.entitlements = AsyncMock()
+        app.state.entitlements.find_one.return_value = {
+            'account_id': '4Vee1rBLoJN9TDjql9xPzDEuf5D2', 'entitlement_key': 'Gold', 'status': 'active', 'expires_date': future_exp,
+        }
         # 8. Query subscriber endpoint using device_token -> Active Gold
         sub_res = http.get(
             '/v1/subscribers/4Vee1rBLoJN9TDjql9xPzDEuf5D2',

@@ -37,7 +37,7 @@ async def _resolve_account_and_build_response(
     eff_account = account.copy() if isinstance(account, dict) else None
     if isinstance(eff_account, dict):
         fb_uid, uid_verified, _, _, _ = extract_verified_uid_metadata(eff_account)
-        # Check entitlements collection for explicit revocation under verified UID
+        ent_doc = None
         entitlements_col = getattr(request.app.state, 'entitlements', None)
         if entitlements_col is not None and hasattr(entitlements_col, 'find_one') and fb_uid:
             try:
@@ -52,13 +52,31 @@ async def _resolve_account_and_build_response(
             except Exception as exc:
                 raise HTTPException(503, 'Entitlement lookup unavailable') from exc
 
-        raw_status, _ = compute_entitlement_status(eff_account, now)
+        raw_status, account_expiry = compute_entitlement_status(eff_account, now)
         if raw_status not in {'revoked', 'expired'}:
             if not uid_verified or not fb_uid:
                 eff_account['status'] = 'pending'
             elif account_id != fb_uid:
                 # Reject attempts to bypass UID entitlement by querying with a username or invite token
                 eff_account = None
+            elif raw_status == 'active':
+                if entitlements_col is None or not hasattr(entitlements_col, 'find_one'):
+                    raise HTTPException(503, 'Entitlement lookup unavailable')
+                if (not isinstance(ent_doc, dict) or ent_doc.get('account_id') != fb_uid
+                        or ent_doc.get('entitlement_key') != 'Gold'
+                        or ent_doc.get('status') not in ('active', 'expired')):
+                    eff_account['status'] = 'pending'
+                else:
+                    grant = {**ent_doc, 'grace_period_expires_date': None}
+                    grant_status, grant_expiry = compute_entitlement_status(grant, now)
+                    if ent_doc.get('status') == 'expired' or grant_status == 'expired':
+                        eff_account.update(expires_date=min(grant_expiry or now, now),
+                                           grace_period_expires_date=None)
+                    elif grant_status == 'active':
+                        eff_account.update(expires_date=min(account_expiry, grant_expiry),
+                                           grace_period_expires_date=None)
+                    else:
+                        eff_account['status'] = grant_status
 
     status, _ = compute_entitlement_status(eff_account, now)
     state_label = _map_api_state_label(status)

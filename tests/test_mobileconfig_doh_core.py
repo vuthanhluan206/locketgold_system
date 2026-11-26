@@ -333,6 +333,10 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
         dev_res = http.post("/admin/devices", headers=admin_hdr, json={"locket_id": "auto_user", "device_name": "iPhone Lab", "ios_version": "18.2"}).json()
         dev_hdr = {"Authorization": "Bearer " + dev_res["device_token"]}
 
+        app.state.entitlements = AsyncMock()
+        app.state.entitlements.find_one.return_value = {
+            'account_id': verified_auto_uid, 'entitlement_key': 'Gold', 'status': 'active', 'expires_date': future_iso,
+        }
         sub_active = http.get(f"/v1/subscribers/{verified_auto_uid}", headers=dev_hdr)
         assert sub_active.status_code == 200
         assert "Gold" in sub_active.json()["subscriber"]["entitlements"]

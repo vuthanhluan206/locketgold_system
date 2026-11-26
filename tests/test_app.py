@@ -234,6 +234,10 @@ def test_upsert_injection_and_subscriber(client):
         'status': 'active',
         'expires_date': future,
     }
+    http.app.state.entitlements = AsyncMock()
+    http.app.state.entitlements.find_one.return_value = {
+        'account_id': verified_uid, 'entitlement_key': 'Gold', 'status': 'active', 'expires_date': future,
+    }
     assert 'Gold' in http.get(f'/v1/subscribers/{verified_uid}', headers=headers).json()['subscriber']['entitlements']
     accounts.find_one.return_value = None
     assert http.get('/v1/subscribers/missing', headers=headers).json()['subscriber']['entitlements'] == {}

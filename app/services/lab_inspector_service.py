@@ -68,8 +68,10 @@ def redact_payload(data: Any) -> Any:
         out = {}
         for k, v in data.items():
             key_lower = str(k).lower()
-            if key_lower in SENSITIVE_BODY_KEYS or 'password' in key_lower or 'secret' in key_lower:
-                out[k] = '***REDACTED***' if not isinstance(v, str) else mask_token_string(v)
+            if (key_lower in SENSITIVE_BODY_KEYS or key_lower in SENSITIVE_HEADER_KEYS
+                    or any(part in key_lower for part in ('password', 'secret', 'token'))
+                    or key_lower.replace('_', '').replace('-', '') in {'apikey', 'privatekey'}):
+                out[k] = '***REDACTED***'
             else:
                 out[k] = redact_payload(v)
         return out
