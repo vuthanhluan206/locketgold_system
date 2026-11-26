@@ -16,6 +16,7 @@ MAX_PUBLIC_LINK_REDIRECTS = 5
 MAX_PUBLIC_LINK_RESPONSE_BYTES = 262_144
 INVITE_PATH_REGEX = re.compile(r'/invites/([A-Za-z0-9_%.\-~]+)', re.IGNORECASE)
 INVITE_TOKEN_CLEAN_PATTERN = re.compile(r'^[A-Za-z0-9_.\-~]{6,128}$')
+COMPOUND_INVITE_UID_PATTERN = re.compile(r'^([A-Za-z0-9]{28})([0-9a-fA-F]{16})$')
 
 FIREBASE_UID_PATTERN = re.compile(r'^[A-Za-z0-9]{28}$')
 MONGO_OBJECT_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{24}$')
@@ -383,6 +384,68 @@ def extract_invite_token_from_text_or_url(raw_text: str) -> str | None:
     return None
 
 
+def extract_firebase_uid_from_invite_token(invite_token: str | None) -> str | None:
+    """
+    Extract the 28-character Firebase UID prefix from a real 44-character Locket public share
+    invite token (`<28-char-Firebase-UID><16-char-hex-suffix>`, e.g.
+    `juNBPjHxRYeYXtMzPIy0YSjzIL83907433b66b8185cb` -> `juNBPjHxRYeYXtMzPIy0YSjzIL83`).
+    Never treats a standalone 28-character invite token without the 16-char hex suffix as a UID.
+    """
+    if not isinstance(invite_token, str) or not invite_token:
+        return None
+    match = COMPOUND_INVITE_UID_PATTERN.fullmatch(invite_token.strip())
+    if not match:
+        return None
+    candidate_uid = match.group(1)
+    return candidate_uid if is_valid_firebase_uid(candidate_uid) else None
+
+
+def _build_public_token_resolution(
+    *,
+    normalized_id: str,
+    input_kind: str,
+    invite_token: str,
+    share_url: str,
+    now: datetime,
+) -> IdentityResolutionOutput:
+    extracted_uid = extract_firebase_uid_from_invite_token(invite_token)
+    if extracted_uid:
+        return IdentityResolutionOutput(
+            status='resolved_uid',
+            normalized_id=normalized_id,
+            input_kind=input_kind,
+            username=normalized_id,
+            invite_token=invite_token,
+            firebase_uid=extracted_uid,
+            source_link=share_url,
+            uid_verified=True,
+            verification_status='verified_uid',
+            verification_method='trusted_proof',
+            verification_source='locket_public_share_link',
+            identity_lookup_source='public_share_link',
+            identity_lookup_at=now,
+            uid_resolved_at=now,
+            uid_resolution_source='locket_public_share_link',
+            message=f'Đã trích xuất Firebase UID ({extracted_uid}) và lưu invite token từ trang công khai Locket.',
+        )
+    return IdentityResolutionOutput(
+        status='invite_token_found',
+        normalized_id=normalized_id,
+        input_kind=input_kind,
+        username=normalized_id,
+        invite_token=invite_token,
+        firebase_uid=None,
+        source_link=share_url,
+        uid_verified=False,
+        verification_status='unverified_handle',
+        verification_method='link_handle_only',
+        verification_source='locket_public_share_link',
+        identity_lookup_source='public_share_link',
+        identity_lookup_at=now,
+        message='Đã lấy invite token — chưa xác minh Firebase UID.',
+    )
+
+
 async def resolve_public_locket_share_link(
     raw_input: str,
     *,
@@ -572,21 +635,12 @@ async def resolve_public_locket_share_link(
             if location.lower().startswith('locket://'):
                 tok = extract_invite_token_from_text_or_url(location)
                 if tok:
-                    return IdentityResolutionOutput(
-                        status='invite_token_found',
+                    return _build_public_token_resolution(
                         normalized_id=normalized_id,
                         input_kind=input_kind,
-                        username=normalized_id,
                         invite_token=tok,
-                        firebase_uid=None,
-                        source_link=share_url,
-                        uid_verified=False,
-                        verification_status='unverified_handle',
-                        verification_method='link_handle_only',
-                        verification_source='locket_public_share_link',
-                        identity_lookup_source='public_share_link',
-                        identity_lookup_at=now,
-                        message='Đã lấy invite token — chưa xác minh Firebase UID.',
+                        share_url=share_url,
+                        now=now,
                     )
             next_url = urljoin(current_url, location)
             try:
@@ -615,21 +669,12 @@ async def resolve_public_locket_share_link(
                 )
             tok_in_redirect = extract_invite_token_from_text_or_url(next_url)
             if tok_in_redirect:
-                return IdentityResolutionOutput(
-                    status='invite_token_found',
+                return _build_public_token_resolution(
                     normalized_id=normalized_id,
                     input_kind=input_kind,
-                    username=normalized_id,
                     invite_token=tok_in_redirect,
-                    firebase_uid=None,
-                    source_link=share_url,
-                    uid_verified=False,
-                    verification_status='unverified_handle',
-                    verification_method='link_handle_only',
-                    verification_source='locket_public_share_link',
-                    identity_lookup_source='public_share_link',
-                    identity_lookup_at=now,
-                    message='Đã lấy invite token — chưa xác minh Firebase UID.',
+                    share_url=share_url,
+                    now=now,
                 )
             current_url = next_url
             continue
@@ -664,21 +709,12 @@ async def resolve_public_locket_share_link(
             final_url_str = current_url
         extracted_tok = extract_invite_token_from_text_or_url(final_url_str) or extract_invite_token_from_text_or_url(html_text)
         if extracted_tok:
-            return IdentityResolutionOutput(
-                status='invite_token_found',
+            return _build_public_token_resolution(
                 normalized_id=normalized_id,
                 input_kind=input_kind,
-                username=normalized_id,
                 invite_token=extracted_tok,
-                firebase_uid=None,
-                source_link=share_url,
-                uid_verified=False,
-                verification_status='unverified_handle',
-                verification_method='link_handle_only',
-                verification_source='locket_public_share_link',
-                identity_lookup_source='public_share_link',
-                identity_lookup_at=now,
-                message='Đã lấy invite token — chưa xác minh Firebase UID.',
+                share_url=share_url,
+                now=now,
             )
 
         return IdentityResolutionOutput(
@@ -935,6 +971,32 @@ async def resolve_locket_identity(
                 public_fetcher=public_fetcher,
                 check_dns=(public_http_client is None and public_fetcher is None),
             )
+            if pub_res.status in {'resolved', 'resolved_uid', 'verified_uid'} and pub_res.firebase_uid:
+                if existing_verified_uid and existing_verified_uid != pub_res.firebase_uid:
+                    return IdentityResolutionOutput(
+                        status='conflict',
+                        normalized_id=normalized_id,
+                        input_kind=input_kind,
+                        username=normalized_id,
+                        source_link=pub_res.source_link or source_link,
+                        message='Firebase UID trả về khác với Firebase UID đã được xác minh trước đó của tài khoản này (conflict).',
+                    )
+                uid_owner = await _find_in_accounts_v2(accounts_v2, {'firebase_uid': pub_res.firebase_uid})
+                if isinstance(uid_owner, dict):
+                    owner_lid = str(uid_owner.get('locket_id') or '').strip()
+                    owner_uname = str(uid_owner.get('username') or '').strip()
+                    target_names = {n.lower() for n in (normalized_id, pub_res.username) if isinstance(n, str) and n}
+                    owner_names = {n.lower() for n in (owner_lid, owner_uname) if n}
+                    if owner_lid and not (target_names & owner_names):
+                        return IdentityResolutionOutput(
+                            status='conflict',
+                            normalized_id=normalized_id,
+                            input_kind=input_kind,
+                            username=normalized_id,
+                            source_link=pub_res.source_link or source_link,
+                            message=f'Firebase UID này đã được gắn với một tài khoản khác ("{owner_lid}") trong MongoDB (conflict).',
+                        )
+                return pub_res
             if existing_verified_uid and pub_res.status in {'invite_token_found', 'verification_required'}:
                 return IdentityResolutionOutput(
                     status='resolved_uid',

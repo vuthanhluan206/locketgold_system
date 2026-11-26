@@ -46,6 +46,7 @@ from app.main import create_app
 from app.passwords import hash_password
 from app.profile import build_profile
 from app.services.identity_service import (
+    extract_firebase_uid_from_invite_token,
     is_valid_firebase_uid,
     normalize_lookup_query,
     resolve_public_locket_share_link,
@@ -445,6 +446,57 @@ def test_02_06_07_08_09_10_auto_public_resolver_and_verified_uid_preservation(pr
     assert v2_store['vt.l']['_server_uid_proof'] is True
     assert (verified_uid, 'Gold') in ent_store
     assert ent_store[(verified_uid, 'Gold')]['status'] == 'active'
+
+    # Real 44-char compound Locket invite token (`<28-char-Firebase-UID><16-char-hex-suffix>`, e.g. vt.l):
+    # Extracts 28-char `firebase_uid`, preserves full 44-char `invite_token`, and activates Gold immediately!
+    v2_store.clear()
+    ent_store.clear()
+    real_invite_44 = 'juNBPjHxRYeYXtMzPIy0YSjzIL83907433b66b8185cb'
+    real_uid_28 = 'juNBPjHxRYeYXtMzPIy0YSjzIL83'
+    assert extract_firebase_uid_from_invite_token(real_invite_44) == real_uid_28
+    assert extract_firebase_uid_from_invite_token(invite_28) is None
+
+    def public_compound_handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            text=(
+                '<html>'
+                '<meta property="og:image" content="https://firebasestorage.googleapis.com/v0/b/locket-public-assets/o/invites%2Fen.png?alt=media" />'
+                f'<img class="profile-pic-img" src="https://cdn2.locketcamera.com/v0/b/locket-img/o/users%2F{real_uid_28}%2Fpublic%2Fprofile_pic.webp" />'
+                f'<a href="https://locket.page.link/?link=https%3A%2F%2Flocket.camera%2Finvites%2F{real_invite_44}%3Ftype%3DUsernameLink">Add</a>'
+                '</html>'
+            ),
+            headers={'Content-Type': 'text/html'},
+        )
+
+    app.state.public_link_fetcher = lambda url: public_compound_handler(httpx.Request('GET', url))
+    res_compound = http.post(
+        '/admin/add-account',
+        headers=admin_headers,
+        json={
+            'locket_id': 'vt.l',
+            'expires_date': future_iso,
+            'resolve_identity': True,
+            'public_only': True,
+        },
+    )
+    assert res_compound.status_code == 200, res_compound.text
+    saved_compound = res_compound.json()
+    assert saved_compound['locket_id'] == 'vt.l'
+    assert saved_compound['username'] == 'vt.l'
+    assert saved_compound['firebase_uid'] == real_uid_28
+    assert saved_compound['invite_token'] == real_invite_44
+    assert saved_compound['verification_status'] == 'verified_uid'
+    assert saved_compound['status'] == 'active'
+    assert v2_store['vt.l']['account_id'] == real_uid_28
+    assert (real_uid_28, 'Gold') in ent_store
+    assert ent_store[(real_uid_28, 'Gold')]['status'] == 'active'
+
+    sub_real = http.get(f'/v1/subscribers/{real_uid_28}', headers=prompt26_env['service_headers'])
+    assert sub_real.status_code == 200
+    assert sub_real.headers['x-lab-entitlement-status'] == 'active'
+    assert 'Gold' in sub_real.json()['subscriber']['entitlements'
+]
 
 
 # Tests 11, 12, 13, 14, 15, 16, 17, 18, 19, 23: Gold Management SSOT & CRUD Synchronized by Verified UID
