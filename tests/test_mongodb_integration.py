@@ -47,6 +47,11 @@ def test_real_mongodb_accounts_rotation_and_cold_starts(monkeypatch):
 
     try:
         with TestClient(create_app(), base_url='http://localhost') as http:
+            verified_mongo_uid = 'MongoIntegVerifiedUid1234567'
+            http.app.state.identity_provider = lambda q, k: (
+                200,
+                {'result': {'status': 200, 'data': {'uid': verified_mongo_uid, 'username': 'internal_user_123'}}},
+            )
             headers = login(http, password)
             expiry = datetime.now(timezone.utc) + timedelta(days=30)
             for value in [expiry, expiry + timedelta(days=1)]:
@@ -57,7 +62,7 @@ def test_real_mongodb_accounts_rotation_and_cold_starts(monkeypatch):
                 assert result.status_code == 200
             rows = http.get('/admin/accounts', headers=headers).json()
             assert len(rows) == 1
-            response = http.get('/v1/subscribers/internal_user_123', headers=headers)
+            response = http.get(f'/v1/subscribers/{verified_mongo_uid}', headers=headers)
             assert 'Gold' in response.json()['subscriber']['entitlements']
 
             # Verify canonical accounts_v2 precedence: revoking in v2 cannot be overridden by active legacy accounts
@@ -71,7 +76,7 @@ def test_real_mongodb_accounts_rotation_and_cold_starts(monkeypatch):
                 )
 
             http.portal.call(force_legacy_active)
-            sub_after_legacy_tamper = http.get('/v1/subscribers/internal_user_123', headers=headers)
+            sub_after_legacy_tamper = http.get(f'/v1/subscribers/{verified_mongo_uid}', headers=headers)
             assert sub_after_legacy_tamper.headers['x-lab-entitlement-status'] == 'revoked'
             assert sub_after_legacy_tamper.json()['subscriber']['entitlements'] == {}
 

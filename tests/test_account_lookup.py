@@ -237,7 +237,7 @@ def test_admin_lookup_distinguishes_handle_unverified_uid_and_verified_uid(looku
     assert data_handle['firebase_uid'] is None
     assert data_handle['uid_verified'] is False
     assert data_handle['verification_status'] == 'unverified_handle'
-    assert data_handle['entitlement_status'] == 'active'
+    assert data_handle['entitlement_status'] == 'pending'
 
     # Scenario 7: Account in MongoDB has 28-char Firebase UID AND valid server-side verification proof -> verified_uid
     verified_uid = '4Vee1rBLoJN9TDjql9xPzDEuf5D2'

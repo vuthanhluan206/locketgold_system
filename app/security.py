@@ -45,8 +45,12 @@ async def require_subscriber_access(
         device_doc = await verify_device_token(request, raw_cred)
         if device_doc is not None:
             target_account_id = request.path_params.get("account_id")
-            bound_account_id = device_doc.get("locket_id")
-            if target_account_id is not None and bound_account_id != target_account_id:
+            allowed_ids = {
+                device_doc.get("locket_id"),
+                device_doc.get("firebase_uid"),
+                device_doc.get("canonical_locket_id"),
+            } - {None, ""}
+            if target_account_id is not None and target_account_id not in allowed_ids:
                 raise HTTPException(
                     403,
                     "Device token is not authorized to access this account",

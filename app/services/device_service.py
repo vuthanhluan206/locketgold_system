@@ -43,6 +43,17 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
             res = await accounts_v2.find_one({'locket_id': data.locket_id}, {'_id': 0})
             if isinstance(res, dict):
                 account = res
+            else:
+                for alt_field in ('firebase_uid', 'username', 'account_id'):
+                    try:
+                        res_alt = accounts_v2.find_one({alt_field: data.locket_id}, {'_id': 0})
+                        if hasattr(res_alt, '__await__'):
+                            res_alt = await res_alt
+                        if isinstance(res_alt, dict):
+                            account = res_alt
+                            break
+                    except KeyError:
+                        continue
         if account is None and accounts is not None:
             res = await accounts.find_one({'locket_id': data.locket_id}, {'_id': 0})
             if isinstance(res, dict):
@@ -94,6 +105,8 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
         doc = {
             'device_id': device_id,
             'locket_id': data.locket_id,
+            'canonical_locket_id': account.get('locket_id') or data.locket_id,
+            'firebase_uid': account.get('firebase_uid'),
             'slot_index': chosen_slot,
             'device_name': data.device_name,
             'ios_version': data.ios_version,

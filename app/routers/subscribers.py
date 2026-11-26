@@ -9,7 +9,7 @@ from ..database import get_accounts
 from ..models import AccountId, compute_entitlement_status, subscriber_response
 from ..security import require_subscriber_access
 from ..services.doh_service import decode_base64url_dns_param, resolve_lab_dns_wireformat
-from ..services.entitlement_service import find_canonical_account
+from ..services.entitlement_service import extract_verified_uid_metadata, find_canonical_account
 from ..services.lab_inspector_service import redact_headers, redact_payload
 
 router = APIRouter(tags=["Subscribers"])
@@ -34,9 +34,35 @@ async def _resolve_account_and_build_response(
     account = await find_canonical_account(request, account_id, accounts_col=accounts)
 
     now = datetime.now(timezone.utc)
-    status, _ = compute_entitlement_status(account if isinstance(account, dict) else None, now)
+    eff_account = account.copy() if isinstance(account, dict) else None
+    if isinstance(eff_account, dict):
+        fb_uid, uid_verified, _, _, _ = extract_verified_uid_metadata(eff_account)
+        # Check entitlements collection for explicit revocation under verified UID
+        entitlements_col = getattr(request.app.state, 'entitlements', None)
+        if entitlements_col is not None and hasattr(entitlements_col, 'find_one') and fb_uid:
+            try:
+                ent_doc = entitlements_col.find_one({'account_id': fb_uid, 'entitlement_key': 'Gold'}, {'_id': 0})
+                if hasattr(ent_doc, '__await__'):
+                    ent_doc = await ent_doc
+                if isinstance(ent_doc, dict) and (
+                    str(ent_doc.get('status') or '').lower() == 'revoked' or ent_doc.get('revoked_at') is not None
+                ):
+                    eff_account['status'] = 'revoked'
+                    eff_account['revoked_at'] = ent_doc.get('revoked_at') or now
+            except Exception:
+                pass
+
+        raw_status, _ = compute_entitlement_status(eff_account, now)
+        if raw_status not in {'revoked', 'expired'}:
+            if not uid_verified or not fb_uid:
+                eff_account['status'] = 'pending'
+            elif account_id != fb_uid:
+                # Reject attempts to bypass UID entitlement by querying with a username or invite token
+                eff_account = None
+
+    status, _ = compute_entitlement_status(eff_account, now)
     state_label = _map_api_state_label(status)
-    payload = subscriber_response(account_id, account if isinstance(account, dict) else None, now)
+    payload = subscriber_response(account_id, eff_account, now)
     latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
     resp_headers = {
@@ -109,7 +135,12 @@ async def lab_echo_inspect(request: Request):
     device_doc = getattr(request.state, 'device_doc', None)
     if getattr(request.state, 'caller_kind', None) == 'device_token' and isinstance(device_doc, dict):
         body_account_id = parsed_body.get('locket_id') if isinstance(parsed_body, dict) else None
-        if body_account_id and body_account_id != device_doc.get('locket_id'):
+        allowed_ids = {
+            device_doc.get('locket_id'),
+            device_doc.get('firebase_uid'),
+            device_doc.get('canonical_locket_id'),
+        } - {None, ''}
+        if body_account_id and body_account_id not in allowed_ids:
             from fastapi import HTTPException
             raise HTTPException(403, 'Device token is not authorized to inspect another account')
 

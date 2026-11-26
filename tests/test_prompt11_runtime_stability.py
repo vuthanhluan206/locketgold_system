@@ -1123,11 +1123,14 @@ def test_prompt17_groups_a_b_c_d_and_real_mobileconfig_file_verification(monkeyp
         assert pub_miss.status_code == 200
         assert pub_miss.json() == {'exists': False}
 
-        # D03: Subscriber entitlement endpoint resolves by locket_id, username, AND firebase_uid
-        for sub_id in ('luan_gold_user', 'luan_handle', manual_fb_uid, verified_fb_uid):
-            sub_res = client.get(f'/v1/subscribers/{sub_id}', headers=auth_headers)
+        # D03: Subscriber entitlement endpoint ONLY grants active Gold to the verified Firebase UID
+        sub_ver = client.get(f'/v1/subscribers/{verified_fb_uid}', headers=auth_headers)
+        assert sub_ver.status_code == 200
+        assert 'Gold' in sub_ver.json()['subscriber']['entitlements']
+        for unverified_sub_id in ('luan_gold_user', 'luan_handle', manual_fb_uid, 'verified_user'):
+            sub_res = client.get(f'/v1/subscribers/{unverified_sub_id}', headers=auth_headers)
             assert sub_res.status_code == 200
-            assert 'Gold' in sub_res.json()['subscriber']['entitlements']
+            assert sub_res.json()['subscriber']['entitlements'] == {}
 
         # D09: Admin HTML contains Firebase UID display in Accounts table & automatic resolution message without manual UID input
         adm_html = client.get('/admin').text
@@ -1466,14 +1469,12 @@ def test_prompt18_automatic_locket_id_to_firebase_uid_resolution_all_16_cases(mo
         # Existing verified UID in MongoDB MUST NOT be overwritten
         assert v2_store['example_user']['firebase_uid'] == uid_user_1
 
-        # Also verify direct HTTP transport path of resolve_locket_identity with httpx.MockTransport
-        def mock_http_handler(request: httpx.Request) -> httpx.Response:
-            assert request.headers.get('Authorization') == 'Bearer test_locket_bearer_token'
-            body = json.loads(request.content.decode('utf-8'))
-            assert body == {'data': {'username': 'http_transport_user'}}
-            return httpx.Response(
+        # Also verify direct async provider path of resolve_locket_identity
+        async def async_provider(query: str, input_kind: str):
+            assert query == 'http_transport_user'
+            return (
                 200,
-                json={'result': {'status': 200, 'data': {'uid': 'HttpResolvedUid1234567890AbC', 'username': 'http_transport_user'}}},
+                {'result': {'status': 200, 'data': {'uid': 'HttpResolvedUid1234567890AbC', 'username': 'http_transport_user'}}},
             )
 
         s_http = Settings(
@@ -1481,13 +1482,9 @@ def test_prompt18_automatic_locket_id_to_firebase_uid_resolution_all_16_cases(mo
             superadmin_email='admin@example.test',
             superadmin_password_hash=encoded,
             mongodb_uri='mongodb://127.0.0.1:27017',
-            locket_identity_lookup_url='https://api.locketcamera.com/getUserByUsername',
-            locket_identity_bearer_token='test_locket_bearer_token',
         )
         async def run_http_resolve():
-            transport = httpx.MockTransport(mock_http_handler)
-            async with httpx.AsyncClient(transport=transport) as hc:
-                return await resolve_locket_identity('http_transport_user', settings=s_http, accounts_v2=mem_v2, http_client=hc)
+            return await resolve_locket_identity('http_transport_user', settings=s_http, accounts_v2=mem_v2, provider=async_provider)
 
         http_res = asyncio.run(run_http_resolve())
         assert http_res.status == 'resolved'

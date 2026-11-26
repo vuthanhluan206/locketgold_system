@@ -106,8 +106,12 @@ def _setup_app_with_stores(monkeypatch, *, require_https: bool = False, enable_p
         accounts_v2_store[lid] = doc
 
     async def v2_find_one(q, proj=None):
-        d = accounts_v2_store.get(q['locket_id'])
-        return d.copy() if d else None
+        for field in ('locket_id', 'username', 'firebase_uid'):
+            if field in q:
+                for doc in accounts_v2_store.values():
+                    if doc.get(field) == q[field]:
+                        return doc.copy()
+        return None
 
     async def v2_delete_one(q):
         existed = q['locket_id'] in accounts_v2_store
@@ -197,6 +201,20 @@ def test_p1_device_authorization_cross_account_access_blocked(monkeypatch):
         service_headers = {'Authorization': 'Bearer ' + ('s' * 40)}
 
         future_exp = (datetime.now(timezone.utc) + timedelta(days=90)).isoformat()
+        uid_a = 'AccountAVerifiedUid123456789'
+        uid_b = 'AccountBVerifiedUid987654321'
+        app.state.identity_provider = lambda q, k: (
+            200,
+            {
+                'result': {
+                    'status': 200,
+                    'data': {
+                        'uid': uid_a if q == 'account_A' else uid_b,
+                        'username': q,
+                    },
+                }
+            },
+        )
         for uid in ('account_A', 'account_B'):
             assert http.post('/admin/add-account', headers=admin_headers, json={
                 'locket_id': uid,
@@ -212,35 +230,35 @@ def test_p1_device_authorization_cross_account_access_blocked(monkeypatch):
         token_a = dev_a['device_token']
         dev_a_headers = {'Authorization': f'Bearer {token_a}'}
 
-        # 1. Device A reading account_A -> 200 OK with Gold
-        res_own = http.get('/v1/subscribers/account_A', headers=dev_a_headers)
+        # 1. Device A reading account_A by verified UID -> 200 OK with Gold
+        res_own = http.get(f'/v1/subscribers/{uid_a}', headers=dev_a_headers)
         assert res_own.status_code == 200
         assert 'Gold' in res_own.json()['subscriber']['entitlements']
 
         # 2. Device A attempting to read account_B -> 403 Forbidden (P1 Fix!)
-        res_cross = http.get('/v1/subscribers/account_B', headers=dev_a_headers)
+        res_cross = http.get(f'/v1/subscribers/{uid_b}', headers=dev_a_headers)
         assert res_cross.status_code == 403
         assert 'not authorized' in res_cross.json()['detail'].lower()
 
-        res_cross_lab = http.get('/api/lab/subscribers/account_B', headers=dev_a_headers)
+        res_cross_lab = http.get(f'/api/lab/subscribers/{uid_b}', headers=dev_a_headers)
         assert res_cross_lab.status_code == 403
 
         res_cross_inspect = http.post('/api/lab/inspect', headers=dev_a_headers, json={'locket_id': 'account_B'})
         assert res_cross_inspect.status_code == 403
 
         # 3. Admin session and Service token CAN access both account_A and account_B
-        assert http.get('/v1/subscribers/account_B', headers=admin_headers).status_code == 200
-        assert http.get('/v1/subscribers/account_B', headers=service_headers).status_code == 200
+        assert http.get(f'/v1/subscribers/{uid_b}', headers=admin_headers).status_code == 200
+        assert http.get(f'/v1/subscribers/{uid_b}', headers=service_headers).status_code == 200
 
         # 4. Revoking account_A stops Gold immediately
         assert http.post('/admin/accounts/account_A/revoke', headers=admin_headers, json={'reason': 'audit'}).status_code == 200
-        res_rev_acc = http.get('/v1/subscribers/account_A', headers=dev_a_headers)
+        res_rev_acc = http.get(f'/v1/subscribers/{uid_a}', headers=dev_a_headers)
         assert res_rev_acc.status_code == 200
         assert res_rev_acc.json()['subscriber']['entitlements'] == {}
 
         # 5. Revoking device A blocks access with 401
         assert http.post(f"/admin/devices/{dev_a['device_id']}/revoke", headers=admin_headers).status_code == 200
-        assert http.get('/v1/subscribers/account_A', headers=dev_a_headers).status_code == 401
+        assert http.get(f'/v1/subscribers/{uid_a}', headers=dev_a_headers).status_code == 401
     finally:
         http.close()
         get_settings.cache_clear()
@@ -565,14 +583,20 @@ def test_blocker_b_canonical_expiry_precedence_and_partial_write_failures(monkey
         admin_headers = {'Authorization': 'Bearer ' + login_res.json()['access_token']}
 
         # Seed user in both stores with mismatched expiry: legacy has past_exp, v2 has future_long
+        diverged_uid = 'DivergedExpVerifiedUid123456'
         accounts_store['diverged_exp_user'] = {'locket_id': 'diverged_exp_user', 'expires_date': past_exp}
         accounts_v2_store['diverged_exp_user'] = {
             'locket_id': 'diverged_exp_user',
-            'account_id': 'diverged_exp_user',
+            'account_id': diverged_uid,
+            'firebase_uid': diverged_uid,
+            'verification_status': 'verified_uid',
+            'verification_method': 'trusted_proof',
+            'verification_source': 'verified_subscriber_traffic',
+            '_server_uid_proof': True,
             'expires_date': future_long,
             'status': 'active',
         }
-        sub_res = http.get('/v1/subscribers/diverged_exp_user', headers=admin_headers)
+        sub_res = http.get(f'/v1/subscribers/{diverged_uid}', headers=admin_headers)
         assert sub_res.status_code == 200
         assert sub_res.headers['x-lab-entitlement-status'] == 'active'
         assert sub_res.json()['subscriber']['entitlements']['Gold']['expires_date'] == future_long.isoformat().replace('+00:00', 'Z')

@@ -77,7 +77,4 @@ async def me(admin: Annotated[dict, Depends(require_admin)]):
 @router.post('/logout', status_code=204)
 async def logout(request: Request, admin: Annotated[dict, Depends(require_admin)]):
     await request.app.state.sessions.delete_one({'_id': admin['session_id']})
-    provider = getattr(request.app.state, 'locket_sessions', {}).pop(admin['session_id'], None)
-    if provider is not None:
-        provider.revoke()
     return Response(status_code=204)

@@ -214,8 +214,12 @@ def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
         accounts_v2_store[lid] = doc
 
     async def v2_find_one(q, proj=None):
-        d = accounts_v2_store.get(q['locket_id'])
-        return d.copy() if d else None
+        for field in ('locket_id', 'username', 'firebase_uid'):
+            if field in q:
+                for doc in accounts_v2_store.values():
+                    if doc.get(field) == q[field]:
+                        return doc.copy()
+        return None
 
     accounts_v2.update_one.side_effect = v2_update
     accounts_v2.find_one.side_effect = v2_find_one
@@ -291,7 +295,11 @@ def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
         assert ver_res.status_code == 200
         assert ver_res.json()['verification_status'] == 'unverified_handle'
 
-        # 4. Add account
+        # 4. Add account (with verified UID resolution proof)
+        app.state.identity_provider = lambda q, k: (
+            200,
+            {'result': {'status': 200, 'data': {'uid': '4Vee1rBLoJN9TDjql9xPzDEuf5D2', 'username': 'alice_lab'}}},
+        )
         future_exp = (datetime.now(timezone.utc) + timedelta(days=60)).isoformat()
         add_res = http.post('/admin/add-account', headers=admin_headers, json={
             'locket_id': '4Vee1rBLoJN9TDjql9xPzDEuf5D2',

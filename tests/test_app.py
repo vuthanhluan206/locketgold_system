@@ -222,7 +222,19 @@ def test_upsert_injection_and_subscriber(client):
         body['expires_date'] = expiry
         assert http.post('/admin/add-account', headers=headers, json=body).status_code == 422
     accounts.find_one.return_value = {'locket_id': 'alice', 'expires_date': future}
-    assert 'Gold' in http.get('/v1/subscribers/alice', headers=headers).json()['subscriber']['entitlements']
+    assert http.get('/v1/subscribers/alice', headers=headers).json()['subscriber']['entitlements'] == {}
+    verified_uid = '4Vee1rBLoJN9TDjql9xPzDEuf5D2'
+    accounts.find_one.return_value = {
+        'locket_id': verified_uid,
+        'firebase_uid': verified_uid,
+        'verification_status': 'verified_uid',
+        'verification_method': 'trusted_proof',
+        'verification_source': 'verified_subscriber_traffic',
+        '_server_uid_proof': True,
+        'status': 'active',
+        'expires_date': future,
+    }
+    assert 'Gold' in http.get(f'/v1/subscribers/{verified_uid}', headers=headers).json()['subscriber']['entitlements']
     accounts.find_one.return_value = None
     assert http.get('/v1/subscribers/missing', headers=headers).json()['subscriber']['entitlements'] == {}
     assert http.get('/admin/accounts?skip=10001', headers=headers).status_code == 422

@@ -36,7 +36,14 @@ def merge_canonical_and_legacy_account(doc_v2: dict | None, doc_v1: dict | None)
     if doc_v2 is not None and doc_v1 is None:
         return doc_v2.copy()
     if doc_v1 is not None and doc_v2 is None:
-        return doc_v1.copy()
+        legacy_copy = doc_v1.copy()
+        # Prevent legacy username-only fallback records from granting active Gold without verified UID proof
+        if 'verification_status' not in legacy_copy and '_server_uid_proof' not in legacy_copy:
+            lid_val = str(legacy_copy.get('locket_id') or legacy_copy.get('account_id') or '')
+            if not FIREBASE_UID_RE.fullmatch(lid_val):
+                legacy_copy['verification_status'] = 'unverified_handle'
+                legacy_copy['_server_uid_proof'] = False
+        return legacy_copy
 
     assert isinstance(doc_v2, dict) and isinstance(doc_v1, dict)
     # Start with legacy fields, then overlay canonical accounts_v2 fields so v2 always wins
