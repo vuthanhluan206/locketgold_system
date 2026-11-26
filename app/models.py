@@ -1,21 +1,43 @@
 from datetime import date, datetime, time, timezone
 from typing import Annotated, Literal
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, field_validator
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, SecretStr, field_validator
+
+
+class LocketSessionInput(BaseModel):
+    model_config = ConfigDict(extra='forbid', hide_input_in_errors=True)
+    id_token: SecretStr
+    refresh_token: SecretStr | None = None
+    username: str = Field(min_length=1, max_length=128)
+    expires_in_seconds: int = Field(default=3600, ge=1, le=3600)
 
 ACCOUNT_ID_REGEX = r'^[A-Za-z0-9_$:@.\-]{1,128}$'
 AccountId = Annotated[str, Field(min_length=1, max_length=128, pattern=r'^[A-Za-z0-9_$:@.\-]+$')]
 EntitlementStatus = Literal['active', 'expired', 'revoked', 'pending', 'unauthorized']
 VerificationStatus = Literal['verified_uid', 'unverified_uid', 'unverified_handle', 'manual_lab_id']
-VerificationMethod = Literal['trusted_proof', 'direct_uid', 'format_only_uid', 'link_handle_only', 'admin_manual_override']
+VerificationMethod = Literal[
+    'trusted_proof',
+    'authenticated_lookup',
+    'direct_uid',
+    'format_only_uid',
+    'link_handle_only',
+    'admin_manual_override',
+]
 IdentityResolutionStatus = Literal[
     'resolved',
     'resolved_uid',
+    'verified_uid',
+    'uid_resolved',
     'invite_token_found',
     'not_found',
     'auth_required',
+    'session_expired',
     'rate_limited',
     'lookup_unavailable',
     'invalid_link',
+    'invalid_response',
+    'uid_missing',
+    'username_mismatch',
+    'uid_conflict',
     'verification_required',
     'conflict',
     'unverified',

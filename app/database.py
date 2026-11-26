@@ -206,6 +206,10 @@ async def lifespan(app: FastAPI):
             ('accounts_v2', 'locket_id', {'unique': True}),
             ('accounts_v2', 'username', {'sparse': True}),
             ('accounts_v2', 'firebase_uid', {'sparse': True}),
+            ('accounts_v2', 'firebase_uid', {
+                'name': 'unique_firebase_uid_string', 'unique': True,
+                'partialFilterExpression': {'firebase_uid': {'$type': 'string'}},
+            }),
             ('devices', 'device_id', {'unique': True}),
             ('devices', 'token_hash', {'unique': True}),
             (
@@ -242,6 +246,9 @@ async def lifespan(app: FastAPI):
         # Migration is strictly controlled via `python -m scripts.migrate_db`.
         yield
     finally:
+        session_provider = getattr(app.state, 'locket_session_provider', None)
+        if session_provider is not None:
+            session_provider.revoke()
         await client.close()
 
 

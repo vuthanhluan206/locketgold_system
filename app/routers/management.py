@@ -10,6 +10,7 @@ from ..database import get_accounts
 from ..middleware import client_ip
 from ..models import (
     AccountId,
+    LocketSessionInput,
     AccountInput,
     AccountOutput,
     ActivateAccountInput,
@@ -473,6 +474,48 @@ async def verify_link_endpoint(
     return result
 
 
+@admin_router.post('/locket-session')
+async def connect_locket_session(
+    data: LocketSessionInput, request: Request,
+    admin: Annotated[dict, Depends(require_admin)],
+):
+    from ..services.locket_session_provider import LocketSessionProvider, firebase_token_refresher
+    try:
+        username, kind = normalize_lookup_query(data.username)
+    except ValueError:
+        raise HTTPException(422, 'Username Locket không hợp lệ.') from None
+    if kind == 'firebase_uid':
+        raise HTTPException(422, 'Nhập username của phiên Locket.')
+    api_key = get_settings().locket_firebase_api_key.get_secret_value()
+    if not data.id_token.get_secret_value().strip():
+        raise HTTPException(422, 'Cần Firebase ID token của phiên Locket.')
+    try:
+        provider = LocketSessionProvider(
+            id_token=data.id_token.get_secret_value(),
+            refresh_token=data.refresh_token.get_secret_value() if data.refresh_token else None,
+            username=username, expires_in_seconds=data.expires_in_seconds,
+            firebase_api_key=api_key, token_refresher=firebase_token_refresher(api_key),
+        )
+    except ValueError:
+        raise HTTPException(422, 'Phiên Locket không hợp lệ.') from None
+    previous = getattr(request.app.state, 'locket_session_provider', None)
+    if previous is not None:
+        previous.revoke()
+    request.app.state.locket_session_provider = provider
+    await record_audit(request, admin, 'LOCKET_SESSION_CONNECTED', username)
+    return {'connected': True, 'expires_at': provider.expires_at}
+
+
+@admin_router.delete('/locket-session')
+async def disconnect_locket_session(request: Request, admin: Annotated[dict, Depends(require_admin)]):
+    provider = getattr(request.app.state, 'locket_session_provider', None)
+    if provider is not None:
+        provider.revoke()
+    request.app.state.locket_session_provider = None
+    await record_audit(request, admin, 'LOCKET_SESSION_DISCONNECTED', 'locket-session')
+    return {'connected': False}
+
+
 @admin_router.post('/add-account', response_model=AccountOutput)
 async def upsert_account(
     data: AccountInput,
@@ -490,13 +533,17 @@ async def upsert_account(
     auto_source_link = f'https://locket.cam/{canonical_id}' if input_kind == 'locket_link' else data.source_link
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     provider = getattr(request.app.state, 'identity_provider', None)
+    session_provider = getattr(request.app.state, 'locket_session_provider', None)
+    auth_http_client = getattr(request.app.state, 'locket_api_http_client', None)
     public_fetcher = getattr(request.app.state, 'public_link_fetcher', None)
     public_http_client = getattr(request.app.state, 'public_http_client', None)
     has_provider = provider is not None or bool((getattr(settings, 'locket_identity_lookup_url', '') or '').strip())
+    has_session_provider = session_provider is not None
     has_public_resolver = public_fetcher is not None or public_http_client is not None
     must_resolve = bool(
         data.resolve_identity
         or has_provider
+        or has_session_provider
         or has_public_resolver
         or getattr(settings, 'require_verified_uid_on_add', False)
         or input_kind in {'locket_link', 'handle'}
@@ -523,11 +570,13 @@ async def upsert_account(
             settings=settings,
             accounts_v2=accounts_v2,
             provider=provider,
+            http_client=auth_http_client,
             public_http_client=public_http_client,
             public_fetcher=public_fetcher,
             use_public_link=bool(has_public_resolver or (data.resolve_identity and not has_provider)),
+            session_provider=session_provider,
         )
-        if resolution.status in {'resolved', 'resolved_uid'} and resolution.firebase_uid:
+        if resolution.status in {'resolved', 'resolved_uid', 'verified_uid'} and resolution.firebase_uid:
             canonical_id = resolution.normalized_id
             resolved_username = resolution.username or data.username
             resolved_fb_uid = resolution.firebase_uid
@@ -538,10 +587,26 @@ async def upsert_account(
             safe_ver_source = resolution.verification_source or 'authorized_identity_provider'
             server_proof = True
             uid_resolved_at = resolution.uid_resolved_at or now
-            uid_resolution_source = resolution.uid_resolution_source or 'authorized_identity_provider'
+            uid_resolution_source = resolution.uid_resolution_source or safe_ver_source
             identity_lookup_at = resolution.identity_lookup_at or now
             identity_lookup_source = resolution.identity_lookup_source or uid_resolution_source
-            resolution_status_val = 'resolved_uid'
+            resolution_status_val = 'verified_uid' if resolution.status == 'verified_uid' else 'resolved_uid'
+        elif resolution.status == 'uid_resolved' and resolution.firebase_uid:
+            # Level B: Authenticated invite lookup returned a candidate Firebase UID, but no owner localId proof yet
+            canonical_id = resolution.normalized_id
+            resolved_username = resolution.username or data.username or canonical_id
+            resolved_fb_uid = resolution.firebase_uid
+            resolved_invite_token = resolution.invite_token or resolved_invite_token
+            auto_source_link = resolution.source_link or auto_source_link
+            safe_ver_status = 'unverified_uid'
+            safe_ver_method = 'authenticated_lookup'
+            safe_ver_source = resolution.verification_source or 'locket_invite_lookup'
+            server_proof = False
+            uid_resolved_at = resolution.uid_resolved_at or now
+            uid_resolution_source = resolution.uid_resolution_source or 'locket_invite_lookup'
+            identity_lookup_at = resolution.identity_lookup_at or now
+            identity_lookup_source = resolution.identity_lookup_source or 'locket_invite_lookup'
+            resolution_status_val = 'uid_resolved'
         elif resolution.status == 'invite_token_found' and resolution.invite_token:
             canonical_id = resolution.normalized_id
             resolved_username = resolution.username or data.username or canonical_id
@@ -574,9 +639,14 @@ async def upsert_account(
             status_map = {
                 'not_found': 404,
                 'auth_required': 502,
+                'session_expired': 502,
                 'rate_limited': 429,
                 'lookup_unavailable': 503,
                 'invalid_link': 422,
+                'invalid_response': 422,
+                'uid_missing': 422,
+                'username_mismatch': 409,
+                'uid_conflict': 409,
                 'verification_required': 422,
                 'conflict': 409,
                 'unverified': 422,
@@ -669,11 +739,6 @@ async def upsert_account(
         'status': data.status,
         'revoked_at': now if data.status == 'revoked' else None,
     }
-    try:
-        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc}, upsert=True)
-    except DuplicateKeyError:
-        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc})
-
     # 2. Write canonical v2 record to `accounts_v2` and `entitlements` (NEVER swallow write failures!)
     v2_doc = {
         'schema_version': 2,
@@ -705,16 +770,26 @@ async def upsert_account(
     if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
         try:
             res = accounts_v2.update_one(
-                {'locket_id': canonical_id},
+                {
+                    'locket_id': canonical_id,
+                    '$or': [
+                        {'_server_uid_proof': {'$ne': True}},
+                        {'firebase_uid': resolved_fb_uid, '_server_uid_proof': server_proof,
+                         'verification_status': safe_ver_status},
+                    ],
+                },
                 {'$set': v2_doc, '$setOnInsert': {'created_at': now, 'purchase_date': now}},
                 upsert=True,
             )
             if hasattr(res, '__await__'):
                 await res
         except DuplicateKeyError:
-            res = accounts_v2.update_one({'locket_id': canonical_id}, {'$set': v2_doc})
-            if hasattr(res, '__await__'):
-                await res
+            raise HTTPException(409, 'UID hoặc tài khoản đã được liên kết đồng thời; vui lòng tra cứu lại (uid_conflict).') from None
+
+    try:
+        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc}, upsert=True)
+    except DuplicateKeyError:
+        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc})
 
     entitlements = getattr(request.app.state, 'entitlements', None)
     if entitlements is not None and hasattr(entitlements, 'update_one'):

@@ -938,13 +938,18 @@ async def resolve_locket_identity(
     public_http_client: AsyncClient | None = None,
     public_fetcher: Callable | None = None,
     use_public_link: bool = False,
+    session_provider: Any = None,
+    owner_identity_proof: dict | None = None,
 ) -> IdentityResolutionOutput:
     """
     Automatic Locket ID / Username / Share Link Resolver.
-    Supports both:
-      1. Zero-env-var Public Locket Share Link Resolver (`https://locket.cam/<username>` -> extracts `invite_token`
-         and strictly separates `invite_token` from `firebase_uid`).
-      2. Authorized Identity Provider (`getUserByUsername` / `fetchUserV2` when configured) for verified `firebase_uid`.
+    Priority Order (Prompt 20 Section 8):
+      1. Read already-verified Firebase UID if present in MongoDB `accounts_v2`.
+      2. Extract `invite_token` via `resolve_public_locket_share_link()`.
+      3. If an authenticated Locket `session_provider` is available, call `resolve_and_verify_locket_uid()`
+         (`fetchUserForInviteToken` + `verify_target_firebase_uid`).
+      4. If an authorized legacy/direct `provider` is configured, call `_call_remote_identity_provider()`.
+      5. Never fabricate a fake UID if no session or provider is available.
     """
     now = datetime.now(timezone.utc)
     if not isinstance(raw_input, str) or not raw_input.strip():
@@ -987,6 +992,31 @@ async def resolve_locket_identity(
     existing_doc = await _find_in_accounts_v2(accounts_v2, {'locket_id': normalized_id})
     if existing_doc is None and input_kind != 'firebase_uid':
         existing_doc = await _find_in_accounts_v2(accounts_v2, {'username': normalized_id})
+
+    # 2. If an authenticated Locket session_provider is provided, execute the 2-step invite -> fetchUserForInviteToken flow
+    if session_provider is not None:
+        from .entitlement_service import extract_verified_uid_metadata
+        cached_uid, cached_verified, _, _, cached_source = extract_verified_uid_metadata(existing_doc or {})
+        if cached_verified:
+            return IdentityResolutionOutput(
+                status='verified_uid', normalized_id=str(existing_doc.get('locket_id') or normalized_id),
+                input_kind=input_kind, username=existing_doc.get('username') or normalized_id,
+                firebase_uid=cached_uid, invite_token=existing_doc.get('invite_token'),
+                source_link=existing_doc.get('source_link'), uid_verified=True,
+                verification_status='verified_uid', verification_method='trusted_proof',
+                verification_source=cached_source, identity_lookup_source='mongodb_verified_cache',
+                identity_lookup_at=now, message='Đã đọc Firebase UID đã xác minh từ hệ thống.',
+            )
+        from .locket_authenticated_identity import resolve_and_verify_locket_uid
+        return await resolve_and_verify_locket_uid(
+            candidate_raw,
+            session_provider=session_provider,
+            accounts_v2=accounts_v2,
+            http_client=http_client,
+            public_http_client=public_http_client,
+            public_fetcher=public_fetcher,
+            owner_identity_proof=owner_identity_proof,
+        )
 
     has_remote_provider = provider is not None or bool(
         settings is not None and (getattr(settings, 'locket_identity_lookup_url', '') or '').strip()
