@@ -2188,9 +2188,17 @@
                 }
                 name.append(crown, label);
                 const uidMeta = document.createElement('div'); uidMeta.className = 'account-uid-meta';
-                uidMeta.textContent = 'Firebase UID: ' + (row.firebase_uid ? row.firebase_uid : 'Chưa liên kết Firebase UID');
                 const verMeta = document.createElement('div'); verMeta.className = 'account-uid-meta';
-                verMeta.textContent = 'Verification: ' + (row.verification_status === 'verified_uid' ? 'Verified' : 'Unverified');
+                if (row.firebase_uid) {
+                  uidMeta.textContent = 'Firebase UID: ' + row.firebase_uid;
+                  verMeta.textContent = 'Verification: ' + (row.verification_status === 'verified_uid' ? 'Verified' : 'Unverified');
+                } else if (row.invite_token) {
+                  uidMeta.textContent = 'Invite token: ' + row.invite_token;
+                  verMeta.textContent = 'Đã lấy invite token — chưa xác minh Firebase UID';
+                } else {
+                  uidMeta.textContent = 'Firebase UID: Chưa liên kết Firebase UID';
+                  verMeta.textContent = 'Verification: Unverified';
+                }
                 stack.append(name, uidMeta, verMeta);
                 td.append(stack);
               } else {
@@ -2282,10 +2290,14 @@
                 resolve_identity: true,
               }),
             });
+            const summary = saved && saved.firebase_uid
+              ? 'Firebase UID: ' + saved.firebase_uid
+              : saved && saved.invite_token
+                ? 'Đã lấy invite token — chưa xác minh Firebase UID'
+                : 'Account saved.';
+            $('accountMessage').textContent = summary;
             accountDialog.close();
-            $('adminMessage').textContent = saved && saved.firebase_uid
-              ? 'Account saved · Firebase UID: ' + saved.firebase_uid
-              : 'Account saved.';
+            $('adminMessage').textContent = 'Account saved · ' + summary;
             await load();
           } catch (error) {
             $(accountDialog.open ? 'accountMessage' : 'adminMessage').textContent = error.message;

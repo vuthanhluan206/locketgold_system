@@ -9,10 +9,14 @@ VerificationStatus = Literal['verified_uid', 'unverified_uid', 'unverified_handl
 VerificationMethod = Literal['trusted_proof', 'direct_uid', 'format_only_uid', 'link_handle_only', 'admin_manual_override']
 IdentityResolutionStatus = Literal[
     'resolved',
+    'resolved_uid',
+    'invite_token_found',
     'not_found',
     'auth_required',
     'rate_limited',
     'lookup_unavailable',
+    'invalid_link',
+    'verification_required',
     'conflict',
     'unverified',
 ]
@@ -146,13 +150,17 @@ class AccountOutput(BaseModel):
     expires_date: AwareDatetime
     status: EntitlementStatus = 'active'
     username: str | None = None
+    invite_token: str | None = None
     firebase_uid: str | None = None
     source_link: str | None = None
     verification_status: VerificationStatus = 'manual_lab_id'
     verification_method: VerificationMethod = 'admin_manual_override'
     verification_source: str = 'admin_direct_input'
+    identity_lookup_source: str | None = None
+    identity_lookup_at: AwareDatetime | None = None
     uid_resolved_at: AwareDatetime | None = None
     uid_resolution_source: str | None = None
+    resolution_status: str | None = None
     max_devices: int = 2
     revoked_at: AwareDatetime | None = None
     revoke_reason: str | None = None
@@ -165,12 +173,15 @@ class IdentityResolutionOutput(BaseModel):
     normalized_id: str
     input_kind: Literal['firebase_uid', 'locket_link', 'handle', 'custom_id', 'invalid']
     username: str | None = None
+    invite_token: str | None = None
     firebase_uid: str | None = None
     source_link: str | None = None
     uid_verified: bool = False
     verification_status: VerificationStatus = 'unverified_handle'
     verification_method: VerificationMethod = 'link_handle_only'
     verification_source: str = 'none'
+    identity_lookup_source: str | None = None
+    identity_lookup_at: AwareDatetime | None = None
     uid_resolved_at: AwareDatetime | None = None
     uid_resolution_source: str | None = None
     message: str

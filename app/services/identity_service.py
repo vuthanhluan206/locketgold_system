@@ -1,13 +1,21 @@
 import asyncio
 from datetime import datetime, timezone
+from ipaddress import ip_address
 import logging
 import re
+import socket
 from typing import Any, Callable
-from urllib.parse import unquote, urlparse, urlsplit
+from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit
 from httpx import AsyncClient, TimeoutException, TransportError
 from ..models import IdentityResolutionOutput, LinkVerifyOutput
 
 logger = logging.getLogger(__name__)
+
+PUBLIC_LINK_TIMEOUT_SECONDS = 8.0
+MAX_PUBLIC_LINK_REDIRECTS = 5
+MAX_PUBLIC_LINK_RESPONSE_BYTES = 262_144
+INVITE_PATH_REGEX = re.compile(r'/invites/([A-Za-z0-9_%.\-~]+)', re.IGNORECASE)
+INVITE_TOKEN_CLEAN_PATTERN = re.compile(r'^[A-Za-z0-9_.\-~]{6,128}$')
 
 FIREBASE_UID_PATTERN = re.compile(r'^[A-Za-z0-9]{28}$')
 MONGO_OBJECT_ID_PATTERN = re.compile(r'^[0-9a-fA-F]{24}$')
@@ -287,6 +295,419 @@ def is_valid_firebase_uid(candidate: Any) -> bool:
     return True
 
 
+def _is_private_or_internal_ip(host_or_ip: str) -> bool:
+    cleaned = host_or_ip.strip().strip('[]')
+    try:
+        ip_obj = ip_address(cleaned)
+        return bool(
+            ip_obj.is_private
+            or ip_obj.is_loopback
+            or ip_obj.is_link_local
+            or ip_obj.is_reserved
+            or ip_obj.is_multicast
+            or ip_obj.is_unspecified
+        )
+    except ValueError:
+        return False
+
+
+def validate_safe_locket_public_url(target_url: str, *, check_dns: bool = False) -> str:
+    """
+    Validate that a URL points strictly to an HTTPS verified Locket public host (`ALLOWED_LOCKET_HOSTS`),
+    blocking SSRF attempts to localhost, internal domains, private/loopback/link-local IPs, or non-HTTPS schemes.
+    """
+    if not isinstance(target_url, str) or not target_url.strip():
+        raise ValueError('URL tra cứu công khai không hợp lệ.')
+    raw = target_url.strip()
+    parsed = urlsplit(raw)
+    if parsed.scheme.lower() != 'https':
+        raise ValueError('Chỉ cho phép truy cập trang công khai Locket qua giao thức HTTPS.')
+    if parsed.username or parsed.password:
+        raise ValueError('URL không được chứa thông tin xác thực.')
+    host = (parsed.hostname or '').strip().lower().rstrip('.')
+    if not host or host in {'localhost', 'localhost.localdomain'} or host.endswith(('.local', '.internal', '.localhost')):
+        raise ValueError('Cấm truy cập hoặc chuyển hướng đến localhost hoặc tên miền nội bộ (SSRF blocked).')
+    if _is_private_or_internal_ip(host):
+        raise ValueError('Cấm truy cập hoặc chuyển hướng đến địa chỉ IP nội bộ/riêng tư (SSRF blocked).')
+    try:
+        ip_address(host.strip('[]'))
+        raise ValueError('Chỉ cho phép truy cập tên miền Locket đã kiểm chứng, không dùng địa chỉ IP trực tiếp.')
+    except ValueError as exc:
+        if 'SSRF' in str(exc) or 'trực tiếp' in str(exc):
+            raise
+    if host not in ALLOWED_LOCKET_HOSTS:
+        raise ValueError(f'Tên miền "{host}" không nằm trong danh sách domain Locket đã kiểm chứng.')
+    if check_dns:
+        try:
+            infos = socket.getaddrinfo(host, 443, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ConnectionError('Không thể phân giải DNS cho domain Locket.') from exc
+        for info in infos:
+            resolved_ip = info[4][0]
+            if _is_private_or_internal_ip(resolved_ip):
+                raise ValueError('Phân giải DNS trỏ về địa chỉ IP nội bộ/riêng tư (SSRF blocked).')
+    return raw
+
+
+def extract_invite_token_from_text_or_url(raw_text: str) -> str | None:
+    """
+    Search for `/invites/<token>` in a redirect URL, final URL, or HTML document,
+    properly decoding URL percent-encoding (including nested query links) and validating token format.
+    """
+    if not isinstance(raw_text, str) or not raw_text:
+        return None
+    candidates_to_scan = [raw_text]
+    decoded_once = unquote(raw_text)
+    if decoded_once != raw_text:
+        candidates_to_scan.append(decoded_once)
+        decoded_twice = unquote(decoded_once)
+        if decoded_twice != decoded_once:
+            candidates_to_scan.append(decoded_twice)
+
+    reserved = {'invites', 'invite', 'login', 'signup', 'download', 'null', 'undefined', 'none'}
+    for text_variant in candidates_to_scan:
+        for match in INVITE_PATH_REGEX.findall(text_variant):
+            cleaned = unquote(match).strip().strip('\'"<>\\/')
+            for sep in ('?', '#', '&', '"', "'", ' '):
+                if sep in cleaned:
+                    cleaned = cleaned.split(sep, 1)[0].strip()
+            if (
+                cleaned
+                and cleaned.lower() not in reserved
+                and '%' not in cleaned
+                and INVITE_TOKEN_CLEAN_PATTERN.fullmatch(cleaned)
+            ):
+                return cleaned
+    return None
+
+
+async def resolve_public_locket_share_link(
+    raw_input: str,
+    *,
+    http_client: AsyncClient | None = None,
+    public_fetcher: Callable | None = None,
+    check_dns: bool = False,
+) -> IdentityResolutionOutput:
+    """
+    Zero-env-var Public Locket Share Link Resolver (`https://locket.cam/<username>`).
+    - Normalizes username or Locket share link.
+    - Enforces HTTPS-only, `ALLOWED_LOCKET_HOSTS` whitelist, SSRF & private-IP redirect protection.
+    - Enforces 8-second timeout, max 5 redirects, and 256 KiB response size limit.
+    - Extracts `/invites/<token>` from redirect URL or HTML and stores it as `invite_token`
+      (NEVER confuses `invite_token` with `firebase_uid`, even if 28 characters long).
+    """
+    now = datetime.now(timezone.utc)
+    if not isinstance(raw_input, str) or not raw_input.strip():
+        return IdentityResolutionOutput(
+            status='invalid_link',
+            normalized_id='',
+            input_kind='invalid',
+            identity_lookup_source='public_share_link',
+            identity_lookup_at=now,
+            message='Đầu vào trống. Vui lòng nhập username hoặc link Locket hợp lệ (invalid_link).',
+        )
+
+    candidate = raw_input.strip()
+    if '://' in candidate or '/' in candidate:
+        url_candidate = candidate if '://' in candidate else f'https://{candidate}'
+        try:
+            validate_safe_locket_public_url(url_candidate, check_dns=False)
+        except ValueError as exc:
+            return IdentityResolutionOutput(
+                status='invalid_link',
+                normalized_id=candidate[:128],
+                input_kind='invalid',
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message=f'{exc} (invalid_link)',
+            )
+
+    try:
+        normalized_id, input_kind = normalize_lookup_query(candidate)
+    except ValueError as exc:
+        return IdentityResolutionOutput(
+            status='invalid_link',
+            normalized_id=candidate[:128],
+            input_kind='invalid',
+            identity_lookup_source='public_share_link',
+            identity_lookup_at=now,
+            message=f'{exc} (invalid_link)',
+        )
+
+    share_url = f'https://locket.cam/{quote(normalized_id, safe="")}'
+    try:
+        validate_safe_locket_public_url(share_url, check_dns=check_dns)
+    except ValueError as exc:
+        return IdentityResolutionOutput(
+            status='invalid_link',
+            normalized_id=normalized_id,
+            input_kind=input_kind,
+            username=normalized_id,
+            source_link=share_url,
+            identity_lookup_source='public_share_link',
+            identity_lookup_at=now,
+            message=f'{exc} (invalid_link)',
+        )
+    except ConnectionError:
+        return IdentityResolutionOutput(
+            status='lookup_unavailable',
+            normalized_id=normalized_id,
+            input_kind=input_kind,
+            username=normalized_id,
+            source_link=share_url,
+            identity_lookup_source='public_share_link',
+            identity_lookup_at=now,
+            message='Không thể kết nối tới trang công khai locket.cam (lookup_unavailable).',
+        )
+
+    current_url = share_url
+    headers = {
+        'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        'User-Agent': 'LocketGold-PublicLinkResolver/1.0',
+    }
+
+    async def _do_fetch(url_to_get: str):
+        if public_fetcher is not None:
+            res = public_fetcher(url_to_get)
+            if hasattr(res, '__await__'):
+                res = await asyncio.wait_for(res, timeout=PUBLIC_LINK_TIMEOUT_SECONDS)
+            return res
+        if http_client is not None:
+            return await http_client.get(
+                url_to_get,
+                headers=headers,
+                follow_redirects=False,
+                timeout=PUBLIC_LINK_TIMEOUT_SECONDS,
+            )
+        async with AsyncClient(
+            timeout=PUBLIC_LINK_TIMEOUT_SECONDS,
+            follow_redirects=False,
+        ) as client:
+            return await client.get(url_to_get, headers=headers)
+
+    for hop in range(MAX_PUBLIC_LINK_REDIRECTS + 1):
+        try:
+            validate_safe_locket_public_url(current_url, check_dns=check_dns)
+        except ValueError as exc:
+            return IdentityResolutionOutput(
+                status='invalid_link',
+                normalized_id=normalized_id,
+                input_kind=input_kind,
+                username=normalized_id,
+                source_link=share_url,
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message=f'{exc} (invalid_link)',
+            )
+        except ConnectionError:
+            return IdentityResolutionOutput(
+                status='lookup_unavailable',
+                normalized_id=normalized_id,
+                input_kind=input_kind,
+                username=normalized_id,
+                source_link=share_url,
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message='Không thể phân giải hoặc kết nối tới locket.cam (lookup_unavailable).',
+            )
+
+        try:
+            resp = await _do_fetch(current_url)
+        except (TimeoutError, asyncio.TimeoutError, TimeoutException, TransportError, ConnectionError, OSError):
+            return IdentityResolutionOutput(
+                status='lookup_unavailable',
+                normalized_id=normalized_id,
+                input_kind=input_kind,
+                username=normalized_id,
+                source_link=share_url,
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message='Hết thời gian chờ (8s) hoặc lỗi mạng khi truy cập trang công khai locket.cam (lookup_unavailable).',
+            )
+
+        status_code = int(getattr(resp, 'status_code', 500))
+        resp_headers = getattr(resp, 'headers', {}) or {}
+        raw_content = getattr(resp, 'content', b'')
+        if isinstance(raw_content, str):
+            raw_content = raw_content.encode('utf-8')
+
+        if len(raw_content) > MAX_PUBLIC_LINK_RESPONSE_BYTES:
+            return IdentityResolutionOutput(
+                status='lookup_unavailable',
+                normalized_id=normalized_id,
+                input_kind=input_kind,
+                username=normalized_id,
+                source_link=share_url,
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message='Phản hồi từ trang công khai vượt quá giới hạn kích thước an toàn (lookup_unavailable).',
+            )
+
+        if status_code in (301, 302, 303, 307, 308):
+            if hop >= MAX_PUBLIC_LINK_REDIRECTS:
+                return IdentityResolutionOutput(
+                    status='lookup_unavailable',
+                    normalized_id=normalized_id,
+                    input_kind=input_kind,
+                    username=normalized_id,
+                    source_link=share_url,
+                    identity_lookup_source='public_share_link',
+                    identity_lookup_at=now,
+                    message='Quá số lần chuyển hướng cho phép khi truy cập link công khai (lookup_unavailable).',
+                )
+            location = resp_headers.get('location') or resp_headers.get('Location') or ''
+            if not location:
+                return IdentityResolutionOutput(
+                    status='lookup_unavailable',
+                    normalized_id=normalized_id,
+                    input_kind=input_kind,
+                    username=normalized_id,
+                    source_link=share_url,
+                    identity_lookup_source='public_share_link',
+                    identity_lookup_at=now,
+                    message='Phản hồi chuyển hướng thiếu header Location (lookup_unavailable).',
+                )
+            if location.lower().startswith('locket://'):
+                tok = extract_invite_token_from_text_or_url(location)
+                if tok:
+                    return IdentityResolutionOutput(
+                        status='invite_token_found',
+                        normalized_id=normalized_id,
+                        input_kind=input_kind,
+                        username=normalized_id,
+                        invite_token=tok,
+                        firebase_uid=None,
+                        source_link=share_url,
+                        uid_verified=False,
+                        verification_status='unverified_handle',
+                        verification_method='link_handle_only',
+                        verification_source='locket_public_share_link',
+                        identity_lookup_source='public_share_link',
+                        identity_lookup_at=now,
+                        message='Đã lấy invite token — chưa xác minh Firebase UID.',
+                    )
+            next_url = urljoin(current_url, location)
+            try:
+                validate_safe_locket_public_url(next_url, check_dns=check_dns)
+            except ValueError as exc:
+                return IdentityResolutionOutput(
+                    status='invalid_link',
+                    normalized_id=normalized_id,
+                    input_kind=input_kind,
+                    username=normalized_id,
+                    source_link=share_url,
+                    identity_lookup_source='public_share_link',
+                    identity_lookup_at=now,
+                    message=f'Chặn chuyển hướng không an toàn: {exc} (invalid_link)',
+                )
+            except ConnectionError:
+                return IdentityResolutionOutput(
+                    status='lookup_unavailable',
+                    normalized_id=normalized_id,
+                    input_kind=input_kind,
+                    username=normalized_id,
+                    source_link=share_url,
+                    identity_lookup_source='public_share_link',
+                    identity_lookup_at=now,
+                    message='Không thể kết nối tới địa chỉ chuyển hướng (lookup_unavailable).',
+                )
+            tok_in_redirect = extract_invite_token_from_text_or_url(next_url)
+            if tok_in_redirect:
+                return IdentityResolutionOutput(
+                    status='invite_token_found',
+                    normalized_id=normalized_id,
+                    input_kind=input_kind,
+                    username=normalized_id,
+                    invite_token=tok_in_redirect,
+                    firebase_uid=None,
+                    source_link=share_url,
+                    uid_verified=False,
+                    verification_status='unverified_handle',
+                    verification_method='link_handle_only',
+                    verification_source='locket_public_share_link',
+                    identity_lookup_source='public_share_link',
+                    identity_lookup_at=now,
+                    message='Đã lấy invite token — chưa xác minh Firebase UID.',
+                )
+            current_url = next_url
+            continue
+
+        if status_code == 404:
+            return IdentityResolutionOutput(
+                status='not_found',
+                normalized_id=normalized_id,
+                input_kind=input_kind,
+                username=normalized_id,
+                source_link=share_url,
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message='Không tìm thấy trang chia sẻ Locket công khai của tài khoản này (not_found).',
+            )
+        if status_code == 429 or status_code >= 500 or status_code >= 400:
+            return IdentityResolutionOutput(
+                status='lookup_unavailable',
+                normalized_id=normalized_id,
+                input_kind=input_kind,
+                username=normalized_id,
+                source_link=share_url,
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message=f'Trang công khai Locket trả về mã HTTP {status_code} (lookup_unavailable).',
+            )
+
+        html_text = raw_content.decode('utf-8', errors='replace')
+        try:
+            final_url_str = str(resp.url) if getattr(resp, '_request', None) is not None else current_url
+        except Exception:
+            final_url_str = current_url
+        extracted_tok = extract_invite_token_from_text_or_url(final_url_str) or extract_invite_token_from_text_or_url(html_text)
+        if extracted_tok:
+            return IdentityResolutionOutput(
+                status='invite_token_found',
+                normalized_id=normalized_id,
+                input_kind=input_kind,
+                username=normalized_id,
+                invite_token=extracted_tok,
+                firebase_uid=None,
+                source_link=share_url,
+                uid_verified=False,
+                verification_status='unverified_handle',
+                verification_method='link_handle_only',
+                verification_source='locket_public_share_link',
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message='Đã lấy invite token — chưa xác minh Firebase UID.',
+            )
+
+        return IdentityResolutionOutput(
+            status='verification_required',
+            normalized_id=normalized_id,
+            input_kind=input_kind,
+            username=normalized_id,
+            invite_token=None,
+            firebase_uid=None,
+            source_link=share_url,
+            uid_verified=False,
+            verification_status='unverified_handle',
+            verification_method='link_handle_only',
+            verification_source='locket_public_share_link',
+            identity_lookup_source='public_share_link',
+            identity_lookup_at=now,
+            message='Trang công khai không chứa invite token và chưa có nguồn xác minh Firebase UID (verification_required).',
+        )
+
+    return IdentityResolutionOutput(
+        status='lookup_unavailable',
+        normalized_id=normalized_id,
+        input_kind=input_kind,
+        username=normalized_id,
+        source_link=share_url,
+        identity_lookup_source='public_share_link',
+        identity_lookup_at=now,
+        message='Không thể hoàn tất tra cứu trang công khai Locket (lookup_unavailable).',
+    )
+
+
 def _parse_provider_payload(status_code: int, payload: Any) -> tuple[str, dict | None, str]:
     """
     Inspect HTTP status code and JSON body from an identity provider (e.g. Firebase Callable
@@ -514,30 +935,53 @@ async def resolve_locket_identity(
     accounts_v2: Any = None,
     provider: Callable | None = None,
     http_client: AsyncClient | None = None,
+    public_http_client: AsyncClient | None = None,
+    public_fetcher: Callable | None = None,
+    use_public_link: bool = False,
 ) -> IdentityResolutionOutput:
     """
-    Automatic Locket ID / Username / Share Link -> Firebase UID Resolver.
-    Statuses:
-      - `resolved`: Found valid 28-char Firebase UID with matching account proof & zero DB conflicts.
-      - `not_found`: Account does not exist on the identity provider.
-      - `auth_required`: Identity provider requires valid authentication (401/403).
-      - `rate_limited`: Identity provider rate limit reached (429).
-      - `lookup_unavailable`: No identity provider configured or network/timeout/5xx error.
-      - `conflict`: Returned UID/username mismatches input, differs from existing verified UID, or is bound to another account.
-      - `unverified`: Response JSON is missing a valid Firebase UID or lacks matching account proof.
+    Automatic Locket ID / Username / Share Link Resolver.
+    Supports both:
+      1. Zero-env-var Public Locket Share Link Resolver (`https://locket.cam/<username>` -> extracts `invite_token`
+         and strictly separates `invite_token` from `firebase_uid`).
+      2. Authorized Identity Provider (`getUserByUsername` / `fetchUserV2` when configured) for verified `firebase_uid`.
     """
+    now = datetime.now(timezone.utc)
+    if not isinstance(raw_input, str) or not raw_input.strip():
+        return IdentityResolutionOutput(
+            status='invalid_link',
+            normalized_id='',
+            input_kind='invalid',
+            identity_lookup_at=now,
+            message='Đầu vào trống. Vui lòng nhập username hoặc link Locket hợp lệ.',
+        )
+    candidate_raw = raw_input.strip()
+    if '://' in candidate_raw or '/' in candidate_raw:
+        url_cand = candidate_raw if '://' in candidate_raw else f'https://{candidate_raw}'
+        try:
+            validate_safe_locket_public_url(url_cand, check_dns=False)
+        except ValueError as exc:
+            return IdentityResolutionOutput(
+                status='invalid_link',
+                normalized_id=candidate_raw[:128],
+                input_kind='invalid',
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                message=str(exc),
+            )
+
     try:
-        normalized_id, input_kind = normalize_lookup_query(raw_input)
+        normalized_id, input_kind = normalize_lookup_query(candidate_raw)
     except ValueError as exc:
         return IdentityResolutionOutput(
-            status='unverified',
-            normalized_id=str(raw_input or '').strip()[:128],
+            status='invalid_link' if ('://' in candidate_raw or '/' in candidate_raw) else 'unverified',
+            normalized_id=candidate_raw[:128],
             input_kind='invalid',
+            identity_lookup_at=now,
             message=str(exc),
         )
 
     source_link = f'https://locket.cam/{normalized_id}' if input_kind == 'locket_link' else None
-    now = datetime.now(timezone.utc)
 
     # 1. Inspect existing canonical accounts_v2 records for this identifier
     existing_doc = await _find_in_accounts_v2(accounts_v2, {'locket_id': normalized_id})
@@ -547,31 +991,68 @@ async def resolve_locket_identity(
     has_remote_provider = provider is not None or bool(
         settings is not None and (getattr(settings, 'locket_identity_lookup_url', '') or '').strip()
     )
+    has_public_resolver = bool(use_public_link or public_http_client is not None or public_fetcher is not None)
 
-    # If no remote provider is configured, check if MongoDB already holds a server-verified UID for this account
+    # 2. If no remote API provider is configured, use the zero-env-var Public Link Resolver if enabled,
+    #    while preserving any already-verified Firebase UID in MongoDB!
     if not has_remote_provider:
-        if (
-            isinstance(existing_doc, dict)
-            and existing_doc.get('_server_uid_proof') is True
-            and existing_doc.get('verification_status') == 'verified_uid'
-            and is_valid_firebase_uid(existing_doc.get('firebase_uid'))
-        ):
-            cached_uid = str(existing_doc['firebase_uid']).strip()
+        existing_verified_uid = (
+            str(existing_doc['firebase_uid']).strip()
+            if (
+                isinstance(existing_doc, dict)
+                and existing_doc.get('_server_uid_proof') is True
+                and existing_doc.get('verification_status') == 'verified_uid'
+                and is_valid_firebase_uid(existing_doc.get('firebase_uid'))
+            )
+            else None
+        )
+        if has_public_resolver:
+            pub_res = await resolve_public_locket_share_link(
+                candidate_raw,
+                http_client=public_http_client,
+                public_fetcher=public_fetcher,
+                check_dns=(public_http_client is None and public_fetcher is None),
+            )
+            if existing_verified_uid and pub_res.status == 'invite_token_found':
+                return IdentityResolutionOutput(
+                    status='resolved_uid',
+                    normalized_id=str(existing_doc.get('locket_id') or normalized_id),
+                    input_kind=input_kind,
+                    username=existing_doc.get('username') or normalized_id,
+                    invite_token=pub_res.invite_token,
+                    firebase_uid=existing_verified_uid,
+                    source_link=pub_res.source_link or existing_doc.get('source_link'),
+                    uid_verified=True,
+                    verification_status='verified_uid',
+                    verification_method='trusted_proof',
+                    verification_source=str(existing_doc.get('verification_source') or 'authorized_identity_provider'),
+                    identity_lookup_source='public_share_link',
+                    identity_lookup_at=now,
+                    uid_resolved_at=existing_doc.get('uid_resolved_at') or now,
+                    uid_resolution_source=str(existing_doc.get('uid_resolution_source') or 'mongodb_verified_cache'),
+                    message=f'Đã giữ nguyên Firebase UID đã xác minh ({existing_verified_uid}) và cập nhật invite token.',
+                )
+            return pub_res
+
+        if existing_verified_uid:
             cached_user = existing_doc.get('username') or (normalized_id if input_kind != 'firebase_uid' else None)
             return IdentityResolutionOutput(
                 status='resolved',
                 normalized_id=str(existing_doc.get('locket_id') or normalized_id),
                 input_kind=input_kind,
                 username=cached_user,
-                firebase_uid=cached_uid,
+                invite_token=existing_doc.get('invite_token'),
+                firebase_uid=existing_verified_uid,
                 source_link=source_link or existing_doc.get('source_link'),
                 uid_verified=True,
                 verification_status='verified_uid',
                 verification_method='trusted_proof',
                 verification_source=str(existing_doc.get('verification_source') or 'authorized_identity_provider'),
+                identity_lookup_source=str(existing_doc.get('identity_lookup_source') or 'mongodb_verified_cache'),
+                identity_lookup_at=now,
                 uid_resolved_at=existing_doc.get('uid_resolved_at') or now,
                 uid_resolution_source=str(existing_doc.get('uid_resolution_source') or 'mongodb_verified_cache'),
-                message=f'Đã xác nhận Firebase UID đã xác minh trong hệ thống: {cached_uid}.',
+                message=f'Đã xác nhận Firebase UID đã xác minh trong hệ thống: {existing_verified_uid}.',
             )
         return IdentityResolutionOutput(
             status='lookup_unavailable',
@@ -579,6 +1060,7 @@ async def resolve_locket_identity(
             input_kind=input_kind,
             username=normalized_id if input_kind != 'firebase_uid' else None,
             source_link=source_link,
+            identity_lookup_at=now,
             message='Không thể tra cứu Firebase UID: Nguồn tra cứu danh tính Locket chưa sẵn sàng (lookup_unavailable).',
         )
 
@@ -693,12 +1175,15 @@ async def resolve_locket_identity(
         normalized_id=canonical_id,
         input_kind=input_kind,
         username=resolved_username,
+        invite_token=existing_doc.get('invite_token') if isinstance(existing_doc, dict) else None,
         firebase_uid=resolved_uid,
         source_link=source_link,
         uid_verified=True,
         verification_status='verified_uid',
         verification_method='trusted_proof',
         verification_source=provider_source,
+        identity_lookup_source='getUserByUsername' if input_kind != 'firebase_uid' else 'fetchUserV2',
+        identity_lookup_at=now,
         uid_resolved_at=now,
         uid_resolution_source='getUserByUsername' if input_kind != 'firebase_uid' else 'fetchUserV2',
         message=f'Đã tra cứu và xác minh thành công Firebase UID: {resolved_uid}.',
