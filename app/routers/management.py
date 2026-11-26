@@ -498,20 +498,22 @@ async def connect_locket_session(
         )
     except ValueError:
         raise HTTPException(422, 'Phiên Locket không hợp lệ.') from None
-    previous = getattr(request.app.state, 'locket_session_provider', None)
+    if not hasattr(request.app.state, 'locket_sessions'):
+        request.app.state.locket_sessions = {}
+    sessions = request.app.state.locket_sessions
+    previous = sessions.get(admin['session_id'])
     if previous is not None:
         previous.revoke()
-    request.app.state.locket_session_provider = provider
+    sessions[admin['session_id']] = provider
     await record_audit(request, admin, 'LOCKET_SESSION_CONNECTED', username)
     return {'connected': True, 'expires_at': provider.expires_at}
 
 
 @admin_router.delete('/locket-session')
 async def disconnect_locket_session(request: Request, admin: Annotated[dict, Depends(require_admin)]):
-    provider = getattr(request.app.state, 'locket_session_provider', None)
+    provider = getattr(request.app.state, 'locket_sessions', {}).pop(admin['session_id'], None)
     if provider is not None:
         provider.revoke()
-    request.app.state.locket_session_provider = None
     await record_audit(request, admin, 'LOCKET_SESSION_DISCONNECTED', 'locket-session')
     return {'connected': False}
 
@@ -533,7 +535,7 @@ async def upsert_account(
     auto_source_link = f'https://locket.cam/{canonical_id}' if input_kind == 'locket_link' else data.source_link
     accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
     provider = getattr(request.app.state, 'identity_provider', None)
-    session_provider = getattr(request.app.state, 'locket_session_provider', None)
+    session_provider = getattr(request.app.state, 'locket_sessions', {}).get(admin['session_id'])
     auth_http_client = getattr(request.app.state, 'locket_api_http_client', None)
     public_fetcher = getattr(request.app.state, 'public_link_fetcher', None)
     public_http_client = getattr(request.app.state, 'public_http_client', None)

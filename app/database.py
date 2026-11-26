@@ -246,8 +246,7 @@ async def lifespan(app: FastAPI):
         # Migration is strictly controlled via `python -m scripts.migrate_db`.
         yield
     finally:
-        session_provider = getattr(app.state, 'locket_session_provider', None)
-        if session_provider is not None:
+        for session_provider in getattr(app.state, 'locket_sessions', {}).values():
             session_provider.revoke()
         await client.close()
 

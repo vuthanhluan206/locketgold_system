@@ -149,8 +149,8 @@ Trên staging, đăng nhập Admin, chọn **Liên kết phiên Locket**, nhập
 của phiên và ID token hợp lệ do chủ tài khoản kiểm thử cấp; refresh token là
 tuỳ chọn. Sau đó Add account bằng username/link và ngày hết hạn như trước.
 Không đưa token vào URL, Git, log, file JSON hoặc localStorage. Nút **Ngắt phiên
-Locket** huỷ token trong bộ nhớ. Phiên nhập dùng chung cho superadmin của tiến
-trình, mất khi restart; triển khai staging phải giữ một worker như Dockerfile.
+Locket** huỷ token trong bộ nhớ. Mỗi lần đăng nhập Admin có phiên Locket riêng.
+Đăng xuất hoặc khởi động lại tiến trình sẽ xoá phiên tương ứng. Staging dùng một worker như Dockerfile.
 Không dùng cơ chế này trên deployment nhiều worker/serverless.
 
 `uid_resolved` / `unverified_uid` nghĩa là API trả UID và username khớp, chưa
