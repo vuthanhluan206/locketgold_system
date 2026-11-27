@@ -49,7 +49,8 @@ def load_validated_root_ca(settings: Settings) -> x509.Certificate | None:
     )
     if not cert.extensions.get_extension_for_class(x509.BasicConstraints).value.ca:
         raise ValueError('Root CA must contain a CA certificate')
-    cert.verify_directly_issued_by(cert)
+    from .services.pki_service import verify_cert_directly_issued_by
+    verify_cert_directly_issued_by(cert, cert)
     try:
         usage = cert.extensions.get_extension_for_class(x509.KeyUsage).value
     except x509.ExtensionNotFound:
@@ -57,7 +58,9 @@ def load_validated_root_ca(settings: Settings) -> x509.Certificate | None:
     if usage is not None and not usage.key_cert_sign:
         raise ValueError('Root CA must allow certificate signing')
     now = datetime.now(timezone.utc)
-    if not cert.not_valid_before_utc <= now < cert.not_valid_after_utc:
+    nvb = getattr(cert, 'not_valid_before_utc', None) or cert.not_valid_before.replace(tzinfo=timezone.utc)
+    nva = getattr(cert, 'not_valid_after_utc', None) or cert.not_valid_after.replace(tzinfo=timezone.utc)
+    if not nvb <= now < nva:
         raise ValueError('The CA certificate is expired or not yet valid')
     return cert
 

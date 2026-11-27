@@ -41,6 +41,8 @@ from app.services.doh_service import (
     resolve_lab_dns_wireformat,
 )
 from app.services.pki_service import (
+    cert_not_valid_after_utc,
+    cert_not_valid_before_utc,
     generate_lab_leaf_certificate,
     generate_lab_root_ca,
     inspect_certificate_metadata,
@@ -80,8 +82,8 @@ def test_check2_and_4_reference_locketproxy_ca_vs_generated_lab_ca():
     assert ref_fp == EXPECTED_REF_SHA256
     assert ref_cert.subject.rfc4514_string() == "C=VN,O=Local Research,CN=LocketProxy CA"
     assert ref_cert.issuer.rfc4514_string() == "C=VN,O=Local Research,CN=LocketProxy CA"
-    assert ref_cert.not_valid_before_utc == datetime(2026, 9, 26, 4, 44, 42, tzinfo=timezone.utc)
-    assert ref_cert.not_valid_after_utc == datetime(2036, 9, 26, 4, 44, 42, tzinfo=timezone.utc)
+    assert cert_not_valid_before_utc(ref_cert) == datetime(2026, 9, 26, 4, 44, 42, tzinfo=timezone.utc)
+    assert cert_not_valid_after_utc(ref_cert) == datetime(2036, 9, 26, 4, 44, 42, tzinfo=timezone.utc)
     bc = ref_cert.extensions.get_extension_for_class(x509.BasicConstraints).value
     assert bc.ca is True
     ref_cert.verify_directly_issued_by(ref_cert)

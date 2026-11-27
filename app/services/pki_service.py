@@ -7,6 +7,44 @@ from cryptography.hazmat.primitives.serialization import Encoding
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID
 
 
+def cert_not_valid_before_utc(cert: x509.Certificate) -> datetime:
+    """Return timezone-aware UTC not_valid_before across cryptography <42 and >=42."""
+    dt = getattr(cert, 'not_valid_before_utc', None)
+    if dt is None:
+        dt = cert.not_valid_before
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def cert_not_valid_after_utc(cert: x509.Certificate) -> datetime:
+    """Return timezone-aware UTC not_valid_after across cryptography <42 and >=42."""
+    dt = getattr(cert, 'not_valid_after_utc', None)
+    if dt is None:
+        dt = cert.not_valid_after
+    if dt.tzinfo is None:
+        return dt.replace(tzinfo=timezone.utc)
+    return dt.astimezone(timezone.utc)
+
+
+def verify_cert_directly_issued_by(cert: x509.Certificate, issuer_cert: x509.Certificate) -> None:
+    """Verify certificate issuer and cryptographic signature across cryptography <40 and >=40."""
+    verifier = getattr(cert, 'verify_directly_issued_by', None)
+    if callable(verifier):
+        verifier(issuer_cert)
+        return
+    if cert.issuer != issuer_cert.subject:
+        raise ValueError('Certificate issuer does not match issuer subject')
+    pub = issuer_cert.public_key()
+    from cryptography.hazmat.primitives.asymmetric import padding, rsa
+    if isinstance(pub, ec.EllipticCurvePublicKey):
+        pub.verify(cert.signature, cert.tbs_certificate_bytes, ec.ECDSA(cert.signature_hash_algorithm))
+    elif isinstance(pub, rsa.RSAPublicKey):
+        pub.verify(cert.signature, cert.tbs_certificate_bytes, padding.PKCS1v15(), cert.signature_hash_algorithm)
+    else:
+        raise ValueError(f'Unsupported public key type for signature verification: {type(pub).__name__}')
+
+
 def generate_lab_root_ca(
     common_name: str = 'LocketGold Research Lab Root CA',
     organization: str = 'LocketGold Research Lab',
@@ -142,11 +180,13 @@ def verify_certificate_chain_and_hostname(
 
     # 1. Verify Root CA self-signature, BasicConstraints, KeyUsage, and validity
     try:
-        root_ca.verify_directly_issued_by(root_ca)
+        verify_cert_directly_issued_by(root_ca, root_ca)
     except Exception as exc:
         errors.append(f'Root CA is not a valid self-signed certificate: {type(exc).__name__}')
 
-    if not (root_ca.not_valid_before_utc <= now < root_ca.not_valid_after_utc):
+    root_nvb = cert_not_valid_before_utc(root_ca)
+    root_nva = cert_not_valid_after_utc(root_ca)
+    if not (root_nvb <= now < root_nva):
         errors.append('Root CA is expired or not yet valid')
 
     try:
@@ -157,15 +197,17 @@ def verify_certificate_chain_and_hostname(
 
     # 2. Verify Leaf Certificate signature by Root CA
     try:
-        leaf_cert.verify_directly_issued_by(root_ca)
+        verify_cert_directly_issued_by(leaf_cert, root_ca)
     except Exception as exc:
         errors.append(f'Leaf certificate signature verification by Root CA failed: {type(exc).__name__}')
 
     # 3. Verify Leaf validity window and Apple 398-day limit
-    if not (leaf_cert.not_valid_before_utc <= now < leaf_cert.not_valid_after_utc):
+    leaf_nvb = cert_not_valid_before_utc(leaf_cert)
+    leaf_nva = cert_not_valid_after_utc(leaf_cert)
+    if not (leaf_nvb <= now < leaf_nva):
         errors.append('Leaf certificate is expired or not yet valid')
 
-    leaf_lifetime_days = (leaf_cert.not_valid_after_utc - leaf_cert.not_valid_before_utc).total_seconds() / 86400.0
+    leaf_lifetime_days = (leaf_nva - leaf_nvb).total_seconds() / 86400.0
     if leaf_lifetime_days > 398.0:
         errors.append(f'Leaf certificate validity ({leaf_lifetime_days:.1f} days) exceeds Apple iOS 398-day limit')
 
@@ -224,16 +266,18 @@ def inspect_certificate_metadata(cert: x509.Certificate) -> dict:
     except x509.ExtensionNotFound:
         can_sign = False
 
+    nvb = cert_not_valid_before_utc(cert)
+    nva = cert_not_valid_after_utc(cert)
     return {
         'subject': cert.subject.rfc4514_string(),
         'issuer': cert.issuer.rfc4514_string(),
         'serial_number': format(cert.serial_number, 'X'),
-        'not_valid_before_utc': cert.not_valid_before_utc.isoformat(),
-        'not_valid_after_utc': cert.not_valid_after_utc.isoformat(),
+        'not_valid_before_utc': nvb.isoformat(),
+        'not_valid_after_utc': nva.isoformat(),
         'sha256_fingerprint': fp,
         'is_ca': bc,
         'is_self_signed': cert.subject == cert.issuer,
         'key_cert_sign': can_sign,
-        'is_currently_valid': cert.not_valid_before_utc <= now < cert.not_valid_after_utc,
+        'is_currently_valid': nvb <= now < nva,
         'pem': cert.public_bytes(Encoding.PEM).decode('ascii'),
     }
