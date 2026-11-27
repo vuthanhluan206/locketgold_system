@@ -15,8 +15,16 @@ from ..models import (
     ActivateAccountInput,
     AdminAccountLookupOutput,
     DEFAULT_ACTIVE_GOLD_FEATURES,
+    DEFAULT_INVITE_CODE,
     DeviceCreateInput,
     DeviceOutput,
+    GOLD_CAPTION_PALETTES,
+    GOLD_FRAMES_CATALOG,
+    GOLD_PACKAGES_CATALOG,
+    GOLD_TRENDING_CAPTIONS,
+    GoldActivateInviteInput,
+    GoldCustomizeInput,
+    InviteCreateInput,
     LinkVerifyInput,
     LinkVerifyOutput,
     LabGoldFeatures,
@@ -1830,4 +1838,318 @@ async def get_pki_status(request: Request):
         },
         'certificate': meta,
     }
+
+
+def _get_in_memory_invites(request: Request) -> dict[str, dict]:
+    store = getattr(request.app.state, '_mem_invites', None)
+    if not isinstance(store, dict):
+        store = {
+            DEFAULT_INVITE_CODE: {
+                'code': DEFAULT_INVITE_CODE,
+                'note': 'Mã mời Locket Gold Vĩnh Viễn mặc định',
+                'max_uses': 9999,
+                'used_count': 0,
+                'is_active': True,
+                'used_by': [],
+                'created_at': datetime(2026, 1, 1, tzinfo=timezone.utc).isoformat(),
+            }
+        }
+        request.app.state._mem_invites = store
+    return store
+
+
+async def _list_all_invites(request: Request) -> list[dict]:
+    mem = _get_in_memory_invites(request)
+    mongo_client = getattr(request.app.state, 'mongo_client', None)
+    settings = get_settings()
+    if mongo_client is not None:
+        try:
+            col = mongo_client[settings.mongodb_database].invites
+            cur = col.find({}, {'_id': 0})
+            rows = await cur.to_list(length=200)
+            if not rows:
+                seed = mem[DEFAULT_INVITE_CODE].copy()
+                await col.update_one({'code': DEFAULT_INVITE_CODE}, {'$setOnInsert': seed}, upsert=True)
+                rows = [seed]
+            return rows
+        except Exception:
+            pass
+    return list(mem.values())
+
+
+@router.get('/api/gold/catalog')
+async def get_gold_catalog():
+    """Return Locket Gold packages, widget frames catalog, and gradient caption studio presets."""
+    return {
+        'packages': GOLD_PACKAGES_CATALOG,
+        'frames': GOLD_FRAMES_CATALOG,
+        'caption_palettes': GOLD_CAPTION_PALETTES,
+        'trending_captions': GOLD_TRENDING_CAPTIONS,
+        'default_invite_hint': DEFAULT_INVITE_CODE,
+    }
+
+
+@router.get('/api/gold/status')
+async def get_public_gold_status(
+    request: Request,
+    accounts: Accounts,
+    query: str = Query(min_length=1, max_length=512),
+):
+    """
+    Public Gold status & feature summary for a Locket username or share link.
+    Returns active Gold package, 60s video & feature flags, widget frame, and gradient caption style
+    without exposing raw device tokens or internal secrets.
+    """
+    try:
+        account_id, _ = normalize_lookup_query(query)
+    except ValueError as exc:
+        raise HTTPException(422, 'Vui lòng nhập username hoặc link Locket hợp lệ.') from exc
+
+    record = await find_canonical_account(request, account_id, accounts_col=accounts)
+    if record is None:
+        return {
+            'exists': False,
+            'username': account_id,
+            'is_gold': False,
+            'status': 'none',
+            'expires_date': None,
+            'gold_features': LabGoldFeatures().model_dump(),
+            'widget_frame': None,
+            'caption_style': None,
+        }
+
+    now = datetime.now(timezone.utc)
+    fb_uid, _, _, _, _ = extract_verified_uid_metadata(record)
+    effective = await effective_gold_account(request, record, fb_uid or record.get('locket_id') or account_id, now)
+    status, expiry = compute_entitlement_status(effective, now)
+    is_gold = status == 'active'
+    raw_features = record.get('lab_features')
+    if is_gold and not raw_features:
+        raw_features = DEFAULT_ACTIVE_GOLD_FEATURES
+    flags = LabGoldFeatures.model_validate(raw_features or {}) if is_gold else LabGoldFeatures()
+    return {
+        'exists': True,
+        'username': record.get('username') or record.get('locket_id') or account_id,
+        'is_gold': is_gold,
+        'status': status,
+        'expires_date': expiry.isoformat().replace('+00:00', 'Z') if expiry else None,
+        'gold_features': flags.model_dump(),
+        'widget_frame': record.get('widget_frame') if is_gold else None,
+        'caption_style': record.get('caption_style') if is_gold else None,
+    }
+
+
+@router.post('/api/gold/activate')
+async def activate_gold_with_invite(
+    data: GoldActivateInviteInput,
+    request: Request,
+    accounts: Accounts,
+):
+    """
+    Public Gold package activation using a valid Invite Code (modeled on `amlongtruc-source` `/api/uplocket/activate`).
+    Resolves the 28-char Firebase UID from `locket.cam/<username>` and grants active Gold + Pro + 60s features in MongoDB SSOT.
+    """
+    try:
+        canonical_id, _ = normalize_lookup_query(data.username)
+    except ValueError as exc:
+        raise HTTPException(422, 'Vui lòng nhập username hoặc link Locket hợp lệ.') from exc
+
+    code_upper = data.invite_code.strip().upper()
+    invites_list = await _list_all_invites(request)
+    matched_inv = next((i for i in invites_list if str(i.get('code', '')).upper() == code_upper), None)
+    if matched_inv is None or matched_inv.get('is_active') is False:
+        raise HTTPException(403, 'Mã mời (Invite Code) không chính xác hoặc đã bị khóa!')
+    used_cnt = int(matched_inv.get('used_count') or 0)
+    max_uses = int(matched_inv.get('max_uses') or 1)
+    if used_cnt >= max_uses:
+        raise HTTPException(403, 'Mã mời này đã hết lượt sử dụng!')
+
+    pkg = next((p for p in GOLD_PACKAGES_CATALOG if p['code'] == data.package_code), GOLD_PACKAGES_CATALOG[0])
+    now = datetime.now(timezone.utc)
+    expires_dt = now + timedelta(days=int(pkg['duration_days']))
+
+    # Delegate to upsert_account so UID resolution, conflict prevention, and MongoDB SSOT grants run identically to Admin Save Account
+    acc_in = AccountInput(
+        locket_id=canonical_id,
+        expires_date=expires_dt,
+        resolve_identity=True,
+        public_only=True,
+        notes=f"Activated via Invite Code {code_upper} ({pkg['name']})",
+    )
+    saved = await upsert_account(
+        acc_in,
+        request,
+        accounts,
+        admin={'email': f'invite:{code_upper}'},
+    )
+
+    # Update invite code usage count
+    used_by = list(matched_inv.get('used_by') or [])
+    if canonical_id not in used_by:
+        used_by.append(canonical_id)
+    matched_inv['used_count'] = used_cnt + 1
+    matched_inv['used_by'] = used_by[-50:]
+    mem = _get_in_memory_invites(request)
+    mem[code_upper] = matched_inv
+    mongo_client = getattr(request.app.state, 'mongo_client', None)
+    if mongo_client is not None:
+        try:
+            col = mongo_client[get_settings().mongodb_database].invites
+            await col.update_one(
+                {'code': code_upper},
+                {'$set': {'used_count': matched_inv['used_count'], 'used_by': matched_inv['used_by']}},
+                upsert=True,
+            )
+        except Exception:
+            pass
+
+    return {
+        'success': True,
+        'package_name': pkg['name'],
+        'package_code': pkg['code'],
+        'invite_code': code_upper,
+        'used_count': matched_inv['used_count'],
+        'max_uses': max_uses,
+        'username': saved.get('username') or saved.get('locket_id') or canonical_id,
+        'status': saved.get('status'),
+        'is_gold': saved.get('status') == 'active',
+        'expires_date': saved.get('expires_date'),
+        'gold_features': DEFAULT_ACTIVE_GOLD_FEATURES if saved.get('status') == 'active' else LabGoldFeatures().model_dump(),
+        'message': (
+            f"Đã kích hoạt {pkg['name']} thành công cho @{saved.get('username') or canonical_id}!"
+            if saved.get('status') == 'active'
+            else f"Đã lưu yêu cầu cho @{canonical_id} ({saved.get('message')})"
+        ),
+    }
+
+
+@router.post('/api/gold/customize')
+async def customize_gold_account(
+    data: GoldCustomizeInput,
+    request: Request,
+    accounts: Accounts,
+):
+    """
+    Save Widget Frame and/or Gradient Caption style for an active Gold account (modeled on `amlongtruc-source` Widget Frame & Caption Studio).
+    """
+    try:
+        canonical_id, _ = normalize_lookup_query(data.username)
+    except ValueError as exc:
+        raise HTTPException(422, 'Vui lòng nhập username hoặc link Locket hợp lệ.') from exc
+
+    record = await find_canonical_account(request, canonical_id, accounts_col=accounts)
+    if record is None:
+        raise HTTPException(404, f'Tài khoản @{canonical_id} chưa có trên hệ thống. Hãy kích hoạt Gold trước!')
+
+    now = datetime.now(timezone.utc)
+    fb_uid, _, _, _, _ = extract_verified_uid_metadata(record)
+    effective = await effective_gold_account(request, record, fb_uid or record.get('locket_id') or canonical_id, now)
+    status, _ = compute_entitlement_status(effective, now)
+    if status != 'active':
+        raise HTTPException(403, f'Tài khoản @{canonical_id} hiện chưa kích hoạt Locket Gold (trạng thái: {status}).')
+
+    updates: dict = {'updated_at': now}
+    if data.frame_id:
+        frame_obj = next((f for f in GOLD_FRAMES_CATALOG if f['frame_id'] == data.frame_id), None)
+        if frame_obj is None:
+            raise HTTPException(422, 'Mẫu khung viền không hợp lệ.')
+        updates['widget_frame'] = {
+            'frame_id': frame_obj['frame_id'],
+            'name': frame_obj['name'],
+            'badge': frame_obj['badge'],
+            'colors': frame_obj['colors'],
+            'updated_at': now.isoformat(),
+        }
+
+    if data.caption_text is not None:
+        clean_text = data.caption_text.strip()
+        if clean_text:
+            colors = [c for c in (data.caption_colors or ['#FFE066', '#D97706'])[:2] if isinstance(c, str) and c.startswith('#')]
+            if len(colors) < 2:
+                colors = ['#FFE066', '#D97706']
+            updates['caption_style'] = {
+                'text': clean_text,
+                'icon': (data.caption_icon or '👑').strip()[:4],
+                'colors': colors,
+                'text_color': (data.caption_text_color or '#1C1C1E').strip()[:16],
+                'updated_at': now.isoformat(),
+            }
+
+    target_lid = record.get('locket_id') or canonical_id
+    await accounts.update_one({'locket_id': target_lid}, {'$set': updates})
+    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
+    if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
+        res = accounts_v2.update_one({'locket_id': target_lid}, {'$set': updates})
+        if hasattr(res, '__await__'):
+            await res
+
+    return {
+        'success': True,
+        'username': record.get('username') or target_lid,
+        'widget_frame': updates.get('widget_frame', record.get('widget_frame')),
+        'caption_style': updates.get('caption_style', record.get('caption_style')),
+        'message': f'Đã cập nhật tùy chỉnh Gold cho @{record.get("username") or target_lid}!',
+    }
+
+
+@admin_router.get('/invites')
+async def admin_list_invites(request: Request):
+    return {'invites': await _list_all_invites(request)}
+
+
+@admin_router.post('/invites')
+async def admin_create_invite(
+    data: InviteCreateInput,
+    request: Request,
+    admin: Annotated[dict, Depends(require_admin)],
+):
+    import secrets
+    raw_code = (data.code or '').strip().upper()
+    if not raw_code:
+        raw_code = 'COC-' + secrets.token_hex(3).upper()
+    clean_code = ''.join(ch for ch in raw_code if ch.isalnum() or ch in {'-', '_'})[:24]
+    if len(clean_code) < 3:
+        raise HTTPException(422, 'Mã mời phải có ít nhất 3 ký tự chữ hoặc số.')
+
+    new_inv = {
+        'code': clean_code,
+        'note': data.note.strip(),
+        'max_uses': data.max_uses,
+        'used_count': 0,
+        'is_active': True,
+        'used_by': [],
+        'created_at': datetime.now(timezone.utc).isoformat(),
+    }
+    mem = _get_in_memory_invites(request)
+    mem[clean_code] = new_inv
+    mongo_client = getattr(request.app.state, 'mongo_client', None)
+    if mongo_client is not None:
+        try:
+            col = mongo_client[get_settings().mongodb_database].invites
+            await col.update_one({'code': clean_code}, {'$set': new_inv}, upsert=True)
+        except Exception:
+            pass
+    await record_audit(request, admin, 'INVITE_CREATE', clean_code, {'max_uses': data.max_uses})
+    return {'invite': new_inv, 'invites': await _list_all_invites(request)}
+
+
+@admin_router.delete('/invites/{code}')
+async def admin_delete_invite(
+    code: str,
+    request: Request,
+    admin: Annotated[dict, Depends(require_admin)],
+):
+    clean_code = code.strip().upper()
+    mem = _get_in_memory_invites(request)
+    mem.pop(clean_code, None)
+    mongo_client = getattr(request.app.state, 'mongo_client', None)
+    if mongo_client is not None:
+        try:
+            col = mongo_client[get_settings().mongodb_database].invites
+            await col.delete_one({'code': clean_code})
+        except Exception:
+            pass
+    await record_audit(request, admin, 'INVITE_DELETE', clean_code)
+    return {'invites': await _list_all_invites(request)}
+
 

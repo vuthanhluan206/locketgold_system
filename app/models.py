@@ -460,6 +460,13 @@ def subscriber_response(account_id: str, account: dict | None, now: datetime | N
         '$gold_since': {'value': purchase_str, 'updated_at_ms': now_ms},
         'gold_member_since': {'value': purchase_str, 'updated_at_ms': now_ms},
     } if active else {}
+    if active and isinstance(account, dict):
+        wf = account.get('widget_frame')
+        if isinstance(wf, dict) and wf.get('frame_id'):
+            subscriber_attributes['widget_frame'] = {'value': str(wf.get('frame_id')), 'updated_at_ms': now_ms}
+        cs = account.get('caption_style')
+        if isinstance(cs, dict) and cs.get('text'):
+            subscriber_attributes['caption_text'] = {'value': str(cs.get('text')), 'updated_at_ms': now_ms}
 
     return {
         'request_date': now_str,
@@ -486,3 +493,119 @@ def subscriber_response(account_id: str, account: dict | None, now: datetime | N
             'original_purchase_date': purchase_str,
         },
     }
+
+
+DEFAULT_INVITE_CODE = 'COC-CON6EMEYG'
+
+GOLD_PACKAGES_CATALOG = [
+    {
+        'id': 'pkg_lifetime',
+        'code': 'LIFETIME',
+        'name': 'Gói Locket Gold Vĩnh Viễn',
+        'price': 0,
+        'original_price': 599000,
+        'duration_days': 3650,
+        'badge': 'VIP Trọn Đời',
+        'features': [
+            'Quay & đăng video khoảnh khắc dài 60 giây',
+            'Mở khóa toàn bộ nhãn dán & bộ lọc cao cấp',
+            'Đăng khoảnh khắc riêng tư & Huy hiệu Locket Gold',
+            'Đổi khung viền widget & Studio Caption màu Gradient',
+        ],
+    },
+    {
+        'id': 'pkg_1_year',
+        'code': '1_YEAR',
+        'name': 'Gói Locket Gold 1 Năm',
+        'price': 0,
+        'original_price': 399000,
+        'duration_days': 365,
+        'badge': 'Ưu đãi lớn',
+        'features': [
+            'Quay & đăng video khoảnh khắc dài 60 giây',
+            'Tự động gia hạn không gián đoạn dịch vụ',
+            'Tùy biến khung viền widget & Caption màu',
+            'Bảo hành xuyên suốt 365 ngày',
+        ],
+    },
+    {
+        'id': 'pkg_1_month',
+        'code': '1_MONTH',
+        'name': 'Gói Locket Gold 1 Tháng',
+        'price': 0,
+        'original_price': 79000,
+        'duration_days': 30,
+        'badge': 'Tiết kiệm',
+        'features': [
+            'Quay & đăng video khoảnh khắc dài 60 giây',
+            'Mở khóa toàn bộ nhãn dán & biểu tượng cảm xúc',
+            'Đổi khung viền widget & Caption màu',
+        ],
+    },
+]
+
+GOLD_FRAMES_CATALOG = [
+    {'frame_id': 'frame_royal_gold', 'name': 'Hoàng Gia Gold', 'category': 'luxury', 'badge': 'VIP Gold', 'colors': ['#FFE066', '#D97706']},
+    {'frame_id': 'frame_sukuna', 'name': 'Sukuna Domain', 'category': 'cyber', 'badge': 'Anime Hot', 'colors': ['#ED213A', '#93291E']},
+    {'frame_id': 'frame_nezuko', 'name': 'Nezuko Pink', 'category': 'cute', 'badge': 'Cute', 'colors': ['#FF758C', '#FF7EB3']},
+    {'frame_id': 'frame_hello_kitty', 'name': 'Hello Kitty Kawaii', 'category': 'cute', 'badge': 'Kawaii', 'colors': ['#F857A6', '#FF5858']},
+    {'frame_id': 'frame_cyberpunk', 'name': 'Cyberpunk Neon', 'category': 'cyber', 'badge': 'Cyber', 'colors': ['#8A2387', '#E94057']},
+    {'frame_id': 'frame_rose_luxury', 'name': 'Rosé Luxury', 'category': 'luxury', 'badge': 'Luxury', 'colors': ['#FA709A', '#FEE140']},
+    {'frame_id': 'frame_20_10', 'name': 'Lễ Hội 20/10', 'category': 'holiday', 'badge': 'Lễ Hội', 'colors': ['#8E2DE2', '#4A00E0']},
+    {'frame_id': 'frame_shin', 'name': 'Shin Cậu Bé Bút Chì', 'category': 'cute', 'badge': 'Fun', 'colors': ['#11998E', '#38EF7D']},
+]
+
+GOLD_CAPTION_PALETTES = [
+    {'name': 'Hoàng Gia Gold', 'colors': ['#FFE066', '#D97706'], 'text_color': '#1C1C1E'},
+    {'name': 'Cyberpunk', 'colors': ['#8A2387', '#E94057'], 'text_color': '#FFFFFF'},
+    {'name': 'Đại Dương Xanh', 'colors': ['#00C0FF', '#42E695'], 'text_color': '#FFFFFF'},
+    {'name': 'Rosé Luxury', 'colors': ['#FF758C', '#FF7EB3'], 'text_color': '#FFFFFF'},
+    {'name': 'Ngọc Lục Bảo', 'colors': ['#11998E', '#38EF7D'], 'text_color': '#FFFFFF'},
+    {'name': 'Tím Quyền Lực', 'colors': ['#8E2DE2', '#4A00E0'], 'text_color': '#FFFFFF'},
+    {'name': 'Đen Nhám', 'colors': ['#232526', '#414345'], 'text_color': '#FFFFFF'},
+    {'name': 'Cực Quang', 'colors': ['#00F260', '#0575E6'], 'text_color': '#FFFFFF'},
+    {'name': 'Hoàng Hôn Hồng', 'colors': ['#FA709A', '#FEE140'], 'text_color': '#1C1C1E'},
+    {'name': 'Midnight Blue', 'colors': ['#0F2027', '#2C5364'], 'text_color': '#FFFFFF'},
+    {'name': 'Candy Mint', 'colors': ['#D4FC79', '#96E6A1'], 'text_color': '#1C1C1E'},
+    {'name': 'Vampire Red', 'colors': ['#ED213A', '#93291E'], 'text_color': '#FFFFFF'},
+    {'name': 'Lavender Dream', 'colors': ['#667EEA', '#764BA2'], 'text_color': '#FFFFFF'},
+    {'name': 'Citrus Fresh', 'colors': ['#F7971E', '#FFD200'], 'text_color': '#1C1C1E'},
+    {'name': 'Neon Cyan', 'colors': ['#00F0FF', '#0072FF'], 'text_color': '#FFFFFF'},
+    {'name': 'Cherry Blossom', 'colors': ['#F857A6', '#FF5858'], 'text_color': '#FFFFFF'},
+]
+
+GOLD_TRENDING_CAPTIONS = [
+    {'category': 'Bá Khí & Triệu View', 'text': 'Siêu cấp bá khí', 'icon': '🔥', 'colors': ['#F12711', '#F5AF19'], 'text_color': '#FFFFFF'},
+    {'category': 'Bá Khí & Triệu View', 'text': 'Đẹp trai có gì sai', 'icon': '👑', 'colors': ['#FFE066', '#D97706'], 'text_color': '#1C1C1E'},
+    {'category': 'Bá Khí & Triệu View', 'text': 'Oách xà lách', 'icon': '✨', 'colors': ['#11998E', '#38EF7D'], 'text_color': '#FFFFFF'},
+    {'category': 'Gen Z & Hài Hước', 'text': 'Ủa alo', 'icon': '📞', 'colors': ['#4E54C8', '#8F94FB'], 'text_color': '#FFFFFF'},
+    {'category': 'Gen Z & Hài Hước', 'text': 'Mắc cỡ quá hai ơi', 'icon': '🫣', 'colors': ['#F857A6', '#FF5858'], 'text_color': '#FFFFFF'},
+    {'category': 'Tình Cảm & Thả Thính', 'text': 'Yeuu Emm', 'icon': '💖', 'colors': ['#FF758C', '#FF7EB3'], 'text_color': '#FFFFFF'},
+    {'category': 'Tình Cảm & Thả Thính', 'text': 'Yeuu Anhh', 'icon': '💙', 'colors': ['#00C0FF', '#42E695'], 'text_color': '#FFFFFF'},
+    {'category': 'Đi Làm & Deadline', 'text': 'Deadline dí tụt quần', 'icon': '🔥', 'colors': ['#FF512F', '#DD2476'], 'text_color': '#FFFFFF'},
+    {'category': 'Đi Làm & Deadline', 'text': 'Tiền đâu mà tiêu', 'icon': '💸', 'colors': ['#0BA360', '#3CBA92'], 'text_color': '#FFFFFF'},
+]
+
+
+class GoldActivateInviteInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    username: str = Field(min_length=1, max_length=256)
+    package_code: Literal['LIFETIME', '1_YEAR', '1_MONTH'] = 'LIFETIME'
+    invite_code: str = Field(min_length=2, max_length=64)
+
+
+class GoldCustomizeInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    username: str = Field(min_length=1, max_length=256)
+    frame_id: str | None = Field(default=None, max_length=64)
+    caption_text: str | None = Field(default=None, max_length=120)
+    caption_icon: str | None = Field(default=None, max_length=8)
+    caption_colors: list[str] | None = Field(default=None, max_length=3)
+    caption_text_color: str | None = Field(default=None, max_length=16)
+
+
+class InviteCreateInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    code: str | None = Field(default=None, max_length=32)
+    max_uses: int = Field(default=10, ge=1, le=100000)
+    note: str = Field(default='', max_length=128)

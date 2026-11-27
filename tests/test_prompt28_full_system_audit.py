@@ -780,6 +780,99 @@ def test_cryptography_pre42_legacy_not_valid_before_compatibility():
     assert chain_check['valid'] is True
 
 
+def test_prompt28_gold_interactive_catalog_invite_activation_and_customization(prompt28_env):
+    """
+    Verify interactive Locket Gold web features modeled on `amlongtruc-source`:
+    - `GET /api/gold/catalog` returns Gold packages (`LIFETIME`, `1_YEAR`, `1_MONTH`), widget frames, and 16 gradient caption palettes.
+    - `POST /api/gold/activate` activates Gold with default Invite Code `COC-CON6EMEYG`, resolves 28-char Firebase UID,
+      and grants full 60s Gold features in MongoDB SSOT.
+    - `POST /api/gold/customize` saves Widget Frame and Gradient Caption style for the active Gold account.
+    - `GET /api/gold/status` and `GET /v1/subscribers/{uid}` reflect the active Gold package, 60s features, widget frame, and caption.
+    - `GET/POST/DELETE /admin/invites` manages Invite Codes in the Admin workspace.
+    """
+    http = prompt28_env['http']
+    app = prompt28_env['app']
+    admin_headers = prompt28_env['admin_headers']
+    service_headers = prompt28_env['service_headers']
+
+    real_invite_44 = 'juNBPjHxRYeYXtMzPIy0YSjzIL83907433b66b8185cb'
+    real_uid_28 = 'juNBPjHxRYeYXtMzPIy0YSjzIL83'
+    app.state.public_link_fetcher = lambda url: httpx.Response(
+        200,
+        text=f'<html><a href="https://locket.camera/invites/{real_invite_44}">Add</a></html>',
+    )
+
+    cat_res = http.get('/api/gold/catalog')
+    assert cat_res.status_code == 200
+    cat = cat_res.json()
+    assert len(cat['packages']) == 3
+    assert len(cat['frames']) == 8
+    assert len(cat['caption_palettes']) == 16
+
+    # Reject invalid invite code
+    bad_act = http.post('/api/gold/activate', json={
+        'username': 'vt.l',
+        'package_code': 'LIFETIME',
+        'invite_code': 'WRONG-CODE',
+    })
+    assert bad_act.status_code == 403
+
+    # Activate with default invite code COC-CON6EMEYG
+    act_res = http.post('/api/gold/activate', json={
+        'username': 'vt.l',
+        'package_code': 'LIFETIME',
+        'invite_code': 'COC-CON6EMEYG',
+    })
+    assert act_res.status_code == 200, act_res.text
+    act_body = act_res.json()
+    assert act_body['success'] is True
+    assert act_body['is_gold'] is True
+    assert act_body['gold_features']['max_video_duration_seconds'] == 60
+
+    # Customize widget frame and gradient caption
+    cust_res = http.post('/api/gold/customize', json={
+        'username': 'vt.l',
+        'frame_id': 'frame_sukuna',
+        'caption_text': 'Siêu cấp bá khí',
+        'caption_icon': '🔥',
+        'caption_colors': ['#F12711', '#F5AF19'],
+        'caption_text_color': '#FFFFFF',
+    })
+    assert cust_res.status_code == 200, cust_res.text
+    cust_body = cust_res.json()
+    assert cust_body['widget_frame']['frame_id'] == 'frame_sukuna'
+    assert cust_body['caption_style']['text'] == 'Siêu cấp bá khí'
+
+    # Check public Gold status
+    st_res = http.get('/api/gold/status?query=vt.l')
+    assert st_res.status_code == 200
+    st = st_res.json()
+    assert st['is_gold'] is True
+    assert st['widget_frame']['frame_id'] == 'frame_sukuna'
+    assert st['caption_style']['text'] == 'Siêu cấp bá khí'
+
+    # Check RevenueCat subscriber response includes widget_frame & caption_text in subscriber_attributes
+    sub_res = http.get(f'/v1/subscribers/{real_uid_28}', headers=service_headers)
+    assert sub_res.status_code == 200
+    sub_attrs = sub_res.json()['subscriber']['subscriber_attributes']
+    assert sub_attrs['widget_frame']['value'] == 'frame_sukuna'
+    assert sub_attrs['caption_text']['value'] == 'Siêu cấp bá khí'
+
+    # Admin invite CRUD
+    inv_create = http.post('/admin/invites', headers=admin_headers, json={
+        'code': 'VIP-2026',
+        'max_uses': 5,
+        'note': 'VIP Friends',
+    })
+    assert inv_create.status_code == 200
+    assert any(i['code'] == 'VIP-2026' for i in inv_create.json()['invites'])
+
+    inv_del = http.delete('/admin/invites/VIP-2026', headers=admin_headers)
+    assert inv_del.status_code == 200
+    assert not any(i['code'] == 'VIP-2026' for i in inv_del.json()['invites'])
+
+
+
 
 
 

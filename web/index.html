@@ -1838,6 +1838,46 @@
     .admin #labDetails input[type="checkbox"] { width: 22px; height: 22px; }
     .admin #labDetails input[type="number"] { width: 78px; }
     .admin #detailsMessage { overflow-wrap: anywhere; }
+    body.public main { max-width: 620px; }
+    .gold-tabs { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 0 0 18px; padding: 6px; border-radius: 16px; background: var(--field); border: 1px solid var(--line); }
+    @media (min-width: 520px) { .gold-tabs { grid-template-columns: repeat(4, 1fr); } }
+    .gold-tab-btn { min-height: 40px; padding: 8px 10px; border-radius: 11px; font-size: 12px; font-weight: 700; background: transparent; color: var(--muted); box-shadow: none; border: 1px solid transparent; }
+    .gold-tab-btn.is-active { background: var(--gold-gradient); color: #1c1c1e; box-shadow: 0 4px 12px rgba(255, 149, 0, .28); }
+    .gold-pkg-grid { display: grid; grid-template-columns: 1fr; gap: 12px; margin: 14px 0; text-align: left; }
+    .gold-pkg-card { padding: 16px; border-radius: 16px; border: 2px solid var(--line); background: var(--field); cursor: pointer; transition: border-color 140ms ease; }
+    .gold-pkg-card.is-selected { border-color: #ff9500; box-shadow: 0 6px 20px rgba(255, 149, 0, .15); }
+    .gold-pkg-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; margin-bottom: 6px; }
+    .gold-badge-pill { display: inline-block; padding: 3px 9px; border-radius: 999px; background: var(--gold-gradient); color: #1c1c1e; font-size: 11px; font-weight: 800; }
+    .gold-price-tag { font-size: 15px; font-weight: 800; color: #16a34a; }
+    .gold-status-card { text-align: left; padding: 14px; border-radius: 14px; border: 1px solid #ffbd36; background: var(--field); margin: 14px 0; font-size: 13px; line-height: 1.55; }
+    .widget-preview-box { width: 190px; height: 190px; margin: 12px auto; border-radius: 36px; position: relative; display: flex; flex-direction: column; align-items: center; justify-content: flex-end; padding: 16px; color: #fff; font-weight: 700; box-shadow: 0 14px 32px rgba(0,0,0,.22); overflow: hidden; background: linear-gradient(145deg, #1e293b, #0f172a); border: 5px solid #ffbd36; }
+    .frame-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 8px; margin: 12px 0; text-align: left; }
+    @media (min-width: 480px) { .frame-grid { grid-template-columns: repeat(4, 1fr); } }
+    .frame-item-btn { min-height: 54px; padding: 8px; border-radius: 12px; font-size: 12px; font-weight: 700; flex-direction: column; gap: 3px; background: var(--field); color: var(--text); border: 2px solid var(--line); box-shadow: none; }
+    .frame-item-btn.is-selected { border-color: #ff9500; }
+    .caption-preview-stage { padding: 24px 14px; border-radius: 18px; background: linear-gradient(145deg, #0f172a, #1e293b); margin: 12px 0; display: flex; align-items: center; justify-content: center; border: 1px solid var(--line); }
+    .locket-pill-preview { display: inline-flex; align-items: center; gap: 7px; padding: 9px 18px; border-radius: 999px; font-size: 14px; font-weight: 800; max-width: 92%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; box-shadow: 0 8px 22px rgba(0,0,0,.35); }
+    .palette-grid { display: grid; grid-template-columns: repeat(8, 1fr); gap: 6px; margin: 10px 0 14px; }
+    .palette-swatch { min-height: 32px; height: 32px; padding: 0; border-radius: 9px; border: 2px solid transparent; box-shadow: none; }
+    .palette-swatch.is-selected { border-color: var(--text); transform: scale(1.06); }
+    .trend-chip-row { display: flex; flex-wrap: wrap; gap: 6px; margin: 10px 0 14px; }
+    .trend-chip { width: auto; min-height: 32px; padding: 5px 11px; border-radius: 999px; font-size: 12px; font-weight: 600; background: var(--field); color: var(--text); border: 1px solid var(--line); box-shadow: none; }
+    .pal-0, .frame-theme-0 { background: linear-gradient(135deg, #FFE066, #D97706); color: #1c1c1e; border-color: #FFE066; }
+    .pal-1, .frame-theme-4 { background: linear-gradient(135deg, #8A2387, #E94057); color: #ffffff; border-color: #E94057; }
+    .pal-2 { background: linear-gradient(135deg, #00C0FF, #42E695); color: #ffffff; }
+    .pal-3, .frame-theme-2 { background: linear-gradient(135deg, #FF758C, #FF7EB3); color: #ffffff; border-color: #FF758C; }
+    .pal-4, .frame-theme-7 { background: linear-gradient(135deg, #11998E, #38EF7D); color: #ffffff; border-color: #38EF7D; }
+    .pal-5, .frame-theme-6 { background: linear-gradient(135deg, #8E2DE2, #4A00E0); color: #ffffff; border-color: #8E2DE2; }
+    .pal-6 { background: linear-gradient(135deg, #232526, #414345); color: #ffffff; }
+    .pal-7 { background: linear-gradient(135deg, #00F260, #0575E6); color: #ffffff; }
+    .pal-8, .frame-theme-5 { background: linear-gradient(135deg, #FA709A, #FEE140); color: #1c1c1e; border-color: #FA709A; }
+    .pal-9 { background: linear-gradient(135deg, #0F2027, #2C5364); color: #ffffff; }
+    .pal-10 { background: linear-gradient(135deg, #D4FC79, #96E6A1); color: #1c1c1e; }
+    .pal-11, .frame-theme-1 { background: linear-gradient(135deg, #ED213A, #93291E); color: #ffffff; border-color: #ED213A; }
+    .pal-12 { background: linear-gradient(135deg, #667EEA, #764BA2); color: #ffffff; }
+    .pal-13 { background: linear-gradient(135deg, #F7971E, #FFD200); color: #1c1c1e; }
+    .pal-14 { background: linear-gradient(135deg, #00F0FF, #0072FF); color: #ffffff; }
+    .pal-15, .frame-theme-3 { background: linear-gradient(135deg, #F857A6, #FF5858); color: #ffffff; border-color: #F857A6; }
   </style>
 </head>
 
@@ -1854,26 +1894,92 @@
       </div>
 
       <h1 id="title">Locket Gold Premium</h1>
-      <p>Cấu hình DNS được cung cấp bởi nhà phát triển <a href="https://vuthanhluan.bond">vuthanhluan.bond</a>, dành cho
+      <p>Hệ thống Locket Gold &amp; Studio Custom được cung cấp bởi <a href="https://vuthanhluan.bond">vuthanhluan.bond</a>, dành cho
         trải nghiệm chia sẻ khoảnh khắc trên Locket.</p>
 
-      <div class="features-list">
-        <div><span aria-hidden="true">↗</span> Đăng ảnh và chia sẻ với bạn bè</div>
-        <div><span aria-hidden="true">▷</span> Quay và đăng video khoảnh khắc</div>
-        <div><span aria-hidden="true">◷</span> Xem lại lịch sử ảnh và video</div>
-        <div><span aria-hidden="true">♡</span> Nhận khoảnh khắc trên widget</div>
-      </div>
-      <p class="note">Các tính năng phụ thuộc phiên bản ứng dụng và quyền tài khoản đang sử dụng.</p>
+      <nav class="gold-tabs" aria-label="Chức năng Locket Gold">
+        <button type="button" class="gold-tab-btn is-active" data-gold-tab="lookup">🔍 Tra Cứu &amp; DNS</button>
+        <button type="button" class="gold-tab-btn" data-gold-tab="activate">👑 Nâng Cấp Gold</button>
+        <button type="button" class="gold-tab-btn" data-gold-tab="frames">🖼️ Khung Viền</button>
+        <button type="button" class="gold-tab-btn" data-gold-tab="caption">🎨 Caption Màu</button>
+      </nav>
 
-      <form id="lookupForm">
-        <label for="locketAccount">Username hoặc link Locket</label>
-        <input id="locketAccount" type="text" placeholder="username hoặc https://locket.cam/username"
-          autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="512"
-          aria-describedby="lookupHelp lookupMessage">
-        <p id="lookupHelp" class="note">Nhập tài khoản đã được nhà phát triển thêm để nhận link cấu hình.</p>
-        <button id="lookupBtn" type="submit">Tìm tài khoản</button>
-      </form>
-      <p id="lookupMessage" class="status" role="status" aria-live="polite"></p>
+      <div id="goldTabLookup">
+        <div class="features-list">
+          <div><span aria-hidden="true">🎬</span> Quay &amp; đăng video khoảnh khắc dài tới 60 giây</div>
+          <div><span aria-hidden="true">👑</span> Huy hiệu Locket Gold &amp; Mở khóa gói Pro (Gold + Pro)</div>
+          <div><span aria-hidden="true">🖼️</span> Đổi khung viền Widget &amp; Studio Caption màu Gradient</div>
+          <div><span aria-hidden="true">🔒</span> Đăng khoảnh khắc riêng tư &amp; Mở khóa toàn bộ bộ lọc, hiệu ứng</div>
+        </div>
+        <p class="note">Nhập username Locket để kiểm tra trạng thái Gold hoặc tải cấu hình DNS + Root CA cho iPhone.</p>
+
+        <form id="lookupForm">
+          <label for="locketAccount">Username hoặc link Locket</label>
+          <input id="locketAccount" type="text" placeholder="username hoặc https://locket.cam/username"
+            autocomplete="off" autocapitalize="none" spellcheck="false" required maxlength="512"
+            aria-describedby="lookupHelp lookupMessage">
+          <p id="lookupHelp" class="note">Nhập tài khoản đã kích hoạt để kiểm tra quyền lợi Gold &amp; nhận link cấu hình.</p>
+          <button id="lookupBtn" type="submit" class="button gold-btn">Tìm tài khoản &amp; Tải cấu hình</button>
+        </form>
+        <div id="publicGoldStatusCard" class="gold-status-card" hidden></div>
+        <p id="lookupMessage" class="status" role="status" aria-live="polite"></p>
+      </div>
+
+      <div id="goldTabActivate" hidden>
+        <div class="gold-pkg-grid" id="goldPackageList"></div>
+        <form id="goldActivateForm">
+          <label for="activateUsername">Username Locket cần nâng cấp Gold</label>
+          <input id="activateUsername" type="text" placeholder="vd: vt.l hoặc https://locket.cam/vt.l" required maxlength="256" autocomplete="off">
+          <label for="activateInviteCode">Mã mời bạn bè (Invite Code · Mặc định: COC-CON6EMEYG)</label>
+          <input id="activateInviteCode" type="text" value="COC-CON6EMEYG" placeholder="Nhập mã mời từ Admin (VD: COC-CON6EMEYG)" required maxlength="64" autocomplete="off">
+          <button id="activateGoldBtn" type="submit" class="button gold-btn">👑 Kích Hoạt Locket Gold Miễn Phí</button>
+        </form>
+        <p id="activateGoldMessage" class="status" role="status" aria-live="polite"></p>
+      </div>
+
+      <div id="goldTabFrames" hidden>
+        <p class="note">Chọn mẫu khung viền Widget Locket yêu thích và gắn trực tiếp cho tài khoản Gold của bạn.</p>
+        <div id="widgetPreviewBox" class="widget-preview-box frame-theme-0">
+          <span id="widgetPreviewBadge" class="gold-badge-pill">VIP Gold</span>
+          <div id="widgetPreviewTitle">Hoàng Gia Gold</div>
+        </div>
+        <div id="goldFramesGrid" class="frame-grid"></div>
+        <form id="goldFrameForm">
+          <label for="frameUsername">Username Locket đã kích hoạt Gold</label>
+          <input id="frameUsername" type="text" placeholder="vd: vt.l" required maxlength="256" autocomplete="off">
+          <button id="applyFrameBtn" type="submit" class="button gold-btn">🖼️ Áp Dụng Khung Viền Này</button>
+        </form>
+        <p id="frameApplyMessage" class="status" role="status" aria-live="polite"></p>
+      </div>
+
+      <div id="goldTabCaption" hidden>
+        <p class="note">Tùy chỉnh nội dung chữ, Emoji và 16 bảng màu Gradient cho Locket Gold Studio.</p>
+        <div class="caption-preview-stage">
+          <div id="captionPillPreview" class="locket-pill-preview pal-0">
+            <span id="captionPillIcon">👑</span>
+            <span id="captionPillText">Đẹp trai có gì sai</span>
+          </div>
+        </div>
+        <div id="captionPaletteGrid" class="palette-grid" aria-label="Bảng màu Gradient"></div>
+        <div id="captionTrendingRow" class="trend-chip-row" aria-label="Cụm từ Hot Trend"></div>
+        <form id="goldCaptionForm">
+          <div class="row">
+            <div class="field">
+              <label for="captionEmojiInput">Emoji</label>
+              <input id="captionEmojiInput" type="text" value="👑" maxlength="4">
+            </div>
+            <div class="field">
+              <label for="captionTextInput">Nội dung Caption (tối đa 80 ký tự)</label>
+              <input id="captionTextInput" type="text" value="Đẹp trai có gì sai" maxlength="80" required>
+            </div>
+          </div>
+          <label for="captionUsername">Username Locket đã kích hoạt Gold</label>
+          <input id="captionUsername" type="text" placeholder="vd: vt.l" required maxlength="256" autocomplete="off">
+          <button id="applyCaptionBtn" type="submit" class="button gold-btn">🎨 Lưu Caption Màu Cho Tài Khoản</button>
+        </form>
+        <p id="captionApplyMessage" class="status" role="status" aria-live="polite"></p>
+      </div>
+
       <dialog id="lookupDialog" class="lookup-dialog" aria-labelledby="lookupTitle" aria-describedby="lookupDescription">
         <h2 id="lookupTitle">Kết quả tìm kiếm</h2>
         <p id="lookupDescription"></p>
@@ -2000,9 +2106,28 @@
               if (installScopedLabBtn) installScopedLabBtn.href = scopedLabDownloadHref;
               if (installCaCertBtn) installCaCertBtn.href = '/api/lab/ca.cer?format=der';
               await refreshPublicCaState();
+              try {
+                const stRes = await fetch('/api/gold/status?query=' + encodeURIComponent(accountInput.value.trim()), {
+                  cache: 'no-store', credentials: 'omit'
+                });
+                if (stRes.ok) {
+                  const st = await stRes.json();
+                  const card = document.getElementById('publicGoldStatusCard');
+                  if (card) {
+                    card.hidden = false;
+                    const expStr = st.expires_date ? new Date(st.expires_date).toLocaleDateString('vi-VN') : 'Chưa cấp';
+                    const wfStr = st.widget_frame && st.widget_frame.name ? st.widget_frame.name : 'Mặc định';
+                    const csStr = st.caption_style && st.caption_style.text ? ((st.caption_style.icon || '') + ' ' + st.caption_style.text) : 'Mặc định';
+                    const dur = (st.gold_features && st.gold_features.max_video_duration_seconds) || 60;
+                    card.textContent = '👑 Tài khoản @' + (st.username || accountInput.value.trim()) +
+                      ' · Trạng thái: ' + (st.is_gold ? 'ĐÃ KÍCH HOẠT GOLD (ACTIVE)' : String(st.status || '').toUpperCase()) +
+                      ' · Hạn: ' + expStr + ' · Quay Video: ' + dur + 's · Khung Widget: ' + wfStr + ' · Caption: ' + csStr;
+                  }
+                }
+              } catch { }
               showLookupResult('Đã tìm thấy tài khoản', 'Tài khoản của bạn đã có trong hệ thống. Chọn cấu hình Root CA + DNS (khuyên dùng) hoặc chỉ DNS bên dưới.');
             } else {
-              showLookupResult('Không tìm thấy tài khoản', 'Tài khoản của bạn hiện chưa có trong hệ thống. Vui lòng liên hệ với nhà phát triển vuthanhluan.bond để được thêm tài khoản.');
+              showLookupResult('Không tìm thấy tài khoản', 'Tài khoản của bạn hiện chưa có trong hệ thống. Bạn có thể chuyển sang tab "👑 Nâng Cấp Gold" để kích hoạt miễn phí bằng Mã mời!');
             }
           } catch (error) {
             if (version === lookupVersion) showLookupResult('Không thể tìm kiếm', error.message);
@@ -2010,6 +2135,283 @@
             lookupButton.disabled = false;
           }
         });
+
+        // Interactive Locket Gold Free & Custom Studio Tabs
+        const tabMap = {
+          lookup: document.getElementById('goldTabLookup'),
+          activate: document.getElementById('goldTabActivate'),
+          frames: document.getElementById('goldTabFrames'),
+          caption: document.getElementById('goldTabCaption'),
+        };
+        document.querySelectorAll('[data-gold-tab]').forEach(btn => {
+          btn.addEventListener('click', () => {
+            const target = btn.getAttribute('data-gold-tab');
+            document.querySelectorAll('[data-gold-tab]').forEach(b => b.classList.toggle('is-active', b === btn));
+            Object.entries(tabMap).forEach(([k, el]) => { if (el) el.hidden = (k !== target); });
+          });
+        });
+
+        let selectedPkgCode = 'LIFETIME';
+        let selectedFrameId = 'frame_royal_gold';
+        let selectedPaletteIdx = 0;
+        let catalogData = {
+          packages: [
+            { code: 'LIFETIME', name: 'Gói Locket Gold Vĩnh Viễn', badge: 'VIP Trọn Đời', duration_days: 3650, features: ['Quay & đăng video dài 60 giây', 'Mở khóa toàn bộ nhãn dán & bộ lọc', 'Đổi khung viền widget & Caption màu'] },
+            { code: '1_YEAR', name: 'Gói Locket Gold 1 Năm', badge: 'Ưu đãi lớn', duration_days: 365, features: ['Quay & đăng video dài 60 giây', 'Tùy biến khung viền & Caption màu', 'Bảo hành 365 ngày'] },
+            { code: '1_MONTH', name: 'Gói Locket Gold 1 Tháng', badge: 'Tiết kiệm', duration_days: 30, features: ['Quay & đăng video dài 60 giây', 'Mở khóa nhãn dán & khung viền'] },
+          ],
+          frames: [
+            { frame_id: 'frame_royal_gold', name: 'Hoàng Gia Gold', badge: 'VIP Gold' },
+            { frame_id: 'frame_sukuna', name: 'Sukuna Domain', badge: 'Anime Hot' },
+            { frame_id: 'frame_nezuko', name: 'Nezuko Pink', badge: 'Cute' },
+            { frame_id: 'frame_hello_kitty', name: 'Hello Kitty Kawaii', badge: 'Kawaii' },
+            { frame_id: 'frame_cyberpunk', name: 'Cyberpunk Neon', badge: 'Cyber' },
+            { frame_id: 'frame_rose_luxury', name: 'Rosé Luxury', badge: 'Luxury' },
+            { frame_id: 'frame_20_10', name: 'Lễ Hội 20/10', badge: 'Lễ Hội' },
+            { frame_id: 'frame_shin', name: 'Shin Bút Chì', badge: 'Fun' },
+          ],
+          caption_palettes: [
+            { name: 'Hoàng Gia Gold', colors: ['#FFE066', '#D97706'], text_color: '#1C1C1E' },
+            { name: 'Cyberpunk', colors: ['#8A2387', '#E94057'], text_color: '#FFFFFF' },
+            { name: 'Đại Dương Xanh', colors: ['#00C0FF', '#42E695'], text_color: '#FFFFFF' },
+            { name: 'Rosé Luxury', colors: ['#FF758C', '#FF7EB3'], text_color: '#FFFFFF' },
+            { name: 'Ngọc Lục Bảo', colors: ['#11998E', '#38EF7D'], text_color: '#FFFFFF' },
+            { name: 'Tím Quyền Lực', colors: ['#8E2DE2', '#4A00E0'], text_color: '#FFFFFF' },
+            { name: 'Đen Nhám', colors: ['#232526', '#414345'], text_color: '#FFFFFF' },
+            { name: 'Cực Quang', colors: ['#00F260', '#0575E6'], text_color: '#FFFFFF' },
+            { name: 'Hoàng Hôn Hồng', colors: ['#FA709A', '#FEE140'], text_color: '#1C1C1E' },
+            { name: 'Midnight Blue', colors: ['#0F2027', '#2C5364'], text_color: '#FFFFFF' },
+            { name: 'Candy Mint', colors: ['#D4FC79', '#96E6A1'], text_color: '#1C1C1E' },
+            { name: 'Vampire Red', colors: ['#ED213A', '#93291E'], text_color: '#FFFFFF' },
+            { name: 'Lavender Dream', colors: ['#667EEA', '#764BA2'], text_color: '#FFFFFF' },
+            { name: 'Citrus Fresh', colors: ['#F7971E', '#FFD200'], text_color: '#1C1C1E' },
+            { name: 'Neon Cyan', colors: ['#00F0FF', '#0072FF'], text_color: '#FFFFFF' },
+            { name: 'Cherry Blossom', colors: ['#F857A6', '#FF5858'], text_color: '#FFFFFF' },
+          ],
+          trending_captions: [
+            { text: 'Siêu cấp bá khí', icon: '🔥', palIdx: 11 },
+            { text: 'Đẹp trai có gì sai', icon: '👑', palIdx: 0 },
+            { text: 'Oách xà lách', icon: '✨', palIdx: 4 },
+            { text: 'Ủa alo', icon: '📞', palIdx: 12 },
+            { text: 'Yeuu Emm', icon: '💖', palIdx: 3 },
+            { text: 'Deadline dí tụt quần', icon: '🔥', palIdx: 1 },
+          ],
+        };
+
+        function renderGoldCatalog() {
+          const pkgList = document.getElementById('goldPackageList');
+          if (pkgList) {
+            pkgList.replaceChildren();
+            (catalogData.packages || []).forEach(pkg => {
+              const card = document.createElement('div');
+              card.className = 'gold-pkg-card' + (pkg.code === selectedPkgCode ? ' is-selected' : '');
+              const head = document.createElement('div');
+              head.className = 'gold-pkg-head';
+              const badge = document.createElement('span');
+              badge.className = 'gold-badge-pill';
+              badge.textContent = pkg.badge || 'GOLD';
+              const price = document.createElement('span');
+              price.className = 'gold-price-tag';
+              price.textContent = '0đ · Miễn phí';
+              head.append(badge, price);
+              const title = document.createElement('strong');
+              title.textContent = pkg.name;
+              const desc = document.createElement('p');
+              desc.className = 'note';
+              desc.textContent = (pkg.features || []).join(' • ');
+              card.append(head, title, desc);
+              card.addEventListener('click', () => {
+                selectedPkgCode = pkg.code;
+                renderGoldCatalog();
+              });
+              pkgList.append(card);
+            });
+          }
+
+          const framesGrid = document.getElementById('goldFramesGrid');
+          if (framesGrid) {
+            framesGrid.replaceChildren();
+            (catalogData.frames || []).forEach((fr, idx) => {
+              const btn = document.createElement('button');
+              btn.type = 'button';
+              btn.className = 'frame-item-btn' + (fr.frame_id === selectedFrameId ? ' is-selected' : '');
+              const b = document.createElement('span');
+              b.className = 'gold-badge-pill';
+              b.textContent = fr.badge || 'Gold';
+              const n = document.createElement('span');
+              n.textContent = fr.name;
+              btn.append(b, n);
+              btn.addEventListener('click', () => {
+                selectedFrameId = fr.frame_id;
+                const box = document.getElementById('widgetPreviewBox');
+                const bEl = document.getElementById('widgetPreviewBadge');
+                const tEl = document.getElementById('widgetPreviewTitle');
+                if (box) box.className = 'widget-preview-box frame-theme-' + (idx % 8);
+                if (bEl) bEl.textContent = fr.badge || 'VIP Gold';
+                if (tEl) tEl.textContent = fr.name;
+                renderGoldCatalog();
+              });
+              framesGrid.append(btn);
+            });
+          }
+
+          const palGrid = document.getElementById('captionPaletteGrid');
+          if (palGrid) {
+            palGrid.replaceChildren();
+            (catalogData.caption_palettes || []).forEach((pal, idx) => {
+              const sw = document.createElement('button');
+              sw.type = 'button';
+              sw.title = pal.name;
+              sw.className = 'palette-swatch pal-' + (idx % 16) + (idx === selectedPaletteIdx ? ' is-selected' : '');
+              sw.addEventListener('click', () => {
+                selectedPaletteIdx = idx;
+                const pill = document.getElementById('captionPillPreview');
+                if (pill) pill.className = 'locket-pill-preview pal-' + (idx % 16);
+                renderGoldCatalog();
+              });
+              palGrid.append(sw);
+            });
+          }
+
+          const trendRow = document.getElementById('captionTrendingRow');
+          if (trendRow && trendRow.childElementCount === 0) {
+            (catalogData.trending_captions || []).forEach((tr, idx) => {
+              const chip = document.createElement('button');
+              chip.type = 'button';
+              chip.className = 'trend-chip';
+              chip.textContent = (tr.icon || '✨') + ' ' + tr.text;
+              chip.addEventListener('click', () => {
+                const emIn = document.getElementById('captionEmojiInput');
+                const txIn = document.getElementById('captionTextInput');
+                const pIcon = document.getElementById('captionPillIcon');
+                const pText = document.getElementById('captionPillText');
+                if (emIn) emIn.value = tr.icon || '✨';
+                if (txIn) txIn.value = tr.text;
+                if (pIcon) pIcon.textContent = tr.icon || '✨';
+                if (pText) pText.textContent = tr.text;
+                selectedPaletteIdx = (typeof tr.palIdx === 'number' ? tr.palIdx : idx) % 16;
+                const pill = document.getElementById('captionPillPreview');
+                if (pill) pill.className = 'locket-pill-preview pal-' + selectedPaletteIdx;
+                renderGoldCatalog();
+              });
+              trendRow.append(chip);
+            });
+          }
+        }
+        renderGoldCatalog();
+        fetch('/api/gold/catalog', { cache: 'no-store', credentials: 'omit' })
+          .then(r => r.ok ? r.json() : null)
+          .then(d => { if (d && d.packages) { catalogData = { ...catalogData, ...d }; renderGoldCatalog(); } })
+          .catch(() => { });
+
+        const capEmojiIn = document.getElementById('captionEmojiInput');
+        const capTextIn = document.getElementById('captionTextInput');
+        if (capEmojiIn) capEmojiIn.addEventListener('input', () => {
+          const el = document.getElementById('captionPillIcon');
+          if (el) el.textContent = capEmojiIn.value;
+        });
+        if (capTextIn) capTextIn.addEventListener('input', () => {
+          const el = document.getElementById('captionPillText');
+          if (el) el.textContent = capTextIn.value || 'Caption Gold';
+        });
+
+        const activateForm = document.getElementById('goldActivateForm');
+        if (activateForm) {
+          activateForm.addEventListener('submit', async ev => {
+            ev.preventDefault();
+            const btn = document.getElementById('activateGoldBtn');
+            const msg = document.getElementById('activateGoldMessage');
+            const uname = document.getElementById('activateUsername').value.trim();
+            const invCode = document.getElementById('activateInviteCode').value.trim();
+            btn.disabled = true;
+            msg.textContent = 'Đang lấy Firebase UID & kích hoạt gói Locket Gold...';
+            try {
+              const res = await fetch('/api/gold/activate', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: uname, package_code: selectedPkgCode, invite_code: invCode }),
+              });
+              const data = await res.json();
+              if (!res.ok) throw Error(data.detail || 'Không thể kích hoạt gói Gold.');
+              msg.textContent = data.message || 'Kích hoạt thành công!';
+              accountInput.value = data.username || uname;
+              const frameU = document.getElementById('frameUsername');
+              const capU = document.getElementById('captionUsername');
+              if (frameU && !frameU.value) frameU.value = data.username || uname;
+              if (capU && !capU.value) capU.value = data.username || uname;
+              downloadResult.hidden = false;
+              installBtn.href = profileDownloadHref;
+              if (installLabCaBtn) installLabCaBtn.href = labCaDownloadHref;
+              if (installScopedLabBtn) installScopedLabBtn.href = scopedLabDownloadHref;
+              if (installCaCertBtn) installCaCertBtn.href = '/api/lab/ca.cer?format=der';
+              await refreshPublicCaState();
+              showLookupResult('👑 Kích hoạt Locket Gold thành công!', data.message + ' Hãy tải cấu hình Root CA + DNS bên dưới để cài lên iPhone.');
+            } catch (e) {
+              msg.textContent = 'Lỗi: ' + e.message;
+            } finally {
+              btn.disabled = false;
+            }
+          });
+        }
+
+        const frameForm = document.getElementById('goldFrameForm');
+        if (frameForm) {
+          frameForm.addEventListener('submit', async ev => {
+            ev.preventDefault();
+            const btn = document.getElementById('applyFrameBtn');
+            const msg = document.getElementById('frameApplyMessage');
+            const uname = document.getElementById('frameUsername').value.trim();
+            btn.disabled = true;
+            msg.textContent = 'Đang đồng bộ khung viền Widget...';
+            try {
+              const res = await fetch('/api/gold/customize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username: uname, frame_id: selectedFrameId }),
+              });
+              const data = await res.json();
+              if (!res.ok) throw Error(data.detail || 'Không thể áp dụng khung viền.');
+              msg.textContent = '✓ ' + (data.message || 'Đã áp dụng khung viền thành công!');
+            } catch (e) {
+              msg.textContent = 'Lỗi: ' + e.message;
+            } finally {
+              btn.disabled = false;
+            }
+          });
+        }
+
+        const captionForm = document.getElementById('goldCaptionForm');
+        if (captionForm) {
+          captionForm.addEventListener('submit', async ev => {
+            ev.preventDefault();
+            const btn = document.getElementById('applyCaptionBtn');
+            const msg = document.getElementById('captionApplyMessage');
+            const uname = document.getElementById('captionUsername').value.trim();
+            const pal = (catalogData.caption_palettes || [])[selectedPaletteIdx] || { colors: ['#FFE066', '#D97706'], text_color: '#1C1C1E' };
+            btn.disabled = true;
+            msg.textContent = 'Đang lưu cấu hình Caption màu...';
+            try {
+              const res = await fetch('/api/gold/customize', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                  username: uname,
+                  caption_text: document.getElementById('captionTextInput').value.trim(),
+                  caption_icon: document.getElementById('captionEmojiInput').value.trim(),
+                  caption_colors: pal.colors,
+                  caption_text_color: pal.text_color || '#FFFFFF',
+                }),
+              });
+              const data = await res.json();
+              if (!res.ok) throw Error(data.detail || 'Không thể lưu Caption màu.');
+              msg.textContent = '✓ ' + (data.message || 'Đã lưu Caption màu thành công!');
+            } catch (e) {
+              msg.textContent = 'Lỗi: ' + e.message;
+            } finally {
+              btn.disabled = false;
+            }
+          });
+        }
       </script>
     </section>
     <!-- PUBLIC_END -->
@@ -2178,6 +2580,7 @@
             </div>
             <div class="row">
               <input id="accountSearch" type="search" placeholder="Search username or UID…" maxlength="128" aria-label="Search accounts">
+              <button class="secondary" id="openInvitesPanel" type="button">Invite Codes (Mã Mời)</button>
               <button class="secondary" id="openPkiStatus" type="button">Root CA &amp; Mobileconfig</button>
               <button class="secondary" id="openSystemHealth" type="button">Health &amp; Audit Logs</button>
               <button id="addAccount" type="button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">
@@ -2681,6 +3084,49 @@
             panel.append(item);
           }
         }
+        async function showInvitesPanel() {
+          const data = await api('/admin/invites');
+          const panel = detailPanel('INVITE CODES MANAGEMENT (MÃ MỜI KÍCH HOẠT GOLD)');
+          const createRow = document.createElement('div');
+          createRow.className = 'row';
+          createRow.append(
+            actionButton('+ Tạo Mã Mời Mới', async () => {
+              const code = prompt('Nhập mã mời tùy chỉnh (để trống nếu muốn tạo mã COC-... ngẫu nhiên):', '');
+              if (code === null) return;
+              const maxStr = prompt('Số lượt kích hoạt tối đa:', '50');
+              if (maxStr === null) return;
+              const note = prompt('Ghi chú mã mời:', 'Mã mời bạn bè kích hoạt Locket Gold') || '';
+              await api('/admin/invites', {
+                method: 'POST',
+                body: JSON.stringify({ code: code.trim() || null, max_uses: Math.max(1, parseInt(maxStr, 10) || 10), note }),
+              });
+              await showInvitesPanel();
+              $('detailsMessage').textContent = 'Đã tạo mã mời mới thành công!';
+            })
+          );
+          panel.append(createRow);
+          for (const inv of (data.invites || [])) {
+            const card = document.createElement('div');
+            card.className = 'editor-panel';
+            const p = document.createElement('p');
+            const usedUsers = Array.isArray(inv.used_by) && inv.used_by.length ? ' · Đã dùng bởi: @' + inv.used_by.join(', @') : '';
+            p.textContent = 'Mã: ' + inv.code + ' · Lượt dùng: ' + (inv.used_count || 0) + '/' + (inv.max_uses || 1) +
+              (inv.note ? ' · ' + inv.note : '') + usedUsers;
+            card.append(p);
+            const act = document.createElement('div');
+            act.className = 'row';
+            act.append(
+              actionButton('Xóa mã ' + inv.code, async () => {
+                if (!confirm('Xóa mã mời ' + inv.code + '?')) return;
+                await api('/admin/invites/' + encodeURIComponent(inv.code), { method: 'DELETE' });
+                await showInvitesPanel();
+              })
+            );
+            card.append(act);
+            panel.append(card);
+          }
+        }
+        if ($('openInvitesPanel')) $('openInvitesPanel').onclick = () => showInvitesPanel().catch(e => { $('adminMessage').textContent = e.message; });
         if ($('openPkiStatus')) $('openPkiStatus').onclick = () => showPkiStatusPanel().catch(e => { $('adminMessage').textContent = e.message; });
         if ($('openSystemHealth')) $('openSystemHealth').onclick = () => showSystemHealthAndLogs().catch(e => { $('adminMessage').textContent = e.message; });
         if ($('accountSearch')) {
