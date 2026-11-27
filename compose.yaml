@@ -4,6 +4,8 @@ services:
     container_name: locket_lab_api
     env_file:
       - .env
+    environment:
+      - ALLOW_LAB_CA_PROFILE=${ALLOW_LAB_CA_PROFILE:-true}
     expose:
       - "8000"
     volumes:

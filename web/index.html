@@ -1358,10 +1358,33 @@
     }
 
     .admin #dashboard td button {
-      border-color: transparent;
-      background: transparent;
-      margin: 0 1px;
+      border-color: var(--line);
+      background: var(--field);
+      margin: 2px;
       border-radius: 10px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .admin #dashboard td button.gold-action-pill {
+      border-color: var(--gold);
+      color: var(--gold);
+    }
+
+    .admin .expiry-presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: -8px 0 16px;
+    }
+
+    .admin .expiry-presets button {
+      width: auto;
+      min-height: 34px;
+      padding: 6px 12px;
+      font-size: 12px;
+      border-radius: 8px;
     }
 
     .admin #dashboard td button:hover:not(:disabled) {
@@ -1695,6 +1718,44 @@
       width: 100%;
     }
 
+    .public-install-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin: 14px 0;
+    }
+
+    .public-ca-guide {
+      margin: 14px 0;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: var(--field);
+      font-size: 13px;
+      line-height: 1.55;
+      text-align: left;
+    }
+
+    .public-ca-guide ol {
+      margin: 8px 0 0;
+      padding-left: 18px;
+    }
+
+    .public-ca-guide li {
+      margin-bottom: 6px;
+    }
+
+    .public-ca-fp {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px dashed var(--line);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
     @media (max-height: 600px) {
       .card.public .logo-wrapper {
         width: 48px;
@@ -1818,10 +1879,30 @@
         <p id="lookupDescription"></p>
         <div id="downloadResult" hidden>
         <div class="features-list">
-          <strong>Không dùng chung link cho nhiều tài khoản.</strong>
-          <p class="note note-spacing">Nếu mất tài khoản hoặc thiết bị gặp vấn đề, nhà phát triển không chịu trách nhiệm.</p>
+          <strong>Quyền lợi Locket Gold đã kích hoạt cho tài khoản:</strong>
+          <div><span aria-hidden="true">👑</span> Huy hiệu Locket Gold &amp; Mở khóa gói Pro (Gold + Pro)</div>
+          <div><span aria-hidden="true">🎬</span> Quay &amp; đăng video khoảnh khắc dài tới 60 giây</div>
+          <div><span aria-hidden="true">🔒</span> Đăng khoảnh khắc riêng tư &amp; Mở khóa toàn bộ bộ lọc, hiệu ứng</div>
+          <p class="note note-spacing">Không dùng chung link cho nhiều tài khoản. Nếu mất tài khoản hoặc thiết bị gặp vấn đề, nhà phát triển không chịu trách nhiệm.</p>
         </div>
-        <a href="/profile.mobileconfig" id="installBtn" class="button gold-btn">Tải về cấu hình ngay</a>
+        <div id="publicLabCaGroup" class="public-install-stack">
+          <a href="/profile.mobileconfig?mode=lab_ca" id="installLabCaBtn" class="button gold-btn">Tải cấu hình Root CA + DNS (.mobileconfig)</a>
+          <a href="/profile.mobileconfig?mode=scoped_lab" id="installScopedLabBtn" class="button secondary">Tải cấu hình Root CA + Split-DNS (.mobileconfig)</a>
+          <a href="/api/lab/ca.cer?format=der" id="installCaCertBtn" class="button secondary">Tải riêng chứng chỉ Root CA (.cer)</a>
+        </div>
+        <div class="public-install-stack">
+          <a href="/profile.mobileconfig" id="installBtn" class="button secondary">Tải cấu hình chỉ DNS (Không kèm Root CA)</a>
+        </div>
+        <div id="publicCaGuide" class="public-ca-guide">
+          <strong>Hướng dẫn cài đặt Root CA + DNS trên iPhone:</strong>
+          <ol>
+            <li>Mở trang này bằng trình duyệt <strong>Safari</strong> trên iPhone, nhấn <strong>Tải cấu hình Root CA + DNS</strong> và chọn <strong>Cho phép (Allow)</strong>.</li>
+            <li>Mở <strong>Cài đặt (Settings)</strong> → <strong>Đã tải về hồ sơ (Profile Downloaded)</strong> → nhấn <strong>Cài đặt (Install)</strong> và nhập mật mã màn hình.</li>
+            <li>Vào <strong>Cài đặt</strong> → <strong>Cài đặt chung (General)</strong> → <strong>Giới thiệu (About)</strong> → kéo xuống cuối chọn <strong>Cài đặt tin cậy chứng nhận (Certificate Trust Settings)</strong> → gạt bật công tắc cho <strong>LocketGold Research Lab Root CA</strong> → chọn <strong>Tiếp tục</strong>.</li>
+            <li>Mở lại ứng dụng Locket để áp dụng cấu hình.</li>
+          </ol>
+          <div id="publicCaFingerprint" class="public-ca-fp">Root CA: LocketGold Research Lab Root CA (2 payloads: com.apple.security.root + com.apple.dnsSettings.managed)</div>
+        </div>
         <p class="note note-spacing">Lưu ý: Bắt buộc mở bằng trình duyệt Safari trên iPhone để cài đặt chính xác.</p>
         </div>
         <form method="dialog">
@@ -1841,10 +1922,44 @@
         const lookupTitle = document.getElementById('lookupTitle');
         const lookupDescription = document.getElementById('lookupDescription');
         const installBtn = document.getElementById('installBtn');
+        const installLabCaBtn = document.getElementById('installLabCaBtn');
+        const installScopedLabBtn = document.getElementById('installScopedLabBtn');
+        const installCaCertBtn = document.getElementById('installCaCertBtn');
+        const publicLabCaGroup = document.getElementById('publicLabCaGroup');
+        const publicCaGuide = document.getElementById('publicCaGuide');
+        const publicCaFingerprint = document.getElementById('publicCaFingerprint');
         const pageTicket = new URLSearchParams(window.location.search).get('ticket');
-        const profileDownloadHref = pageTicket && pageTicket.startsWith('lkg_dl_')
+        const hasValidTicket = Boolean(pageTicket && pageTicket.startsWith('lkg_dl_'));
+        const profileDownloadHref = hasValidTicket
           ? '/profile.mobileconfig?ticket=' + encodeURIComponent(pageTicket)
           : '/profile.mobileconfig';
+        const labCaDownloadHref = hasValidTicket
+          ? '/profile.mobileconfig?mode=lab_ca&ticket=' + encodeURIComponent(pageTicket)
+          : '/profile.mobileconfig?mode=lab_ca';
+        const scopedLabDownloadHref = hasValidTicket
+          ? '/profile.mobileconfig?mode=scoped_lab&ticket=' + encodeURIComponent(pageTicket)
+          : '/profile.mobileconfig?mode=scoped_lab';
+
+        async function refreshPublicCaState() {
+          try {
+            const hRes = await fetch('/api/health', { cache: 'no-store', credentials: 'omit' });
+            if (!hRes.ok) return;
+            const hData = await hRes.json();
+            const caLoaded = Boolean(hData && hData.root_ca_loaded);
+            if (publicLabCaGroup) publicLabCaGroup.hidden = !caLoaded;
+            if (publicCaGuide) publicCaGuide.hidden = !caLoaded;
+            if (installBtn) {
+              installBtn.className = caLoaded ? 'button secondary' : 'button gold-btn';
+              installBtn.textContent = caLoaded
+                ? 'Tải cấu hình chỉ DNS (Không kèm Root CA)'
+                : 'Tải về cấu hình ngay';
+            }
+            if (caLoaded && publicCaFingerprint && hData.root_ca_sha256) {
+              publicCaFingerprint.textContent = 'Root CA SHA-256: ' + hData.root_ca_sha256;
+            }
+          } catch { }
+        }
+        refreshPublicCaState();
         function showLookupResult(title, description) {
           lookupMessage.textContent = '';
           lookupTitle.textContent = title;
@@ -1881,7 +1996,11 @@
             downloadResult.hidden = result.exists !== true;
             if (result.exists === true) {
               installBtn.href = profileDownloadHref;
-              showLookupResult('Đã tìm thấy tài khoản', 'Tài khoản của bạn đã có trong hệ thống. Bạn có thể tải cấu hình bên dưới.');
+              if (installLabCaBtn) installLabCaBtn.href = labCaDownloadHref;
+              if (installScopedLabBtn) installScopedLabBtn.href = scopedLabDownloadHref;
+              if (installCaCertBtn) installCaCertBtn.href = '/api/lab/ca.cer?format=der';
+              await refreshPublicCaState();
+              showLookupResult('Đã tìm thấy tài khoản', 'Tài khoản của bạn đã có trong hệ thống. Chọn cấu hình Root CA + DNS (khuyên dùng) hoặc chỉ DNS bên dưới.');
             } else {
               showLookupResult('Không tìm thấy tài khoản', 'Tài khoản của bạn hiện chưa có trong hệ thống. Vui lòng liên hệ với nhà phát triển vuthanhluan.bond để được thêm tài khoản.');
             }
@@ -2024,8 +2143,15 @@
               <div class="field"><label for="accountId">Locket ID / Username</label><input id="accountId" required maxlength="256"
                   autocomplete="off" placeholder="username hoặc https://locket.cam/username"></div>
               <div class="field"><label for="expiry">Expires at · local time</label><input id="expiry"
-                  type="datetime-local" required></div>
+                  type="datetime-local" required>
+                <div class="expiry-presets">
+                  <button class="secondary" type="button" data-expiry-days="30">+30 Ngày (1 Tháng)</button>
+                  <button class="secondary" type="button" data-expiry-days="365">+365 Ngày (1 Năm)</button>
+                  <button class="secondary" type="button" data-expiry-days="3650">Vĩnh Viễn (10 Năm)</button>
+                </div>
+              </div>
             </div>
+            <p class="note">Khi bấm Save account, hệ thống tự động lấy Firebase UID 28 ký tự, cấp quyền Gold + Pro và bật sẵn Full tính năng Gold (Video 60s, Private Posts, Full Filters).</p>
             <p class="status" id="accountMessage" role="status" aria-live="polite"></p>
             <div class="dialog-actions">
               <button class="secondary" id="cancelAccount" type="button">Cancel</button>
@@ -2108,9 +2234,20 @@
         const key = 'locket_admin_session';
         const $ = id => document.getElementById(id);
         const accountDialog = $('accountDialog');
+        function setExpiryDaysFromNow(days) {
+          const target = new Date(Date.now() + days * 86400000);
+          target.setHours(23, 59, 0, 0);
+          $('expiry').value = new Date(target - target.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+        }
+        document.querySelectorAll('[data-expiry-days]').forEach(btn => {
+          btn.addEventListener('click', () => setExpiryDaysFromNow(Number(btn.dataset.expiryDays) || 365));
+        });
         function openAccountDialog(editing = false) {
           $('accountId').readOnly = editing;
-          if (!editing) $('accountForm').reset();
+          if (!editing) {
+            $('accountForm').reset();
+            setExpiryDaysFromNow(365);
+          }
           $('editorTitle').textContent = editing ? 'Edit / renew account' : 'Add account';
           $('accountMessage').textContent = '';
           accountDialog.showModal();
@@ -2274,7 +2411,8 @@
                 }
                 const deviceInfo = document.createElement('div'); deviceInfo.className = 'account-uid-meta';
                 deviceInfo.textContent = 'Device Count: ' + row.active_devices + '/' + row.max_devices +
-                  ' · Activated: ' + (row.activated_at ? new Date(row.activated_at).toLocaleString() : '—');
+                  ' · Activated: ' + (row.activated_at ? new Date(row.activated_at).toLocaleString() : '—') +
+                  (row.status === 'active' ? ' · Gold Features: Video 60s, Private Posts, All Filters (Active)' : '');
                 stack.append(name, uidMeta, verMeta, grantMeta, deviceInfo);
                 td.append(stack);
               } else {
@@ -2335,8 +2473,11 @@
             });
             revoke.disabled = row.status === 'revoked';
             edit.title = 'Edit / Renew';
-            actions.append(edit, check, activate, revoke, actionButton('Gold Features', () => features(row)),
-              actionButton('Devices', () => devices(row)), remove);
+            const featBtn = actionButton('Gold Features', () => features(row));
+            featBtn.classList.add('gold-action-pill');
+            const devBtn = actionButton('Devices', () => devices(row));
+            devBtn.classList.add('gold-action-pill');
+            actions.append(edit, check, activate, revoke, featBtn, devBtn, remove);
             tr.append(actions); body.append(tr);
           }
           if (!rows.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 5; td.textContent = 'No accounts yet.'; tr.append(td); body.append(tr); }

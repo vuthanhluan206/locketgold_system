@@ -14,6 +14,7 @@ from ..models import (
     AccountOutput,
     ActivateAccountInput,
     AdminAccountLookupOutput,
+    DEFAULT_ACTIVE_GOLD_FEATURES,
     DeviceCreateInput,
     DeviceOutput,
     LinkVerifyInput,
@@ -230,6 +231,7 @@ async def create_profile_ticket_from_device_bearer(
 
 
 @router.get('/profile.mobileconfig')
+@router.head('/profile.mobileconfig')
 async def download_profile(
     request: Request,
     mode: Literal['default', 'dns_only', 'lab_ca', 'scoped_lab'] = Query('default'),
@@ -271,13 +273,14 @@ async def download_profile(
                 raise HTTPException(401, 'Device token không hợp lệ hoặc đã bị thu hồi.')
             device_label = device_doc.get('device_id')
 
-    if settings.app_env == 'production' and eff_mode in {'lab_ca', 'scoped_lab'}:
+    is_prod_restricted = settings.app_env == 'production' and not getattr(settings, 'allow_lab_ca_profile', False)
+    if is_prod_restricted and eff_mode in {'lab_ca', 'scoped_lab'}:
         raise HTTPException(403, 'Lab CA profiles require a research environment')
     if eff_mode == 'default' and (settings.root_ca_path or settings.root_ca_pem):
         eff_mode = 'dns_only'
     if eff_mode != 'default' or device_label:
         try:
-            scoped = settings.lab_scoped_domains if eff_mode in {'scoped_lab', 'lab_ca'} else None
+            scoped = settings.lab_scoped_domains if eff_mode == 'scoped_lab' else None
             if eff_mode == 'dns_only':
                 s_copy = settings.model_copy(update={'root_ca_path': '', 'root_ca_pem': ''})
                 profile_bytes = build_profile(s_copy, scoped_domains=None, device_label=device_label)
@@ -336,6 +339,7 @@ async def download_profile(
 
 
 @router.get('/api/lab/ca.cer')
+@router.head('/api/lab/ca.cer')
 async def download_public_lab_root_ca(
     format: Literal['der', 'pem'] = Query('der'),
 ):
@@ -1127,6 +1131,11 @@ async def upsert_account(
         'revoked_at': legacy_doc['revoked_at'],
         'revoke_reason': ((existing_v2 or {}).get('revoke_reason') or 'Set to revoked on save') if effective_status == 'revoked' else None,
         'activated_at': ((existing_v2 or {}).get('activated_at') or now) if effective_status == 'active' else (existing_v2 or {}).get('activated_at'),
+        'lab_features': (
+            (existing_v2 or {}).get('lab_features') or dict(DEFAULT_ACTIVE_GOLD_FEATURES)
+            if effective_status == 'active'
+            else (existing_v2 or {}).get('lab_features', {})
+        ),
         'max_devices': data.max_devices if 'max_devices' in data.model_fields_set else (existing_v2 or {}).get('max_devices', data.max_devices),
         'notes': data.notes,
         'updated_at': now,
@@ -1478,6 +1487,7 @@ async def activate_account(
                         'status': 'active',
                         'grant_basis': grant_basis_val,
                         'result_code': 'GOLD_GRANTED',
+                        'lab_features': existing.get('lab_features') or dict(DEFAULT_ACTIVE_GOLD_FEATURES),
                         'activated_at': now,
                         'expires_date': new_expiry,
                         'revoked_at': None,
@@ -1731,7 +1741,7 @@ async def get_pki_status(request: Request):
             doh_url = resolve_doh_server_url(settings)
         except Exception:
             doh_url = None
-    is_prod = settings.app_env == 'production'
+    is_prod = settings.app_env == 'production' and not getattr(settings, 'allow_lab_ca_profile', False)
 
     try:
         cert = load_validated_root_ca(settings)

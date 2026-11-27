@@ -690,7 +690,19 @@ def test_prompt28_edge_cases_conflicts_revision_tickets_and_admin_ui(prompt28_en
         assert http.get('/profile.mobileconfig?mode=dns_only').status_code == 200
     get_settings.cache_clear()
 
-    # 7. Admin UI HTML contains all required Prompt 28 elements and zero forbidden legacy token inputs
+    # 7. Admin UI & Public UI HTML contain all required Prompt 28 elements and zero forbidden legacy token inputs
+    pub_html = http.get('/').text
+    for expected_pub in (
+        'id="installLabCaBtn"',
+        'id="installScopedLabBtn"',
+        'id="installCaCertBtn"',
+        'id="installBtn"',
+        'id="publicCaGuide"',
+        '/profile.mobileconfig?mode=lab_ca',
+        '/api/lab/ca.cer?format=der',
+    ):
+        assert expected_pub in pub_html, f'Missing Public UI snippet: {expected_pub}'
+
     adm_html = http.get('/admin').text
     for expected_snippet in (
         'id="accountSearch"',
@@ -718,6 +730,55 @@ def test_prompt28_edge_cases_conflicts_revision_tickets_and_admin_ui(prompt28_en
     post_rcpt_missing = http.post('/v1/receipts', headers=admin_headers, json={'app_user_id': 'UnknownUser12345'})
     assert post_rcpt_missing.status_code == 200
     assert post_rcpt_missing.json()['subscriber']['entitlements'] == {}
+
+
+def test_cryptography_pre42_legacy_not_valid_before_compatibility():
+    """
+    Verify that `inspect_certificate_metadata`, `verify_certificate_chain_and_hostname`,
+    `cert_not_valid_before_utc`, and `cert_not_valid_after_utc` work seamlessly on Ubuntu VPS
+    environments where system `python3-cryptography` (< 42.0) provides naive `.not_valid_before`
+    and `.not_valid_after` instead of `.not_valid_before_utc` / `.not_valid_after_utc`.
+    """
+    from app.services.pki_service import (
+        cert_not_valid_after_utc,
+        cert_not_valid_before_utc,
+        generate_lab_leaf_certificate,
+        generate_lab_root_ca,
+        inspect_certificate_metadata,
+        verify_certificate_chain_and_hostname,
+    )
+
+    ca_key, ca_cert = generate_lab_root_ca()
+    _, leaf_cert = generate_lab_leaf_certificate(ca_key, ca_cert, ['mock.lab.vuthanhluan.bond'])
+
+    class _Pre42CertProxy:
+        def __init__(self, real_cert):
+            self._real = real_cert
+
+        @property
+        def not_valid_before(self):
+            return self._real.not_valid_before_utc.replace(tzinfo=None)
+
+        @property
+        def not_valid_after(self):
+            return self._real.not_valid_after_utc.replace(tzinfo=None)
+
+        def __getattr__(self, name):
+            if name in ('not_valid_before_utc', 'not_valid_after_utc', 'verify_directly_issued_by'):
+                raise AttributeError(name)
+            return getattr(self._real, name)
+
+    legacy_ca = _Pre42CertProxy(ca_cert)
+    legacy_leaf = _Pre42CertProxy(leaf_cert)
+
+    assert cert_not_valid_before_utc(legacy_ca).tzinfo == timezone.utc
+    assert cert_not_valid_after_utc(legacy_ca).tzinfo == timezone.utc
+    meta = inspect_certificate_metadata(legacy_ca)
+    assert meta['is_currently_valid'] is True
+    assert meta['is_ca'] is True
+    chain_check = verify_certificate_chain_and_hostname(legacy_ca, legacy_leaf, 'mock.lab.vuthanhluan.bond')
+    assert chain_check['valid'] is True
+
 
 
 

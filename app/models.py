@@ -331,6 +331,16 @@ class LabGoldFeatures(BaseModel):
     unlocked_all_filters: bool = False
 
 
+DEFAULT_ACTIVE_GOLD_FEATURES: dict[str, int | bool] = {
+    'max_video_duration_seconds': 60,
+    'enable_private_posts': True,
+    'unlocked_filters': True,
+    'camera_filters_enabled': True,
+    'holiday_effects_enabled': True,
+    'unlocked_all_filters': True,
+}
+
+
 class DeviceCreateInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     locket_id: AccountId
@@ -406,28 +416,46 @@ def subscriber_response(account_id: str, account: dict | None, now: datetime | N
         'purchase_date': purchase_str,
     } if active else None
 
+    pro_entitlement = {
+        'expires_date': entitlement_expires,
+        'grace_period_expires_date': grace_str,
+        'product_identifier': 'locket_1600_1y',
+        'purchase_date': purchase_str,
+    } if active else None
+
+    sub_payload = {
+        'auto_resume_date': None,
+        'billing_issues_detected_at': None,
+        'expires_date': entitlement_expires,
+        'grace_period_expires_date': grace_str,
+        'is_sandbox': False,
+        'original_purchase_date': purchase_str,
+        'purchase_date': purchase_str,
+        'ownership_type': 'PURCHASED',
+        'period_type': 'normal',
+        'refunded_at': None,
+        'store': 'app_store',
+        'unsubscribe_detected_at': None,
+    } if active else None
+
     subscriptions = {
-        product_id: {
-            'expires_date': entitlement_expires,
-            'grace_period_expires_date': grace_str,
-            'is_sandbox': False,
-            'original_purchase_date': purchase_str,
-            'purchase_date': purchase_str,
-            'ownership_type': 'PURCHASED',
-            'store': 'app_store',
-        }
-    } if active else {}
+        product_id: sub_payload,
+        'locket_1600_1y': dict(sub_payload),
+    } if active and sub_payload else {}
 
     return {
         'request_date': now_str,
         'request_date_ms': int(now.timestamp() * 1000),
         'subscriber': {
             'original_app_user_id': account_id,
+            'original_application_version': '1.0',
             'non_subscriptions': {},
+            'other_purchases': {},
             'first_seen': now_str,
-            'entitlements': {'Gold': entitlement} if active else {},
+            'last_seen': now_str,
+            'entitlements': {'Gold': entitlement, 'pro': pro_entitlement} if active else {},
             'subscriptions': subscriptions,
-            'management_url': None,
+            'management_url': 'https://apps.apple.com/account/subscriptions' if active else None,
             'original_purchase_date': purchase_str,
         },
     }

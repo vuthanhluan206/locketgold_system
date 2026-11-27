@@ -16,6 +16,7 @@ from app.services.pki_service import (
     generate_lab_leaf_certificate,
     generate_lab_root_ca,
     inspect_certificate_metadata,
+    verify_cert_directly_issued_by,
 )
 
 FORBIDDEN_THIRD_PARTY_SAN_DOMAINS = {
@@ -95,7 +96,7 @@ def generate_ca_and_leaf_files(
                     'Refusing to overwrite without --rotate.'
                 )
             try:
-                loaded_cert.verify_directly_issued_by(loaded_cert)
+                verify_cert_directly_issued_by(loaded_cert, loaded_cert)
             except Exception as exc:
                 raise RuntimeError(
                     'Existing Root CA certificate self-signature verification failed. '
