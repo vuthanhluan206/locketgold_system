@@ -427,6 +427,10 @@ def _build_public_token_resolution(
             identity_lookup_at=now,
             uid_resolved_at=now,
             uid_resolution_source='locket_public_share_link',
+            uid_resolution_status='found',
+            uid_source='public_share_link',
+            uid_assurance='public_derived',
+            result_code='UID_FOUND',
             message=f'Đã trích xuất Firebase UID ({extracted_uid}) và lưu invite token từ trang công khai Locket.',
         )
     return IdentityResolutionOutput(
@@ -443,6 +447,10 @@ def _build_public_token_resolution(
         verification_source='locket_public_share_link',
         identity_lookup_source='public_share_link',
         identity_lookup_at=now,
+        uid_resolution_status='not_found',
+        uid_source='public_share_link',
+        uid_assurance='none',
+        result_code='UID_NOT_FOUND',
         message='Đã lấy invite token — chưa xác minh Firebase UID.',
     )
 
@@ -979,6 +987,10 @@ async def resolve_locket_identity(
                         input_kind=input_kind,
                         username=normalized_id,
                         source_link=pub_res.source_link or source_link,
+                        uid_resolution_status='conflict',
+                        uid_source='public_share_link',
+                        uid_assurance='none',
+                        result_code='UID_CONFLICT',
                         message='Firebase UID trả về khác với Firebase UID đã được xác minh trước đó của tài khoản này (conflict).',
                     )
                 uid_owner = await _find_in_accounts_v2(accounts_v2, {'firebase_uid': pub_res.firebase_uid})
@@ -994,6 +1006,10 @@ async def resolve_locket_identity(
                             input_kind=input_kind,
                             username=normalized_id,
                             source_link=pub_res.source_link or source_link,
+                            uid_resolution_status='conflict',
+                            uid_source='public_share_link',
+                            uid_assurance='none',
+                            result_code='UID_CONFLICT',
                             message=f'Firebase UID này đã được gắn với một tài khoản khác ("{owner_lid}") trong MongoDB (conflict).',
                         )
                 return pub_res
@@ -1014,6 +1030,10 @@ async def resolve_locket_identity(
                     identity_lookup_at=now,
                     uid_resolved_at=existing_doc.get('uid_resolved_at') or now,
                     uid_resolution_source=str(existing_doc.get('uid_resolution_source') or 'mongodb_verified_cache'),
+                    uid_resolution_status='found',
+                    uid_source='verified_cache',
+                    uid_assurance='independently_verified',
+                    result_code='UID_FOUND',
                     message=f'Đã giữ nguyên Firebase UID đã xác minh ({existing_verified_uid}) và cập nhật dữ liệu công khai.',
                 )
             return pub_res
@@ -1036,7 +1056,40 @@ async def resolve_locket_identity(
                 identity_lookup_at=now,
                 uid_resolved_at=existing_doc.get('uid_resolved_at') or now,
                 uid_resolution_source=str(existing_doc.get('uid_resolution_source') or 'mongodb_verified_cache'),
+                uid_resolution_status='found',
+                uid_source='verified_cache',
+                uid_assurance='independently_verified',
+                result_code='UID_FOUND',
                 message=f'Đã xác nhận Firebase UID đã xác minh trong hệ thống: {existing_verified_uid}.',
+            )
+        if (
+            isinstance(existing_doc, dict)
+            and is_valid_firebase_uid(existing_doc.get('firebase_uid'))
+            and existing_doc.get('verification_source') == 'locket_public_share_link'
+        ):
+            cached_pub_uid = str(existing_doc['firebase_uid']).strip()
+            cached_user = existing_doc.get('username') or (normalized_id if input_kind != 'firebase_uid' else None)
+            return IdentityResolutionOutput(
+                status='resolved_uid',
+                normalized_id=str(existing_doc.get('locket_id') or normalized_id),
+                input_kind=input_kind,
+                username=cached_user,
+                invite_token=existing_doc.get('invite_token'),
+                firebase_uid=cached_pub_uid,
+                source_link=source_link or existing_doc.get('source_link'),
+                uid_verified=False,
+                verification_status='unverified_uid',
+                verification_method='format_only_uid',
+                verification_source='locket_public_share_link',
+                identity_lookup_source='public_share_link',
+                identity_lookup_at=now,
+                uid_resolved_at=existing_doc.get('uid_resolved_at') or now,
+                uid_resolution_source='locket_public_share_link',
+                uid_resolution_status='found',
+                uid_source='public_share_link',
+                uid_assurance='public_derived',
+                result_code='UID_FOUND',
+                message=f'Đã giữ nguyên Firebase UID trích xuất từ link công khai ({cached_pub_uid}).',
             )
         return IdentityResolutionOutput(
             status='lookup_unavailable',
@@ -1045,6 +1098,10 @@ async def resolve_locket_identity(
             username=normalized_id if input_kind != 'firebase_uid' else None,
             source_link=source_link,
             identity_lookup_at=now,
+            uid_resolution_status='lookup_error',
+            uid_source='none',
+            uid_assurance='none',
+            result_code='UID_LOOKUP_ERROR',
             message='Không thể tra cứu Firebase UID: Nguồn tra cứu danh tính Locket chưa sẵn sàng (lookup_unavailable).',
         )
 
@@ -1170,5 +1227,9 @@ async def resolve_locket_identity(
         identity_lookup_at=now,
         uid_resolved_at=now,
         uid_resolution_source='getUserByUsername' if input_kind != 'firebase_uid' else 'fetchUserV2',
+        uid_resolution_status='found',
+        uid_source='verified_provider',
+        uid_assurance='independently_verified',
+        result_code='UID_FOUND',
         message=f'Đã tra cứu và xác minh thành công Firebase UID: {resolved_uid}.',
     )

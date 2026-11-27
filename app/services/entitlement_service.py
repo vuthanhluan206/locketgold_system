@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 import re
 from fastapi import HTTPException
 from ..models import (
+    _is_public_uid_grant_policy_enabled,
     compute_entitlement_status,
     normalize_expiry,
 )
@@ -157,6 +158,138 @@ def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, 
     )
 
 
+def extract_grant_eligibility_metadata(
+    record: dict | None,
+    *,
+    allow_public_uid_grant: bool | None = None,
+) -> dict:
+    """
+    Determine UID resolution status, UID source, UID assurance, and internal Gold grant basis:
+    - `independently_verified`: UID has server-verified proof (`_server_uid_proof == True`, `verification_status == 'verified_uid'`).
+    - `admin_authorized_public_uid`: 28-char UID extracted from public Locket share link (`locket_public_share_link`)
+      and authorized by Admin internal grant policy (`allow_admin_public_uid_grant`).
+      Never sets `_server_uid_proof = True` or `verification_status = 'verified_uid'` for public-derived UIDs.
+    """
+    if not isinstance(record, dict):
+        return {
+            'firebase_uid': None,
+            'uid_verified': False,
+            'verification_status': 'unverified_handle',
+            'verification_method': 'link_handle_only',
+            'verification_source': 'none',
+            'uid_resolution_status': 'not_found',
+            'uid_source': 'none',
+            'uid_assurance': 'none',
+            'grant_basis': None,
+            'can_grant_gold': False,
+            'grant_reason': 'Account not found',
+        }
+
+    fb_uid, uid_ver, ver_status, ver_method, ver_source = extract_verified_uid_metadata(record)
+    policy_enabled = (
+        _is_public_uid_grant_policy_enabled()
+        if allow_public_uid_grant is None
+        else bool(allow_public_uid_grant)
+    )
+
+    if uid_ver and fb_uid:
+        uid_src = (
+            'verified_cache'
+            if record.get('uid_resolution_source') == 'mongodb_verified_cache'
+            else 'verified_provider'
+        )
+        return {
+            'firebase_uid': fb_uid,
+            'uid_verified': True,
+            'verification_status': ver_status,
+            'verification_method': ver_method,
+            'verification_source': ver_source,
+            'uid_resolution_status': 'found',
+            'uid_source': uid_src,
+            'uid_assurance': 'independently_verified',
+            'grant_basis': 'independently_verified',
+            'can_grant_gold': True,
+            'grant_reason': 'Independently verified Firebase UID',
+        }
+
+    is_public_derived_uid = bool(
+        fb_uid
+        and FIREBASE_UID_RE.fullmatch(fb_uid)
+        and (
+            ver_source == 'locket_public_share_link'
+            or record.get('uid_resolution_source') == 'locket_public_share_link'
+            or record.get('uid_assurance') == 'public_derived'
+        )
+    )
+    if is_public_derived_uid:
+        stored_basis = record.get('grant_basis')
+        if policy_enabled and stored_basis == 'admin_authorized_public_uid':
+            return {
+                'firebase_uid': fb_uid,
+                'uid_verified': False,
+                'verification_status': ver_status,
+                'verification_method': ver_method,
+                'verification_source': ver_source,
+                'uid_resolution_status': 'found',
+                'uid_source': 'public_share_link',
+                'uid_assurance': 'public_derived',
+                'grant_basis': 'admin_authorized_public_uid',
+                'can_grant_gold': True,
+                'grant_reason': 'Admin authorized internal Gold grant for public-derived UID',
+            }
+        return {
+            'firebase_uid': fb_uid,
+            'uid_verified': False,
+            'verification_status': ver_status,
+            'verification_method': ver_method,
+            'verification_source': ver_source,
+            'uid_resolution_status': 'found',
+            'uid_source': 'public_share_link',
+            'uid_assurance': 'public_derived',
+            'grant_basis': None,
+            'can_grant_gold': False,
+            'grant_reason': (
+                'Admin public-UID grant policy disabled'
+                if not policy_enabled
+                else (record.get('grant_reason') or 'Public UID found — awaiting Admin grant authorization')
+            ),
+        }
+
+    if fb_uid and FIREBASE_UID_RE.fullmatch(fb_uid):
+        return {
+            'firebase_uid': fb_uid,
+            'uid_verified': False,
+            'verification_status': ver_status,
+            'verification_method': ver_method,
+            'verification_source': ver_source,
+            'uid_resolution_status': record.get('uid_resolution_status') or 'found',
+            'uid_source': 'admin_manual_input',
+            'uid_assurance': 'unverified_manual',
+            'grant_basis': None,
+            'can_grant_gold': False,
+            'grant_reason': 'Manual format-only UID requires verification or public Locket link resolution',
+        }
+
+    res_st = record.get('uid_resolution_status') or (
+        'conflict'
+        if record.get('resolution_status') in {'conflict', 'uid_conflict'}
+        else ('lookup_error' if record.get('resolution_status') in {'lookup_unavailable', 'auth_required'} else 'not_found')
+    )
+    return {
+        'firebase_uid': None,
+        'uid_verified': False,
+        'verification_status': ver_status,
+        'verification_method': ver_method,
+        'verification_source': ver_source,
+        'uid_resolution_status': res_st,
+        'uid_source': 'public_share_link' if ver_source == 'locket_public_share_link' else 'none',
+        'uid_assurance': 'none',
+        'grant_basis': None,
+        'can_grant_gold': False,
+        'grant_reason': record.get('grant_reason') or 'Firebase UID not found from public share link',
+    }
+
+
 def format_account_record(record: dict, now: datetime | None = None) -> dict:
     """Normalize a raw MongoDB account document (from accounts or accounts_v2) into AccountOutput dict."""
     now = now if now is not None else datetime.now(timezone.utc)
@@ -168,7 +301,38 @@ def format_account_record(record: dict, now: datetime | None = None) -> dict:
         except (ValueError, TypeError):
             expiry = datetime.fromtimestamp(0, tz=timezone.utc)
 
-    fb_uid, _, ver_status, ver_method, ver_source = extract_verified_uid_metadata(record)
+    meta = extract_grant_eligibility_metadata(record)
+    fb_uid = meta['firebase_uid']
+    ver_status = meta['verification_status']
+    ver_method = meta['verification_method']
+    ver_source = meta['verification_source']
+    uid_res_status = record.get('uid_resolution_status') or meta['uid_resolution_status']
+    if uid_res_status == 'conflict':
+        status_label = 'UID Conflict'
+    elif uid_res_status == 'lookup_error':
+        status_label = 'UID Lookup Failed'
+    elif status == 'active':
+        status_label = 'Active'
+    elif status == 'expired':
+        status_label = 'Expired'
+    elif status == 'revoked':
+        status_label = 'Revoked'
+    else:
+        status_label = 'Not Granted'
+
+    res_code = record.get('result_code')
+    if not res_code:
+        if uid_res_status == 'conflict':
+            res_code = 'UID_CONFLICT'
+        elif uid_res_status == 'lookup_error':
+            res_code = 'UID_LOOKUP_ERROR'
+        elif status == 'active' and fb_uid:
+            res_code = 'GOLD_GRANTED'
+        elif fb_uid:
+            res_code = 'GOLD_NOT_GRANTED'
+        else:
+            res_code = 'UID_NOT_FOUND'
+
     return {
         'locket_id': str(record.get('locket_id') or record.get('account_id') or ''),
         'expires_date': expiry,
@@ -185,6 +349,13 @@ def format_account_record(record: dict, now: datetime | None = None) -> dict:
         'uid_resolved_at': record.get('uid_resolved_at'),
         'uid_resolution_source': record.get('uid_resolution_source'),
         'resolution_status': record.get('resolution_status'),
+        'uid_resolution_status': uid_res_status,
+        'uid_source': record.get('uid_source') or meta['uid_source'],
+        'uid_assurance': record.get('uid_assurance') or meta['uid_assurance'],
+        'grant_basis': meta['grant_basis'],
+        'grant_status_label': status_label,
+        'grant_reason': record.get('grant_reason') or meta['grant_reason'],
+        'result_code': res_code,
         'max_devices': int(record.get('max_devices') or 2),
         'activated_at': record.get('activated_at'),
         'revoked_at': record.get('revoked_at'),
@@ -238,9 +409,11 @@ async def effective_gold_account(request, account, account_id: str, now: datetim
     """Resolve the Gold grant shared by the admin dashboard and lab APIs."""
     if not account:
         return None
-    uid, verified, *_ = extract_verified_uid_metadata(account)
+    meta = extract_grant_eligibility_metadata(account)
+    uid = meta['firebase_uid']
+    can_grant = meta['can_grant_gold']
     grant = None
-    if verified:
+    if can_grant and uid:
         collection = getattr(request.app.state, 'entitlements', None)
         if collection is None:
             raise HTTPException(503, 'Entitlement lookup unavailable')
@@ -253,26 +426,42 @@ async def effective_gold_account(request, account, account_id: str, now: datetim
 
 def evaluate_gold_record(account, requested_id, grant, now):
     """Intersect account and grant states and return a record usable by the lab response formatter."""
+    if not account or not isinstance(account, dict):
+        return None
     record = {**account, 'grace_period_expires_date': None}
-    uid, verified, *_ = extract_verified_uid_metadata(record)
-    if verified and requested_id != uid:
+    meta = extract_grant_eligibility_metadata(record)
+    uid = meta['firebase_uid']
+    can_grant = meta['can_grant_gold']
+    if can_grant and uid and requested_id != uid:
         return None
     account_status, account_expiry = compute_entitlement_status(record, now)
     if account_status == 'revoked':
         return record
     if record.get('status') == 'expired' or account_status == 'expired':
         return {**record, 'expires_date': min(account_expiry or now, now)}
-    if not verified or record.get('status') != 'active':
+    if not can_grant or not uid or record.get('status') != 'active':
         return {**record, 'status': 'pending'}
     if (not isinstance(grant, dict) or grant.get('account_id') != uid or grant.get('entitlement_key') != 'Gold'
             or grant.get('locket_id', record.get('locket_id')) != record.get('locket_id')
             or grant.get('grant_revision') != record.get('grant_revision')):
         return {**record, 'status': 'pending'}
-    grant_status, expiry = compute_entitlement_status({**grant, 'grace_period_expires_date': None}, now)
+    eff_grant_basis = grant.get('grant_basis') or meta['grant_basis']
+    if eff_grant_basis == 'admin_authorized_public_uid' and not _is_public_uid_grant_policy_enabled():
+        return {**record, 'status': 'pending'}
+    grant_eval_doc = {
+        **grant,
+        'firebase_uid': uid,
+        'verification_status': record.get('verification_status'),
+        'verification_source': record.get('verification_source'),
+        '_server_uid_proof': record.get('_server_uid_proof'),
+        'grant_basis': eff_grant_basis,
+        'grace_period_expires_date': None,
+    }
+    grant_status, expiry = compute_entitlement_status(grant_eval_doc, now)
     if grant_status == 'revoked':
         return {**record, 'status': 'revoked', 'revoked_at': grant.get('revoked_at') or now}
     if grant.get('status') == 'expired' or grant_status == 'expired':
         return {**record, 'expires_date': min(expiry or now, now)}
     if grant.get('status') != 'active' or grant_status != 'active' or account_status != 'active':
         return {**record, 'status': 'pending'}
-    return {**record, 'expires_date': min(account_expiry, expiry)}
+    return {**record, 'grant_basis': eff_grant_basis, 'expires_date': min(account_expiry, expiry)}

@@ -155,11 +155,17 @@ Hệ thống Admin Dashboard chỉ có **một luồng `Add Account` duy nhất*
 
 1. Quản trị viên mở `Add Account`, nhập `Locket ID / Username` (ví dụ `vt.l` hoặc `https://locket.cam/vt.l`), chọn `Expires at` và nhấn `Save account`.
 2. Backend (`POST /admin/add-account`) tự động chuẩn hóa định danh, kiểm tra `accounts_v2` xem đã có Firebase UID đã xác minh (`verified_uid`, `_server_uid_proof=True`) chưa, và tra cứu trang chia sẻ công khai `https://locket.cam/<username>` (không dùng phiên đăng nhập Locket, không yêu cầu Firebase ID Token hay Refresh Token).
-3. Nếu tài khoản có Firebase UID đã xác minh (`verified_uid`):
-   - Lưu vào `accounts_v2` với `account_id = <VERIFIED_FIREBASE_UID>`, `firebase_uid = <VERIFIED_FIREBASE_UID>`, `status = "active"`.
-   - Liên kết quyền Gold trong `entitlements` với khóa `account_id = <VERIFIED_FIREBASE_UID>`.
-4. Nếu chỉ có username hoặc `invite_token` từ trang công khai mà chưa có bằng chứng xác minh Firebase UID:
-   - Lưu vào `accounts_v2` với `firebase_uid = null`, `verification_status = "unverified_handle"`, `status = "pending"`.
-   - **Không tạo quyền Gold active** cho đến khi UID được xác minh.
+3. Nếu tài khoản có Firebase UID đã xác minh độc lập (`independently_verified` / `verified_uid`, `_server_uid_proof=True`):
+   - Lưu vào `accounts_v2` với `account_id = <VERIFIED_FIREBASE_UID>`, `firebase_uid = <VERIFIED_FIREBASE_UID>`, `uid_assurance = "independently_verified"`, `grant_basis = "independently_verified"`, `status = "active"`.
+   - Liên kết quyền Gold trong `entitlements` với khóa `account_id = <VERIFIED_FIREBASE_UID>` và `grant_basis = "independently_verified"`.
+4. Nếu trang công khai `https://locket.cam/<username>` trả về compound invite token 44 ký tự (`<28-char-Firebase-UID><16-char-hex-suffix>`):
+   - Backend tách 28 ký tự đầu làm `firebase_uid`, giữ nguyên chuỗi 44 ký tự ở `invite_token`, và đặt trung thực:
+     `uid_resolution_status = "found"`, `uid_source = "public_share_link"`, `uid_assurance = "public_derived"`, `verification_status = "unverified_uid"`, `_server_uid_proof = False`.
+   - Khi `ALLOW_ADMIN_PUBLIC_UID_GRANT=true` (mặc định bật cho hệ thống cấp phép nội bộ):
+     - Cấp quyền Gold nội bộ ngay lập tức khi bấm `Save Account` với `grant_basis = "admin_authorized_public_uid"`, `result_code = "GOLD_GRANTED"`, `status = "active"` và tạo bản ghi `entitlements` theo UID 28 ký tự.
+   - Khi `ALLOW_ADMIN_PUBLIC_UID_GRANT=false`:
+     - Lưu UID với `result_code = "GOLD_NOT_GRANTED"`, `grant_reason = "Admin public-UID grant policy disabled"`, `status = "pending"`.
+5. Nếu trang công khai không trích xuất được UID 28 ký tự hợp lệ:
+   - Lưu vào `accounts_v2` với `firebase_uid = null`, `uid_resolution_status = "not_found"`, `result_code = "UID_NOT_FOUND"`, `status = "pending"`.
 
 Index `unique_firebase_uid_string` ngăn hai account giữ cùng một Firebase UID; giá trị `null` được bỏ qua.

@@ -70,21 +70,31 @@ flowchart TD
 
 ### Module 2 — Account Identity Service (`app/services/identity_service.py`)
 - **Trách nhiệm:**
-  - Tiếp nhận đầu vào từ Admin:
-    1. **Link chia sẻ:** Ví dụ `https://locket.cam/<username>` hoặc `@<username>`.
+  - Tiếp nhận đầu vào từ Admin trong thao tác duy nhất `Save Account`:
+    1. **Link chia sẻ / Username:** Ví dụ `vt.l`, `@vt.l` hoặc `https://locket.cam/<username>`.
     2. **Định danh trực tiếp (UID / UUID):** Ví dụ chuỗi UID 28 ký tự hoặc `account_id` nội bộ.
-  - **Quy tắc xác minh minh bạch (Zero-Guessing Policy):**
-    - Kiểm tra cú pháp URL/handle nghiêm ngặt.
-    - Nếu đầu vào chỉ là `username` hoặc link `https://locket.cam/<username>`, dịch vụ kiểm tra xem trang công khai hoặc provider hợp pháp được cấu hình có trả về `uid` xác thực được hay không.
-    - **Tuyệt đối không tự suy đoán hoặc giả định `username == uid` nếu chưa xác minh.** Hệ thống lưu rõ trạng thái xác minh (`verification_status`: `verified_uid`, `unverified_handle`, `manual_lab_id`) và `verification_method` (`direct_uid`, `public_meta_resolved`, `admin_manual_override`). Nếu một link không cung cấp được UUID/UID có thể xác minh, API trả về cảnh báo rõ ràng cho Admin để Admin quyết định nhập UID trực tiếp hoặc đánh dấu là tài khoản thử nghiệm (`manual_lab_id`).
+  - **Quy tắc xác minh minh bạch & Phân tách Độ tin cậy (`uid_assurance`) với Chính sách Cấp phép Nội bộ (`grant_basis`):**
+    - Kiểm tra cú pháp URL/handle, giới hạn domain Locket hợp lệ và chống SSRF nghiêm ngặt.
+    - Tự động truy xuất trang chia sẻ công khai `https://locket.cam/<username>`, lấy `invite_token` 44 ký tự (`<28-char-Firebase-UID><16-char-hex-suffix>`) và tách **28 ký tự đầu** làm `firebase_uid`.
+    - **Tuyệt đối không giả mạo bằng chứng xác minh độc lập:**
+      - Khi UID được trích xuất từ link công khai, hệ thống ghi nhận trung thực:
+        - `uid_resolution_status = "found"`
+        - `uid_source = "public_share_link"`
+        - `uid_assurance = "public_derived"`
+        - `verification_status = "unverified_uid"`
+        - `_server_uid_proof = False`
+      - Chỉ khi có nguồn xác minh độc lập (`SERVER_TRUSTED_UID_SOURCES`), hệ thống mới đặt `uid_assurance = "independently_verified"`, `verification_status = "verified_uid"` và `_server_uid_proof = True`.
 
 ### Module 3 — Entitlement Service (`app/services/entitlement_service.py`)
 - **Trách nhiệm:** Là **Nguồn dữ liệu duy nhất (Single Source of Truth - SSOT)** quyết định trạng thái thuê bao trong toàn hệ thống.
+- **Hai căn cứ cấp quyền nội bộ (`grant_basis`):**
+  1. `independently_verified`: UID đã có bằng chứng xác minh danh tính độc lập (`_server_uid_proof == True`, `verification_status == "verified_uid"`).
+  2. `admin_authorized_public_uid`: Khi chính sách `ALLOW_ADMIN_PUBLIC_UID_GRANT=true` (mặc định bật cho hệ thống cấp phép nội bộ), thao tác `Save Account` (hoặc `Activate Gold`) của Admin được phép cấp giấy phép Gold nội bộ theo UID 28 ký tự trích xuất từ link công khai `locket.cam/<username>` sau khi backend kiểm tra định dạng, liên kết username, không xung đột và duy nhất trong MongoDB. Nếu chính sách này bị tắt (`ALLOW_ADMIN_PUBLIC_UID_GRANT=false`), hệ thống lưu UID với `UID: FOUND`, `Grant: Not issued`, `Reason: Admin public-UID grant policy disabled`.
 - **Máy trạng thái (State Machine) rõ ràng:**
-  - `active` yêu cầu cả tài khoản và bản ghi Gold đúng Firebase UID đã xác minh có trạng thái active, chưa bị thu hồi và còn hạn UTC. Mốc hết hạn hiệu lực là mốc sớm hơn của hai bản ghi. UID trích từ invite token công khai 44 ký tự được lưu cùng nguồn và ở trạng thái `unverified_uid` cho đến khi có bằng chứng độc lập.
+  - `active` yêu cầu cả tài khoản và bản ghi Gold đúng UID 28 ký tự hợp lệ (có `grant_basis` thuộc `independently_verified` hoặc `admin_authorized_public_uid` theo chính sách) có trạng thái active, chưa bị thu hồi và còn hạn UTC. Mốc hết hạn hiệu lực là mốc sớm hơn của hai bản ghi. UID trích từ invite token công khai 44 ký tự được lưu cùng nguồn và ở trạng thái `unverified_uid` (`uid_assurance = "public_derived"`, `_server_uid_proof = False`) cho đến khi có bằng chứng độc lập.
   - `expired`: Tài khoản tồn tại, không bị thu hồi, nhưng `expires_date <= now_utc`.
   - `revoked`: Tài khoản bị Admin chủ động thu hồi quyền (`status == "revoked"` hoặc `revoked_at is not None`), bất kể `expires_date` còn hạn hay không.
-  - `pending`: Tài khoản mới thêm vào hệ thống để chờ xác minh thiết bị/UUID, chưa kích hoạt quyền (`status == "pending"`).
+  - `pending`: Tài khoản mới thêm vào hệ thống để chờ xác minh thiết bị/UUID, hoặc chính sách `ALLOW_ADMIN_PUBLIC_UID_GRANT` đang tắt (`status == "pending"`).
   - `unauthorized`: Tài khoản **không tồn tại** trong cơ sở dữ liệu hoặc thiết bị gọi API không hợp lệ.
 - **Chốt chặn an toàn (Fail-Closed):**
   - Xóa bỏ hoàn toàn đoạn code `if expiry is None: expiry = datetime(2029, 12, 31, ...)` từng gây lỗi ở bản cũ.

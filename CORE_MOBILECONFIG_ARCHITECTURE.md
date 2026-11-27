@@ -4,7 +4,7 @@
 **Tài liệu gốc đối chiếu:** `cotloicualocketgold.txt` và `LocketGold_Clean_Unlocked.mobileconfig`
 **Ngày cập nhật:** 2026-11-25
 
-Lần rà soát Prompt 27 không tìm thấy hai tệp gốc trong repository. Phần nghiệm thu đối chiếu profile do mã hiện tại sinh ra với các yêu cầu trong tài liệu này. Endpoint mặc định trả DNS-only. Các chế độ nghiên cứu có Root CA yêu cầu chọn rõ `lab_ca` hoặc `scoped_lab` trong môi trường Lab.
+Lần rà soát Prompt 28 đã đọc trực tiếp `cotloicualocketgold.txt` trong workspace (tệp nằm trong `.gitignore`, mô tả 2 payload `com.apple.security.root` và `com.apple.dnsSettings.managed`). Không tìm thấy tệp `.mobileconfig` gốc `LocketGold_Clean_Unlocked.mobileconfig` trong repository/workspace nên không tự tạo bản gốc giả; toàn bộ kiểm thử dùng `plistlib` và `cryptography.x509` giải mã trực tiếp file `.mobileconfig` thật do API sinh ra ở cả chế độ `dns_only` (1 payload) và `lab_ca` / `scoped_lab` (2 payload). Endpoint công khai mặc định trả DNS-only; các chế độ nghiên cứu có Root CA yêu cầu chọn rõ `lab_ca` hoặc `scoped_lab` trong môi trường Research Lab.
 
 ---
 
