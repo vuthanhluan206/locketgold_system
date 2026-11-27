@@ -409,51 +409,78 @@ def subscriber_response(account_id: str, account: dict | None, now: datetime | N
         except (ValueError, TypeError):
             grace_str = None
 
+    now_ms = int(now.timestamp() * 1000)
+
     entitlement = {
         'expires_date': entitlement_expires,
         'grace_period_expires_date': grace_str,
         'product_identifier': product_id,
         'purchase_date': purchase_str,
+        'original_purchase_date': purchase_str,
     } if active else None
 
-    pro_entitlement = {
+    locket_entitlement = {
         'expires_date': entitlement_expires,
         'grace_period_expires_date': grace_str,
         'product_identifier': 'locket_1600_1y',
         'purchase_date': purchase_str,
+        'original_purchase_date': purchase_str,
     } if active else None
 
-    sub_payload = {
-        'auto_resume_date': None,
-        'billing_issues_detected_at': None,
-        'expires_date': entitlement_expires,
-        'grace_period_expires_date': grace_str,
-        'is_sandbox': False,
-        'original_purchase_date': purchase_str,
-        'purchase_date': purchase_str,
-        'ownership_type': 'PURCHASED',
-        'period_type': 'normal',
-        'refunded_at': None,
-        'store': 'app_store',
-        'unsubscribe_detected_at': None,
-    } if active else None
+    def _build_sub(name: str) -> dict:
+        return {
+            'auto_resume_date': None,
+            'billing_issues_detected_at': None,
+            'display_name': name,
+            'expires_date': entitlement_expires,
+            'grace_period_expires_date': grace_str,
+            'is_sandbox': False,
+            'original_purchase_date': purchase_str,
+            'purchase_date': purchase_str,
+            'ownership_type': 'PURCHASED',
+            'period_type': 'normal',
+            'price': {'amount': 399000, 'currency': 'VND'},
+            'refunded_at': None,
+            'store': 'app_store',
+            'store_transaction_id': '490003094202846',
+            'unsubscribe_detected_at': None,
+        }
 
     subscriptions = {
-        product_id: sub_payload,
-        'locket_1600_1y': dict(sub_payload),
-    } if active and sub_payload else {}
+        product_id: _build_sub(product_id),
+        'locket_1600_1y': _build_sub('locket_1600_1y'),
+        'locket_gold_annual': _build_sub('locket_gold_annual'),
+    } if active else {}
+
+    subscriber_attributes = {
+        '$badge': {'value': 'locket_gold', 'updated_at_ms': now_ms},
+        'profile_badge': {'value': 'locket_gold', 'updated_at_ms': now_ms},
+        'gold_badge': {'value': 'true', 'updated_at_ms': now_ms},
+        'gold_since': {'value': purchase_str, 'updated_at_ms': now_ms},
+        '$gold_since': {'value': purchase_str, 'updated_at_ms': now_ms},
+        'gold_member_since': {'value': purchase_str, 'updated_at_ms': now_ms},
+    } if active else {}
 
     return {
         'request_date': now_str,
-        'request_date_ms': int(now.timestamp() * 1000),
+        'request_date_ms': now_ms,
         'subscriber': {
+            'aliases': [account_id],
+            'app_user_id': account_id,
             'original_app_user_id': account_id,
-            'original_application_version': '1.0',
+            'original_application_version': '4',
             'non_subscriptions': {},
             'other_purchases': {},
             'first_seen': now_str,
             'last_seen': now_str,
-            'entitlements': {'Gold': entitlement, 'pro': pro_entitlement} if active else {},
+            'entitlements': {
+                'Gold': entitlement,
+                'gold': dict(locket_entitlement),
+                'locket_gold': dict(locket_entitlement),
+                'profile_badge': dict(locket_entitlement),
+                'pro': dict(locket_entitlement),
+            } if active and locket_entitlement else {},
+            'subscriber_attributes': subscriber_attributes,
             'subscriptions': subscriptions,
             'management_url': 'https://apps.apple.com/account/subscriptions' if active else None,
             'original_purchase_date': purchase_str,
