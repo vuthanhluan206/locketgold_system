@@ -188,6 +188,8 @@ class AccountOutput(BaseModel):
     uid_resolution_source: str | None = None
     resolution_status: str | None = None
     max_devices: int = 2
+    active_devices: int = 0
+    activated_at: AwareDatetime | None = None
     revoked_at: AwareDatetime | None = None
     revoke_reason: str | None = None
     notes: str | None = None
@@ -273,6 +275,16 @@ class ActivateAccountInput(BaseModel):
         if value is None:
             return None
         return normalize_expiry(value)
+
+
+class LabGoldFeatures(BaseModel):
+    model_config = ConfigDict(extra='forbid', strict=True)
+    max_video_duration_seconds: int = Field(default=0, ge=0, le=60)
+    enable_private_posts: bool = False
+    unlocked_filters: bool = False
+    camera_filters_enabled: bool = False
+    holiday_effects_enabled: bool = False
+    unlocked_all_filters: bool = False
 
 
 class DeviceCreateInput(BaseModel):

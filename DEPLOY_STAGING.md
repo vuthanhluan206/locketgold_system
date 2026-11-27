@@ -126,6 +126,19 @@ docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m 
 docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --reconcile --dry-run
 ```
 
+### Áp dụng và rollback migration UID trên staging
+
+Sau khi duyệt dry-run, dùng một tên backup mới trên volume bền vững. CLI ghi bản trước và sau của từng document ở `accounts_v2` và `entitlements`, kiểm tra checksum rồi áp dụng trong transaction trên MongoDB replica set hoặc Atlas. Dừng ghi quản trị trong cửa sổ migration. Các lệnh rollback dùng chính file của lần áp dụng.
+
+```bash
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --uid-entitlements --apply --backup /app/backups/prompt27-uid-01.json
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --uid-entitlements --dry-run
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --uid-entitlements --rollback /app/backups/prompt27-uid-01.json --dry-run
+docker compose -p locket_staging -f compose.staging.yaml run --rm api python -m scripts.migrate_db --uid-entitlements --rollback /app/backups/prompt27-uid-01.json
+```
+
+Rollback kiểm tra dữ liệu hiện tại với journal. Nếu quản trị viên đã sửa document sau migration, transaction dừng để bảo toàn thay đổi đó.
+
 ### Bước 12: Dừng môi trường Staging an toàn (Không ảnh hưởng Production)
 
 > **Lưu ý an toàn:** Không bao giờ chạy `docker system prune --volumes` trên VPS. Chỉ hạ đúng project `locket_staging`:

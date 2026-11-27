@@ -37,34 +37,37 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
     if devices is None:
         raise HTTPException(503, 'Device service unavailable')
 
-    async with _get_account_lock(data.locket_id):
-        account = None
-        if accounts_v2 is not None:
-            res = await accounts_v2.find_one({'locket_id': data.locket_id}, {'_id': 0})
-            if isinstance(res, dict):
-                account = res
-            else:
-                for alt_field in ('firebase_uid', 'username', 'account_id'):
-                    try:
-                        res_alt = accounts_v2.find_one({alt_field: data.locket_id}, {'_id': 0})
-                        if hasattr(res_alt, '__await__'):
-                            res_alt = await res_alt
-                        if isinstance(res_alt, dict):
-                            account = res_alt
-                            break
-                    except KeyError:
-                        continue
-        if account is None and accounts is not None:
-            res = await accounts.find_one({'locket_id': data.locket_id}, {'_id': 0})
-            if isinstance(res, dict):
-                account = res
-        if account is None:
-            raise HTTPException(404, 'Account not found')
+    account = None
+    if accounts_v2 is not None:
+        res = await accounts_v2.find_one({'locket_id': data.locket_id}, {'_id': 0})
+        if isinstance(res, dict):
+            account = res
+        else:
+            for alt_field in ('firebase_uid', 'username', 'account_id'):
+                try:
+                    res_alt = accounts_v2.find_one({alt_field: data.locket_id}, {'_id': 0})
+                    if hasattr(res_alt, '__await__'):
+                        res_alt = await res_alt
+                    if isinstance(res_alt, dict):
+                        account = res_alt
+                        break
+                except KeyError:
+                    continue
+    if account is None and accounts is not None:
+        res = await accounts.find_one({'locket_id': data.locket_id}, {'_id': 0})
+        if isinstance(res, dict):
+            account = res
+    if account is None:
+        raise HTTPException(404, 'Account not found')
 
+    canonical_id = account.get('locket_id') or data.locket_id
+    async with _get_account_lock(canonical_id):
         max_devices = int(account.get('max_devices') or 2)
-        cursor = devices.find({'locket_id': data.locket_id, 'status': 'active'}, {'_id': 0})
+        cursor = devices.find({'locket_id': canonical_id, 'status': 'active'}, {'_id': 0})
         active_devices = await cursor.to_list(length=max_devices + 5)
         active_list = [d for d in (active_devices if isinstance(active_devices, list) else []) if isinstance(d, dict)]
+        if any(str(d.get('device_name', '')).casefold() == data.device_name.casefold() for d in active_list):
+            raise HTTPException(409, 'An active device with this name already exists on this account')
         if len(active_list) >= max_devices:
             raise HTTPException(409, f'Account reached maximum active devices limit ({max_devices})')
 
@@ -104,8 +107,8 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
 
         doc = {
             'device_id': device_id,
-            'locket_id': data.locket_id,
-            'canonical_locket_id': account.get('locket_id') or data.locket_id,
+            'locket_id': canonical_id,
+            'canonical_locket_id': canonical_id,
             'firebase_uid': account.get('firebase_uid'),
             'slot_index': chosen_slot,
             'device_name': data.device_name,
@@ -124,7 +127,7 @@ async def enroll_device(request, data: DeviceCreateInput) -> dict:
 
         # Post-insert verification in case an external process inserted concurrently without slot_index.
         # Rollback strictly targets only the newly created (device_id, token_hash) from this request.
-        verify_cur = devices.find({'locket_id': data.locket_id, 'status': 'active'}, {'_id': 0})
+        verify_cur = devices.find({'locket_id': canonical_id, 'status': 'active'}, {'_id': 0})
         after_list = await verify_cur.to_list(length=max_devices + 5)
         if isinstance(after_list, list) and len(after_list) > max_devices:
             if hasattr(devices, 'delete_one'):

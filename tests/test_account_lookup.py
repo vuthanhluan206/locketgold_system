@@ -104,6 +104,8 @@ def lookup_env(monkeypatch):
     app.dependency_overrides[get_accounts] = lambda: accounts
     app.state.accounts = accounts
     app.state.accounts_v2 = accounts_v2
+    app.state.entitlements = AsyncMock()
+    app.state.entitlements.find_one.return_value = None
     app.state.admins = admins
     app.state.sessions = sessions
     app.state.audit = AsyncMock()
@@ -265,6 +267,7 @@ def test_admin_lookup_distinguishes_handle_unverified_uid_and_verified_uid(looku
     assert data_ver['internal_identifier'] == verified_uid
     assert data_ver['firebase_uid'] == verified_uid
     assert data_ver['uid_verified'] is True
+    assert data_ver['entitlement_status'] == 'pending'
     assert data_ver['verification_status'] == 'verified_uid'
     assert data_ver['verification_method'] == 'trusted_proof'
     assert data_ver['verification_source'] == 'verified_subscriber_traffic'

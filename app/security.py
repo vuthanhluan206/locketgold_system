@@ -101,4 +101,5 @@ async def require_admin(
     admin = await request.app.state.admins.find_one({"_id": session["admin_id"]})
     if admin is None or admin.get("auth_version") != session["auth_version"]:
         raise unauthorized
+    request.state.admin_email = admin['email']
     return {"session_id": session["_id"], "email": admin["email"]}

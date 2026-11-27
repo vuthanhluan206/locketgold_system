@@ -14,12 +14,14 @@ import asyncio
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Literal
+from bson import json_util
 from pymongo import AsyncMongoClient
 from app.config import get_settings
 from app.database import _fetch_all_documents, run_controlled_migration
-from app.models import normalize_expiry
+from app.models import compute_entitlement_status, normalize_expiry
 from app.services.entitlement_service import extract_verified_uid_metadata
 from app.services.identity_service import is_valid_firebase_uid
 
@@ -42,6 +44,8 @@ def compute_snapshot_sha256(accounts: list[dict], accounts_v2: list[dict]) -> st
 def verify_snapshot_integrity(snapshot: dict) -> bool:
     if not isinstance(snapshot, dict):
         raise ValueError('Invalid backup snapshot: root must be a dictionary')
+    if 'uid_migration_version' in snapshot:
+        raise ValueError('Use --uid-entitlements --rollback with a UID migration journal')
     accounts = snapshot.get('accounts', [])
     accounts_v2 = snapshot.get('accounts_v2', [])
     if not isinstance(accounts, list) or not isinstance(accounts_v2, list):
@@ -310,6 +314,13 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
                 except Exception:
                     ent_exp = None
             ent_status = str(ent_doc.get('status') or '').lower() if isinstance(ent_doc, dict) else ''
+            if auth_status == 'active':
+                if not uid_ver or not ent_doc or ent_doc.get('account_id') != fb_uid:
+                    auth_status = 'pending'
+                elif ent_status != 'active' or ent_doc.get('revoked_at'):
+                    auth_status = 'revoked' if ent_doc.get('revoked_at') or ent_status == 'revoked' else 'pending'
+                if uid_ver and ent_exp is not None:
+                    auth_expiry = min(auth_expiry, ent_exp)
             if ent_doc is None or ent_doc.get('account_id') != target_ent_id or ent_exp != auth_expiry or ent_status != auth_status:
                 drifts.append({'locket_id': lid, 'target': 'entitlements', 'reason': 'Entitlement projection out of sync with accounts_v2'})
                 if not dry_run:
@@ -339,7 +350,7 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
     }
 
 
-async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True) -> dict:
+async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True, changes_out=None) -> dict:
     """
     Controlled UID-Key Entitlement Audit & Migration (Prompt 26 Section 10):
       1. Lists accounts currently using username as key (`username_keyed_accounts`).
@@ -364,6 +375,7 @@ async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True) -> d
     known_locket_ids: set[str] = set()
     known_verified_uids: set[str] = set()
     v2_by_lid: dict[str, dict] = {}
+    active_keys = {e.get('account_id') for e in ent_list if e.get('status') == 'active'}
 
     for doc in v2_list:
         if not isinstance(doc, dict):
@@ -389,7 +401,7 @@ async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True) -> d
                 'verification_source': ver_source,
                 'status': doc.get('status'),
             })
-            if doc.get('account_id') != fb_uid or lid != fb_uid:
+            if doc.get('account_id') != fb_uid or (lid != fb_uid and lid in active_keys):
                 old_to_new_mapping.append({
                     'locket_id': lid,
                     'old_key': str(doc.get('account_id') or lid),
@@ -409,77 +421,70 @@ async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True) -> d
         if len(owners) > 1:
             duplicate_uids.append({'firebase_uid': uid_val, 'locket_ids': owners})
 
+    changes = []
+    def change(collection, key, before, fields):
+        changes.append({'collection': collection, 'key': key, 'before': before,
+                        'after': {**(before or {}), **key, **fields}})
+
+    grants = {}
     for ent in ent_list:
-        if not isinstance(ent, dict):
+        if ent.get('entitlement_key') != 'Gold':
             continue
-        ent_aid = str(ent.get('account_id') or '').strip()
-        ent_status = str(ent.get('status') or '').lower()
-        if not ent_aid:
+        aid = ent['account_id']
+        if aid in grants:
+            duplicate_uids.append({'account_id': aid, 'reason': 'Duplicate Gold grants'})
+        grants[aid] = ent
+        owners = uid_owners.get(aid, [])
+        if owners and ent.get('locket_id') and ent['locket_id'] not in owners:
+            duplicate_uids.append({'account_id': aid, 'reason': 'Grant belongs to another account'})
+        if aid in known_verified_uids:
+            if aid in known_locket_ids and owners != [aid]:
+                duplicate_uids.append({'account_id': aid, 'reason': 'UID collides with another account key'})
             continue
-        if ent_aid not in known_verified_uids and ent_aid not in known_locket_ids:
-            orphan_entitlements.append({
-                'account_id': ent_aid,
-                'status': ent_status,
-                'reason': 'No matching account in accounts_v2',
+        if aid not in known_locket_ids:
+            orphan_entitlements.append({'account_id': aid, 'status': ent.get('status')})
+        elif ent.get('locket_id', aid) != aid:
+            duplicate_uids.append({'account_id': aid, 'reason': 'Legacy grant belongs to another account'})
+        if ent.get('status') == 'active':
+            unverified_active_entitlements.append({'account_id': aid, 'status': 'active'})
+            change('entitlements', {'account_id': aid, 'entitlement_key': 'Gold'}, ent,
+                   {'status': 'revoked', 'revoked_at': now, 'updated_at': now})
+
+    migrated_entitlements = downgraded_pending = 0
+    for mapping in old_to_new_mapping:
+        lid, uid = mapping['locket_id'], mapping['new_verified_uid']
+        account = v2_by_lid[lid]
+        if account.get('account_id') != uid:
+            change('accounts_v2', {'locket_id': lid}, account, {'account_id': uid, 'updated_at': now})
+        old = grants.get(lid)
+        # Never mint a grant from account status or resurrect an existing revoked UID grant.
+        if uid not in grants and old and old.get('locket_id', lid) == lid:
+            status, expiry = compute_entitlement_status(old, now)
+            if account.get('status') != 'active' or old.get('status') != 'active':
+                status = 'revoked' if 'revoked' in (account.get('status'), old.get('status')) else 'pending'
+            fields = {**old, 'account_id': uid, 'locket_id': lid, 'status': status,
+                      'expires_date': expiry, 'updated_at': now}
+            change('entitlements', {'account_id': uid, 'entitlement_key': 'Gold'}, None, fields)
+            migrated_entitlements += 1
+
+    for item in username_keyed_accounts:
+        if item['status'] == 'active':
+            lid = item['locket_id']
+            account = v2_by_lid[lid]
+            change('accounts_v2', {'locket_id': lid}, account, {
+                'status': 'pending', 'verification_status': item['verification_status'],
+                '_server_uid_proof': False, 'updated_at': now,
             })
-        elif ent_aid not in known_verified_uids and ent_status == 'active':
-            # Matched a username/locket_id rather than a verified UID
-            v2_match = v2_by_lid.get(ent_aid)
-            fb_uid, uid_ver, *_ = extract_verified_uid_metadata(v2_match) if isinstance(v2_match, dict) else (None, False, '', '', '')
-            if not uid_ver or not fb_uid:
-                unverified_active_entitlements.append({
-                    'account_id': ent_aid,
-                    'status': ent_status,
-                    'reason': 'Active entitlement keyed by unverified username/handle',
-                })
+            downgraded_pending += 1
 
-    has_conflicts = len(duplicate_uids) > 0
-    migrated_entitlements = 0
-    downgraded_pending = 0
-
-    if not dry_run and not has_conflicts:
-        for item in old_to_new_mapping:
-            lid = item['locket_id']
-            fb_uid = item['new_verified_uid']
-            v2_doc = v2_by_lid.get(lid, {})
-            if getattr(db, 'accounts_v2', None) is not None:
-                await db.accounts_v2.update_one(
-                    {'locket_id': lid, 'firebase_uid': fb_uid, '_server_uid_proof': True},
-                    {'$set': {'account_id': fb_uid, 'updated_at': now}},
-                )
-            if getattr(db, 'entitlements', None) is not None:
-                raw_exp = v2_doc.get('expires_date')
-                try:
-                    eff_exp = normalize_expiry(raw_exp) if raw_exp else datetime(1970, 1, 1, tzinfo=timezone.utc)
-                except Exception:
-                    eff_exp = datetime(1970, 1, 1, tzinfo=timezone.utc)
-                eff_st = str(v2_doc.get('status') or 'active').lower()
-                await db.entitlements.update_one(
-                    {'account_id': fb_uid, 'entitlement_key': 'Gold'},
-                    {
-                        '$set': {
-                            'account_id': fb_uid,
-                            'locket_id': lid,
-                            'entitlement_key': 'Gold',
-                            'product_identifier': 'com.locket.gold.yearly',
-                            'status': eff_st,
-                            'expires_date': eff_exp,
-                            'revoked_at': v2_doc.get('revoked_at'),
-                            'updated_at': now,
-                        }
-                    },
-                    upsert=True,
-                )
-                migrated_entitlements += 1
-
-        for item in username_keyed_accounts:
-            lid = item['locket_id']
-            if item['status'] == 'active' and getattr(db, 'accounts_v2', None) is not None:
-                await db.accounts_v2.update_one(
-                    {'locket_id': lid, '_server_uid_proof': {'$ne': True}},
-                    {'$set': {'status': 'pending', 'updated_at': now}},
-                )
-                downgraded_pending += 1
+    has_conflicts = bool(duplicate_uids)
+    if has_conflicts:
+        changes.clear()
+    if changes_out is not None:
+        changes_out.extend(changes)
+    if not dry_run:
+        for item in changes:
+            await getattr(db, item['collection']).update_one(item['key'], {'$set': item['after']}, upsert=item['before'] is None)
 
     return {
         'dry_run': dry_run,
@@ -495,9 +500,59 @@ async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True) -> d
         'duplicate_uids': duplicate_uids,
         'orphan_entitlements': orphan_entitlements,
         'unverified_active_entitlements': unverified_active_entitlements,
-        'migrated_entitlements': migrated_entitlements,
-        'downgraded_to_pending': downgraded_pending,
+        'migrated_entitlements': migrated_entitlements if not dry_run and not has_conflicts else 0,
+        'downgraded_to_pending': downgraded_pending if not dry_run and not has_conflicts else 0,
+        'planned_changes': len(changes),
     }
+
+
+def uid_journal(path, database, changes=None):
+    """Preserve BSON dates and verify the persisted preimages before the first write."""
+    path = Path(path)
+    if changes is not None:
+        payload = json_util.dumps({'database': database, 'changes': changes})
+        envelope = {'uid_migration_version': 1, 'sha256': hashlib.sha256(payload.encode()).hexdigest(),
+                    'payload': payload}
+        with path.open('x', encoding='utf8') as file:
+            json.dump(envelope, file)
+            file.flush()
+            os.fsync(file.fileno())
+    envelope = json.loads(path.read_text(encoding='utf8'))
+    payload = envelope['payload']
+    if envelope.get('uid_migration_version') != 1 or hashlib.sha256(payload.encode()).hexdigest() != envelope['sha256']:
+        raise ValueError('Invalid UID migration backup')
+    data = json_util.loads(payload, json_options=json_util.JSONOptions(tz_aware=True))
+    if data['database'] != database:
+        raise ValueError('UID migration backup belongs to another database')
+    return data['changes']
+
+
+async def apply_uid_journal(db, changes, *, rollback=False, dry_run=False):
+    # The snapshot, conflict check and writes use one Atlas/replica-set transaction.
+    async with db.client.start_session() as session:
+        async with await session.start_transaction():
+            for item in reversed(changes) if rollback else changes:
+                name, key = item['collection'], item['key']
+                if not ((name == 'accounts_v2' and set(key) == {'locket_id'}) or
+                        (name == 'entitlements' and set(key) == {'account_id', 'entitlement_key'}
+                         and key['entitlement_key'] == 'Gold')):
+                    raise ValueError('Invalid UID migration collection or key')
+                before, after = item['before'], item['after']
+                if rollback:
+                    before, after = after, before
+                current = await db[name].find_one(key, {'_id': 0}, session=session)
+                if current == after:
+                    continue
+                if current != before:
+                    raise RuntimeError(f'Conflicting concurrent change in {name}; transaction aborted')
+                if dry_run:
+                    continue
+                if after is None:
+                    await db[name].delete_one(key, session=session)
+                else:
+                    await db[name].replace_one(key, after, upsert=before is None, session=session)
+                if await db[name].find_one(key, {'_id': 0}, session=session) != after:
+                    raise RuntimeError('UID migration verification failed')
 
 
 async def run_migration_cli(
@@ -529,8 +584,26 @@ async def run_migration_cli(
         await client.admin.command('ping')
         db = client[settings.mongodb_database]
         if uid_entitlements:
-            uid_report = await inspect_and_migrate_uid_entitlements(db, dry_run=dry_run)
+            if rollback_path:
+                changes = uid_journal(rollback_path, db.name)
+                await apply_uid_journal(db, changes, rollback=True, dry_run=dry_run)
+                print(f'UID rollback verified: {len(changes)} entries (dry_run={dry_run})')
+                return
+            changes = []
+            uid_report = await inspect_and_migrate_uid_entitlements(db, changes_out=changes)
             print(f"UID Entitlement Migration report (dry_run={dry_run}): {json.dumps(uid_report)}")
+            if not dry_run:
+                if uid_report['aborted_on_conflict']:
+                    raise RuntimeError('UID conflict; no changes applied')
+                if not backup_path:
+                    raise ValueError('UID migration requires --backup pointing to a new file')
+                persisted = uid_journal(backup_path, db.name, changes)
+                await apply_uid_journal(db, persisted)
+                post = await inspect_and_migrate_uid_entitlements(db)
+                if post['planned_changes'] or post['aborted_on_conflict']:
+                    raise RuntimeError('Post-migration audit found outstanding changes')
+                print(f'UID migration verified: {len(persisted)} entries')
+                uid_report.update(dry_run=False, applied_changes=len(persisted), post_migration=post)
             return uid_report
         if reconcile:
             rec_report = await reconcile_collections(db, dry_run=dry_run)

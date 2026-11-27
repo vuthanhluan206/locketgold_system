@@ -650,7 +650,7 @@
       border-radius: 7px;
     }
 
-    .admin td button:nth-child(3) {
+    .admin td button:last-child {
       color: var(--danger);
       border-color: var(--danger-line);
     }
@@ -1370,7 +1370,7 @@
       filter: none;
     }
 
-    .admin #dashboard td button:nth-child(3) {
+    .admin #dashboard td button:last-child {
       border-color: transparent;
     }
 
@@ -1768,6 +1768,15 @@
         font-size: 12px;
       }
     }
+    .admin #overview { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 10px; margin: 0; }
+    .admin #overview div { padding: 12px; background: var(--card); border: 1px solid var(--line); border-radius: 12px; }
+    .admin #overview dt { font-size: .8rem; }
+    .admin #overview dd { margin: 5px 0 0; font-size: 1.4rem; font-weight: 600; }
+    .admin #dashboard td:last-child:not([colspan]) { white-space: normal; }
+    .admin #labDetails .field { display: flex; align-items: center; justify-content: space-between; margin: 8px 0; }
+    .admin #labDetails input[type="checkbox"] { width: 22px; height: 22px; }
+    .admin #labDetails input[type="number"] { width: 78px; }
+    .admin #detailsMessage { overflow-wrap: anywhere; }
   </style>
 </head>
 
@@ -2000,6 +2009,7 @@
           </svg></span>
       </div>
       <div class="workspace-layout">
+        <dl id="overview" aria-label="Account overview"></dl>
         <dialog id="accountDialog" class="account-dialog" aria-labelledby="editorTitle">
           <form id="accountForm" class="editor-panel" aria-labelledby="editorTitle">
             <div class="dialog-heading">
@@ -2024,6 +2034,13 @@
                 </svg>&nbsp; Save account</button>
             </div>
           </form>
+        </dialog>
+        <dialog id="labDetails" class="account-dialog" aria-labelledby="labDetailsTitle">
+          <div class="editor-panel">
+            <div class="dialog-heading"><h3 id="labDetailsTitle"></h3><button id="closeDetails" type="button">Close</button></div>
+            <div id="detailsBody"></div>
+            <p id="detailsMessage" role="status"></p>
+          </div>
         </dialog>
         <section class="directory-panel" aria-labelledby="directoryTitle">
           <div class="directory-heading">
@@ -2087,6 +2104,7 @@
         const $ = id => document.getElementById(id);
         const accountDialog = $('accountDialog');
         function openAccountDialog(editing = false) {
+          $('accountId').readOnly = editing;
           if (!editing) $('accountForm').reset();
           $('editorTitle').textContent = editing ? 'Edit / renew account' : 'Add account';
           $('accountMessage').textContent = '';
@@ -2140,6 +2158,8 @@
         }
         function clearSession() {
           accountDialog.close();
+          $('labDetails').close();
+          $('overview').textContent = '';
           clearTimeout(timer); session = null;
           try { localStorage.removeItem(key); } catch { }
           $('dashboard').hidden = true; $('loginScreen').hidden = false;
@@ -2166,14 +2186,23 @@
           return response.status === 204 ? null : response.json();
         }
         async function load() {
-          const rows = await api('/admin/accounts?skip=' + skip + '&limit=' + limit);
+          $('overview').textContent = '';
+          const [rows, totals] = await Promise.all([api('/admin/accounts?skip=' + skip + '&limit=' + limit), api('/admin/overview')]);
           if (!session) return;
+          for (const [key, title] of Object.entries({accounts:'Accounts',active:'Gold active',pending:'Pending',
+            expired:'Expired',revoked:'Revoked',verified_uid:'Verified UID',devices:'Active devices',entitlements:'Gold records',
+            downloads:'Profile downloads',uid_errors:'UID lookup errors',gold_errors:'Logged Gold write errors'})) {
+            const metric = document.createElement('div'), label = document.createElement('dt'), value = document.createElement('dd');
+            label.textContent = title; value.textContent = totals[key]; metric.append(label, value); $('overview').append(metric);
+          }
           const body = $('accounts'); body.replaceChildren();
           for (const [rowIndex, row] of rows.entries()) {
             const tr = document.createElement('tr');
             const number = document.createElement('td');
             number.className = 'row-number'; number.textContent = String(skip + rowIndex + 1); tr.append(number);
-            const rawSt = String(row.status || '').toLowerCase(); const isFuture = new Date(row.expires_date) > new Date(); const isVerifiedUid = row.verification_status === 'verified_uid' && Boolean(row.firebase_uid); const statusText = rawSt === 'revoked' ? 'Revoked' : !isFuture ? 'Expired' : (rawSt === 'pending' || !isVerifiedUid) ? 'Pending' : 'Gold'; for (const [index, value] of [row.locket_id, new Date(row.expires_date).toLocaleString('en-US'), statusText].entries()) {
+            const isVerifiedUid = row.verification_status === 'verified_uid' && Boolean(row.firebase_uid);
+            const statusText = ({ active: 'Gold', expired: 'Expired', pending: 'Pending', revoked: 'Revoked' })[row.status] || 'Unauthorized';
+            for (const [index, value] of [row.locket_id, new Date(row.expires_date).toLocaleString('en-US'), statusText].entries()) {
               const td = document.createElement('td');
               const label = document.createElement('span'); label.textContent = value;
               if (index === 0) {
@@ -2202,7 +2231,12 @@
                   uidMeta.textContent = 'Firebase UID: Chưa xác minh (Chưa liên kết Firebase UID)';
                   verMeta.textContent = 'Verification: Unverified · Gold: Pending (Chờ xác minh UID)';
                 }
-                stack.append(name, uidMeta, verMeta);
+                verMeta.textContent = 'Verification: ' + row.verification_status + ' · ' + row.verification_source;
+                if (row.status === 'pending') verMeta.textContent += isVerifiedUid ? ' · Chờ cấp quyền Gold' : ' · Chờ xác minh UID';
+                const deviceInfo = document.createElement('div'); deviceInfo.className = 'account-uid-meta';
+                deviceInfo.textContent = 'Devices: ' + row.active_devices + '/' + row.max_devices +
+                  ' · Activated: ' + (row.activated_at ? new Date(row.activated_at).toLocaleString() : '—');
+                stack.append(name, uidMeta, verMeta, deviceInfo);
                 td.append(stack);
               } else {
                 label.className = index === 1 ? 'account-expiry' : 'account-status' + (value === 'Gold' ? ' is-gold' : '');
@@ -2248,11 +2282,100 @@
               const path = document.createElementNS('http://www.w3.org/2000/svg', 'path');
               path.setAttribute('d', pathData); icon.append(path); button.replaceChildren(icon);
             }
-            actions.append(edit, check, remove); tr.append(actions); body.append(tr);
+            const path = '/admin/accounts/' + encodeURIComponent(row.locket_id);
+            const activate = actionButton('Activate Gold', async () => {
+              await api(path + '/activate', {method: 'POST', body: JSON.stringify({expires_date: row.expires_date})});
+              await load();
+            });
+            activate.disabled = !isVerifiedUid || row.status === 'active' || Date.parse(row.expires_date) <= Date.now();
+            const revoke = actionButton('Revoke Gold', async () => {
+              const reason = prompt('Lý do thu hồi Gold');
+              if (!reason?.trim()) return;
+              await api(path + '/revoke', {method: 'POST', body: JSON.stringify({reason: reason.trim()})});
+              await load();
+            });
+            revoke.disabled = row.status === 'revoked';
+            edit.title = 'Edit / Renew';
+            actions.append(edit, check, activate, revoke, actionButton('Lab features', () => features(row)),
+              actionButton('Devices', () => devices(row)), remove);
+            tr.append(actions); body.append(tr);
           }
           if (!rows.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 5; td.textContent = 'No accounts yet.'; tr.append(td); body.append(tr); }
           $('previous').disabled = skip === 0; $('next').disabled = rows.length < limit || skip + limit > 10000;
           $('page').textContent = 'Page ' + (skip / limit + 1);
+        }
+        function actionButton(title, handler) {
+          const b = document.createElement('button');
+          b.type = 'button'; b.className = 'secondary'; b.textContent = title;
+          b.onclick = async () => {
+            b.disabled = true;
+            try { await handler(); }
+            catch (e) { $($('labDetails').open ? 'detailsMessage' : 'adminMessage').textContent = e.message; }
+            finally { b.disabled = false; }
+          };
+          return b;
+        }
+        function detailPanel(title) {
+          $('labDetailsTitle').textContent = title;
+          $('detailsMessage').textContent = ''; $('detailsBody').replaceChildren();
+          if (!$('labDetails').open) $('labDetails').showModal();
+          return $('detailsBody');
+        }
+        $('closeDetails').onclick = () => $('labDetails').close();
+        $('labDetails').onclose = () => { $('detailsBody').replaceChildren(); $('detailsMessage').textContent = ''; };
+        async function features(row) {
+          const path = '/admin/accounts/' + encodeURIComponent(row.locket_id) + '/features';
+          const config = await api(path);
+          const panel = detailPanel('Gold features · Lab Client · ' + row.locket_id);
+          const fields = [];
+          for (const [key, title] of Object.entries({
+            max_video_duration_seconds: 'Video duration (0–60 seconds)', enable_private_posts: 'Private posts',
+            unlocked_filters: 'Unlocked filters', camera_filters_enabled: 'Camera filters',
+            holiday_effects_enabled: 'Holiday effects', unlocked_all_filters: 'All filters',
+          })) {
+            const label = document.createElement('label'); label.className = 'field'; label.textContent = title;
+            const input = document.createElement('input');
+            if (key === 'max_video_duration_seconds') {
+              input.type = 'number'; input.min = 0; input.max = 60; input.required = true; input.value = config[key];
+            } else { input.type = 'checkbox'; input.checked = config[key]; }
+            label.append(input); panel.append(label); fields.push([key, input]);
+          }
+          panel.append(actionButton('Save feature configuration', async () => {
+            const flags = {};
+            for (const [key, input] of fields) {
+              if (!input.reportValidity()) return;
+              flags[key] = input.type === 'checkbox' ? input.checked : input.valueAsNumber;
+            }
+            await api(path, {method: 'PUT', body: JSON.stringify(flags)});
+            $('detailsMessage').textContent = 'Đã lưu cấu hình Lab Client.';
+          }));
+        }
+        async function devices(row) {
+          const list = await api('/admin/devices?locket_id=' + encodeURIComponent(row.locket_id));
+          const panel = detailPanel('Devices · ' + row.locket_id);
+          panel.append(actionButton('Add device', async () => {
+            const device_name = prompt('Device name'); if (!device_name) return;
+            const ios_version = prompt('iOS version'); if (!ios_version) return;
+            const device = await api('/admin/devices', {method: 'POST',
+              body: JSON.stringify({locket_id: row.locket_id, device_name, ios_version})});
+            await devices(row);
+            $('detailsMessage').textContent = 'Device token (shown once): ' + device.device_token;
+          }));
+          for (const device of list) {
+            const p = document.createElement('p');
+            p.textContent = [device.device_name, device.device_id, 'iOS ' + device.ios_version, device.status,
+              device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : 'Never seen'].join(' · ');
+            panel.append(p);
+            if (device.status !== 'active') continue;
+            const path = '/admin/devices/' + encodeURIComponent(device.device_id);
+            panel.append(actionButton('Revoke device', async () => {
+              if (!confirm('Revoke ' + device.device_name + '?')) return;
+              await api(path + '/revoke', {method: 'POST'}); await devices(row);
+            }), actionButton('Download DNS profile', async () => {
+              const ticket = await api(path + '/profile-ticket?mode=dns_only', {method: 'POST'});
+              window.location.assign(ticket.download_url);
+            }));
+          }
         }
         async function enter() {
           if (!session || !Number.isFinite(Date.parse(session.expires_at)) || Date.parse(session.expires_at) <= Date.now()) { clearSession(); return; }
@@ -2296,7 +2419,7 @@
               }),
             });
             const summary = saved && saved.firebase_uid && saved.verification_status === 'verified_uid'
-              ? 'Firebase UID đã xác minh: ' + saved.firebase_uid + ' · Gold: Active'
+              ? 'Firebase UID đã xác minh: ' + saved.firebase_uid + ' · Gold: ' + saved.status
               : saved && saved.firebase_uid
                 ? 'Đã tìm được UID — cần xác minh: ' + saved.firebase_uid + ' · Gold: Pending (Chờ xác minh UID)'
                 : saved && saved.invite_token

@@ -478,6 +478,11 @@ volumes:
             "python", "-c", mongo_verify_script,
         ])
         assert db_check.returncode == 0
+        activation, _, activation_body = http_req(
+            f"{base_http}/admin/accounts/e2e_user_1/activate", method="POST", headers=admin_headers,
+            json_body={"expires_date": future_exp},
+        )
+        assert activation == 200 and json.loads(activation_body)["status"] == "active"
 
         print("=== [SCENARIO 10, 11 & 12] Enrolling device, testing cross-account 403, concurrent requests & active entitlement ===", flush=True)
         st, _, body = http_req(

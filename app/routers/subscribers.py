@@ -6,14 +6,24 @@ from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from ..config import get_settings
 from ..database import get_accounts
-from ..models import AccountId, compute_entitlement_status, subscriber_response
+from ..models import AccountId, LabGoldFeatures, compute_entitlement_status, subscriber_response
 from ..security import require_subscriber_access
 from ..services.doh_service import decode_base64url_dns_param, resolve_lab_dns_wireformat
-from ..services.entitlement_service import extract_verified_uid_metadata, find_canonical_account
+from ..services.entitlement_service import effective_gold_account, find_canonical_account
 from ..services.lab_inspector_service import redact_headers, redact_payload
 
 router = APIRouter(tags=["Subscribers"])
 Accounts = Annotated[object, Depends(get_accounts)]
+
+
+@router.get('/api/lab/accounts/{account_id}/features', dependencies=[Depends(require_subscriber_access)])
+async def lab_features(account_id: AccountId, request: Request, accounts: Accounts):
+    account = await find_canonical_account(request, account_id, accounts_col=accounts)
+    now = datetime.now(timezone.utc)
+    effective = await effective_gold_account(request, account, account_id, now)
+    status, _ = compute_entitlement_status(effective, now)
+    flags = LabGoldFeatures.model_validate(account.get('lab_features', {})) if status == 'active' else LabGoldFeatures()
+    return {'status': status, 'gold': {'enabled': status == 'active', **flags.model_dump()}}
 
 
 def _map_api_state_label(status: str) -> str:
@@ -34,50 +44,7 @@ async def _resolve_account_and_build_response(
     account = await find_canonical_account(request, account_id, accounts_col=accounts)
 
     now = datetime.now(timezone.utc)
-    eff_account = account.copy() if isinstance(account, dict) else None
-    if isinstance(eff_account, dict):
-        fb_uid, uid_verified, _, _, _ = extract_verified_uid_metadata(eff_account)
-        ent_doc = None
-        entitlements_col = getattr(request.app.state, 'entitlements', None)
-        if entitlements_col is not None and hasattr(entitlements_col, 'find_one') and fb_uid:
-            try:
-                ent_doc = entitlements_col.find_one({'account_id': fb_uid, 'entitlement_key': 'Gold'}, {'_id': 0})
-                if hasattr(ent_doc, '__await__'):
-                    ent_doc = await ent_doc
-                if isinstance(ent_doc, dict) and (
-                    str(ent_doc.get('status') or '').lower() == 'revoked' or ent_doc.get('revoked_at') is not None
-                ):
-                    eff_account['status'] = 'revoked'
-                    eff_account['revoked_at'] = ent_doc.get('revoked_at') or now
-            except Exception as exc:
-                raise HTTPException(503, 'Entitlement lookup unavailable') from exc
-
-        raw_status, account_expiry = compute_entitlement_status(eff_account, now)
-        if raw_status not in {'revoked', 'expired'}:
-            if not uid_verified or not fb_uid:
-                eff_account['status'] = 'pending'
-            elif account_id != fb_uid:
-                # Reject attempts to bypass UID entitlement by querying with a username or invite token
-                eff_account = None
-            elif raw_status == 'active':
-                if entitlements_col is None or not hasattr(entitlements_col, 'find_one'):
-                    raise HTTPException(503, 'Entitlement lookup unavailable')
-                if (not isinstance(ent_doc, dict) or ent_doc.get('account_id') != fb_uid
-                        or ent_doc.get('entitlement_key') != 'Gold'
-                        or ent_doc.get('status') not in ('active', 'expired')):
-                    eff_account['status'] = 'pending'
-                else:
-                    grant = {**ent_doc, 'grace_period_expires_date': None}
-                    grant_status, grant_expiry = compute_entitlement_status(grant, now)
-                    if ent_doc.get('status') == 'expired' or grant_status == 'expired':
-                        eff_account.update(expires_date=min(grant_expiry or now, now),
-                                           grace_period_expires_date=None)
-                    elif grant_status == 'active':
-                        eff_account.update(expires_date=min(account_expiry, grant_expiry),
-                                           grace_period_expires_date=None)
-                    else:
-                        eff_account['status'] = grant_status
-
+    eff_account = await effective_gold_account(request, account, account_id, now)
     status, _ = compute_entitlement_status(eff_account, now)
     state_label = _map_api_state_label(status)
     payload = subscriber_response(account_id, eff_account, now)

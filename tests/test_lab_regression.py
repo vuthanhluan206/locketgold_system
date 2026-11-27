@@ -137,6 +137,7 @@ def test_pki_lab_root_ca_and_leaf_generation():
 def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
     password = secrets.token_urlsafe(20)
     encoded = hash_password(password)
+    monkeypatch.setenv('APP_ENV', 'test')
     monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
     monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
     monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
@@ -267,6 +268,11 @@ def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
     app.dependency_overrides[get_accounts] = lambda: accounts
     app.state.accounts = accounts
     app.state.accounts_v2 = accounts_v2
+    grants = {}
+    app.state.entitlements = AsyncMock()
+    app.state.entitlements.update_one.side_effect = lambda q, u, upsert=False: grants.update({q['account_id']: u['$set']})
+    app.state.entitlements.find_one.side_effect = lambda q, projection: grants.get(q['account_id'])
+
     app.state.devices = devices
     app.state.download_tickets = download_tickets
     app.state.admins = admins
@@ -352,10 +358,6 @@ def test_end_to_end_lab_flow_devices_revocation_and_scoped_profile(monkeypatch):
         replay_res = http.get(f'/profile.mobileconfig?mode=scoped_lab&ticket={download_ticket}')
         assert replay_res.status_code == 401
 
-        app.state.entitlements = AsyncMock()
-        app.state.entitlements.find_one.return_value = {
-            'account_id': '4Vee1rBLoJN9TDjql9xPzDEuf5D2', 'entitlement_key': 'Gold', 'status': 'active', 'expires_date': future_exp,
-        }
         # 8. Query subscriber endpoint using device_token -> Active Gold
         sub_res = http.get(
             '/v1/subscribers/4Vee1rBLoJN9TDjql9xPzDEuf5D2',

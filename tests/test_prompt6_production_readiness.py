@@ -285,6 +285,11 @@ def test_issue5_mobileconfig_dns_only_vs_lab_ca_and_plist_validation(monkeypatch
         assert payload_types_dns == ['com.apple.dnsSettings.managed']
         assert plist_dns['PayloadContent'][0]['DNSSettings']['ServerURL'] == 'https://dns.nextdns.io/a8b247'
 
+        assert http.get('/profile.mobileconfig?mode=lab_ca').status_code == 403
+        assert len(plistlib.loads(http.get('/profile.mobileconfig').content)['PayloadContent']) == 1
+        monkeypatch.setenv('APP_ENV', 'test')
+        get_settings.cache_clear()
+
         # 2. Lab CA profile (?mode=lab_ca) contains NextDNS + Scoped Domains + Root CA
         res_lab = http.get('/profile.mobileconfig?mode=lab_ca')
         assert res_lab.status_code == 200

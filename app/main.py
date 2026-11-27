@@ -27,6 +27,10 @@ def create_app() -> FastAPI:
 
     @app.exception_handler(PyMongoError)
     async def database_error(request: Request, exc: PyMongoError):
+        actor = getattr(request.state, 'admin_email', None)
+        if actor and request.method == 'POST' and (request.url.path == '/admin/add-account'
+                or request.url.path.endswith(('/activate', '/revoke')) and '/accounts/' in request.url.path):
+            await management.record_audit(request, {'email': actor}, 'GOLD_WRITE_FAILED', request.url.path)
         return JSONResponse({'detail': 'Database unavailable'}, status_code=503)
 
     @app.exception_handler(Exception)

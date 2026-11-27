@@ -6,7 +6,7 @@ from uuid import uuid4
 from fastapi import APIRouter, Depends, HTTPException, Query, Response, Request
 from fastapi.responses import FileResponse, HTMLResponse, PlainTextResponse
 from pymongo.errors import DuplicateKeyError
-from ..database import get_accounts
+from ..database import account_write_options, get_accounts
 from ..middleware import client_ip
 from ..models import (
     AccountId,
@@ -18,10 +18,12 @@ from ..models import (
     DeviceOutput,
     LinkVerifyInput,
     LinkVerifyOutput,
+    LabGoldFeatures,
     ProfileTicketInput,
     ProfileTicketOutput,
     PublicLookupOutput,
     RevokeAccountInput,
+    compute_entitlement_status,
     TestResultInput,
 )
 from ..profile import build_profile, load_validated_root_ca
@@ -34,6 +36,8 @@ from ..services.device_service import (
     verify_device_token,
 )
 from ..services.entitlement_service import (
+    effective_gold_account,
+    evaluate_gold_record,
     extract_verified_uid_metadata,
     find_canonical_account,
     format_account_record,
@@ -266,6 +270,10 @@ async def download_profile(
                 raise HTTPException(401, 'Device token không hợp lệ hoặc đã bị thu hồi.')
             device_label = device_doc.get('device_id')
 
+    if settings.app_env == 'production' and eff_mode in {'lab_ca', 'scoped_lab'}:
+        raise HTTPException(403, 'Lab CA profiles require a research environment')
+    if eff_mode == 'default' and (settings.root_ca_path or settings.root_ca_pem):
+        eff_mode = 'dns_only'
     if eff_mode != 'default' or device_label:
         try:
             scoped = settings.lab_scoped_domains if eff_mode in {'scoped_lab', 'lab_ca'} else None
@@ -328,6 +336,56 @@ async def admin_login_custom(admin_slug: str, request: Request):
 admin_router = APIRouter(prefix='/admin', dependencies=[Depends(require_admin)])
 
 
+@admin_router.get('/overview')
+async def overview(request: Request):
+    state = request.app.state
+    counts = dict(accounts=0, active=0, pending=0, revoked=0, expired=0, verified_uid=0)
+    # Include legacy-only accounts once. Stream the join so dashboard totals have no page limit.
+    pipeline = [
+        {'$project': {'locket_id': 1, 'legacy': '$$ROOT'}},
+        {'$unionWith': {'coll': 'accounts_v2', 'pipeline': [{'$project': {'locket_id': 1, 'canonical': '$$ROOT'}}]}},
+        {'$group': {'_id': '$locket_id', 'canonical': {'$max': '$canonical'}, 'legacy': {'$max': '$legacy'}}},
+        {'$set': {'uid': {'$ifNull': ['$canonical.firebase_uid', '$legacy.firebase_uid']}}},
+        {'$lookup': {'from': 'entitlements', 'localField': 'uid', 'foreignField': 'account_id',
+                     'pipeline': [{'$match': {'entitlement_key': 'Gold'}}], 'as': 'grants'}},
+    ]
+    now = datetime.now(timezone.utc)
+    async for item in await state.accounts.aggregate(pipeline, allowDiskUse=True):
+        account = merge_canonical_and_legacy_account(item.get('canonical'), item.get('legacy'))
+        uid, verified, *_ = extract_verified_uid_metadata(account)
+        grant = next(iter(item['grants']), None)
+        effective = evaluate_gold_record(account, uid or item['_id'], grant, now)
+        status, _ = compute_entitlement_status(effective, now)
+        counts[status] += 1
+        counts['verified_uid'] += int(verified)
+        counts['accounts'] += 1
+    counts['devices'] = await state.devices.count_documents({'status': 'active'})
+    counts['entitlements'] = await state.entitlements.count_documents({'entitlement_key': 'Gold'})
+    counts['downloads'] = await state.profile_versions.count_documents({})
+    counts['uid_errors'] = await state.audit.count_documents({'action': 'ACCOUNT_UID_RESOLUTION_FAILED'})
+    counts['gold_errors'] = await state.audit.count_documents({'action': 'GOLD_WRITE_FAILED'})
+    return counts
+
+
+@admin_router.get('/accounts/{account_id}/features', response_model=LabGoldFeatures)
+async def admin_features(account_id: AccountId, request: Request):
+    doc = await request.app.state.accounts_v2.find_one({'locket_id': account_id}, {'lab_features': 1})
+    if doc is None:
+        raise HTTPException(404, 'Account not found')
+    return doc.get('lab_features', {})
+
+
+@admin_router.put('/accounts/{account_id}/features', response_model=LabGoldFeatures)
+async def save_lab_features(account_id: AccountId, flags: LabGoldFeatures, request: Request,
+                            admin: Annotated[dict, Depends(require_admin)]):
+    result = await request.app.state.accounts_v2.update_one({'locket_id': account_id},
+                                                            {'$set': {'lab_features': flags.model_dump()}})
+    if not result.matched_count:
+        raise HTTPException(404, 'Account not found')
+    await record_audit(request, admin, 'LAB_FEATURES_UPDATED', account_id, flags.model_dump())
+    return flags
+
+
 @admin_router.get('/accounts/lookup', response_model=AdminAccountLookupOutput)
 async def admin_lookup_account_endpoint(
     request: Request,
@@ -378,6 +436,8 @@ async def admin_lookup_account_endpoint(
 
     formatted = format_account_record(record, now)
     fb_uid, uid_ver, ver_status, ver_method, ver_source = extract_verified_uid_metadata(record)
+    effective = await effective_gold_account(request, record, fb_uid or formatted['locket_id'], now)
+    formatted['status'], _ = compute_entitlement_status(effective, now)
     internal_id = formatted['locket_id']
     username = formatted.get('username') or (internal_id if not fb_uid else base_verify.extracted_username)
 
@@ -436,6 +496,8 @@ async def verify_link_endpoint(
             now = datetime.now(timezone.utc)
             formatted = format_account_record(record, now)
             fb_uid, uid_ver, ver_status, ver_method, ver_source = extract_verified_uid_metadata(record)
+            effective = await effective_gold_account(request, record, fb_uid or formatted['locket_id'], now)
+            formatted['status'], _ = compute_entitlement_status(effective, now)
             result.exists_in_db = True
             result.resolved_identifier = formatted['locket_id']
             result.resolved_firebase_uid = fb_uid
@@ -526,6 +588,7 @@ async def upsert_account(
                     continue
 
     uid_resolved_at = existing_v2.get('uid_resolved_at') if isinstance(existing_v2, dict) else None
+    existing_verified = bool(existing_v2 and extract_verified_uid_metadata(existing_v2)[1])
     uid_resolution_source = existing_v2.get('uid_resolution_source') if isinstance(existing_v2, dict) else None
     identity_lookup_at = existing_v2.get('identity_lookup_at') if isinstance(existing_v2, dict) else None
     identity_lookup_source = existing_v2.get('identity_lookup_source') if isinstance(existing_v2, dict) else None
@@ -580,10 +643,13 @@ async def upsert_account(
                     )
             resolved_invite_token = resolution.invite_token or resolved_invite_token
             auto_source_link = resolution.source_link or auto_source_link
-            safe_ver_status = 'verified_uid'
-            safe_ver_method = 'trusted_proof'
             safe_ver_source = resolution.verification_source or 'authorized_identity_provider'
-            server_proof = True
+            server_proof = resolution.uid_verified
+            if existing_verified and existing_v2['firebase_uid'] == resolved_fb_uid and not server_proof:
+                safe_ver_source = existing_v2['verification_source']
+                server_proof = True
+            safe_ver_status = 'verified_uid' if server_proof else 'unverified_uid'
+            safe_ver_method = 'trusted_proof' if server_proof else 'format_only_uid'
             uid_resolved_at = resolution.uid_resolved_at or now
             uid_resolution_source = resolution.uid_resolution_source or safe_ver_source
             identity_lookup_at = resolution.identity_lookup_at or now
@@ -630,9 +696,9 @@ async def upsert_account(
                 server_proof = True
                 resolution_status_val = 'resolved_uid'
             else:
-                resolved_fb_uid = None
-                safe_ver_status = 'unverified_handle'
-                safe_ver_method = 'link_handle_only'
+                resolved_fb_uid = (existing_v2 or {}).get('firebase_uid')
+                safe_ver_status = 'unverified_uid' if resolved_fb_uid else 'unverified_handle'
+                safe_ver_method = 'format_only_uid' if resolved_fb_uid else 'link_handle_only'
                 safe_ver_source = 'locket_public_share_link'
                 server_proof = False
                 resolution_status_val = resolution.status
@@ -694,7 +760,7 @@ async def upsert_account(
                     )
             if (
                 isinstance(existing_v2, dict)
-                and existing_v2.get('_server_uid_proof') is True
+                and existing_verified
                 and existing_v2.get('firebase_uid') == resolved_fb_uid
                 and existing_v2.get('verification_status') == 'verified_uid'
             ):
@@ -709,8 +775,7 @@ async def upsert_account(
                 server_proof = False
         elif (
             isinstance(existing_v2, dict)
-            and existing_v2.get('_server_uid_proof') is True
-            and existing_v2.get('verification_status') == 'verified_uid'
+            and existing_verified
             and existing_v2.get('firebase_uid')
         ):
             # Preserve existing verified UID when renewing expiry date
@@ -740,7 +805,8 @@ async def upsert_account(
         and safe_ver_status == 'verified_uid'
         and is_valid_firebase_uid(resolved_fb_uid)
     )
-    if data.status == 'revoked':
+    was_revoked = bool(existing_v2 and (existing_v2.get('status') == 'revoked' or existing_v2.get('revoked_at')))
+    if data.status == 'revoked' or was_revoked:
         effective_status = 'revoked'
     elif data.status == 'pending' or not is_verified_uid:
         effective_status = 'pending'
@@ -754,7 +820,7 @@ async def upsert_account(
         'locket_id': canonical_id,
         'expires_date': data.expires_date,
         'status': effective_status,
-        'revoked_at': now if effective_status == 'revoked' else None,
+        'revoked_at': ((existing_v2 or {}).get('revoked_at') or now) if effective_status == 'revoked' else None,
     }
     # 2. Write canonical v2 record to `accounts_v2` and `entitlements` (NEVER swallow write failures!)
     v2_doc = {
@@ -777,63 +843,76 @@ async def upsert_account(
         'status': effective_status,
         'product_identifier': 'com.locket.gold.yearly',
         'expires_date': data.expires_date,
-        'revoked_at': now if effective_status == 'revoked' else None,
-        'revoke_reason': 'Set to revoked on save' if effective_status == 'revoked' else None,
-        'max_devices': data.max_devices,
+        'revoked_at': legacy_doc['revoked_at'],
+        'revoke_reason': ((existing_v2 or {}).get('revoke_reason') or 'Set to revoked on save') if effective_status == 'revoked' else None,
+        'activated_at': ((existing_v2 or {}).get('activated_at') or now) if effective_status == 'active' else (existing_v2 or {}).get('activated_at'),
+        'max_devices': data.max_devices if 'max_devices' in data.model_fields_set else (existing_v2 or {}).get('max_devices', data.max_devices),
         'notes': data.notes,
         'updated_at': now,
         'updated_by': admin.get('email', 'superadmin'),
     }
-    if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
+    revision = {}
+    if getattr(request.app.state, 'transactions_supported', None) is False or (existing_v2 or {}).get('grant_revision'):
+        revision = {'grant_revision': str(uuid4())}
+        v2_doc.update(revision)
+    if is_verified_uid and getattr(request.app.state, 'entitlements', None) is None:
+        raise HTTPException(503, 'Entitlement storage unavailable')
+    async with account_write_options(request) as options:
+        if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
+            try:
+                res = accounts_v2.update_one(
+                    {
+                        'locket_id': canonical_id,
+                        'updated_at': (existing_v2 or {}).get('updated_at'),
+                        '$or': [
+                            {'_server_uid_proof': {'$ne': True}},
+                            {'verification_source': 'locket_public_share_link', 'firebase_uid': resolved_fb_uid},
+                            {'firebase_uid': resolved_fb_uid, '_server_uid_proof': server_proof,
+                             'verification_status': safe_ver_status},
+                        ],
+                    },
+                    {'$set': v2_doc, '$setOnInsert': {'created_at': now, 'purchase_date': now}},
+                    upsert=True,
+                    **options,
+                )
+                if hasattr(res, '__await__'):
+                    await res
+            except DuplicateKeyError:
+                raise HTTPException(409, 'UID hoặc tài khoản đã được liên kết đồng thời; vui lòng tra cứu lại (uid_conflict).') from None
+
         try:
-            res = accounts_v2.update_one(
+            await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc}, upsert=True, **options)
+        except DuplicateKeyError:
+            await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc}, **options)
+
+        entitlements = getattr(request.app.state, 'entitlements', None)
+        if is_verified_uid and entitlements is not None and hasattr(entitlements, 'update_one'):
+            res = entitlements.update_one(
+                {'account_id': resolved_fb_uid, 'entitlement_key': 'Gold'},
                 {
-                    'locket_id': canonical_id,
-                    '$or': [
-                        {'_server_uid_proof': {'$ne': True}},
-                        {'firebase_uid': resolved_fb_uid, '_server_uid_proof': server_proof,
-                         'verification_status': safe_ver_status},
-                    ],
+                    '$set': {
+                        'account_id': resolved_fb_uid,
+                        **revision,
+                        'locket_id': canonical_id,
+                        'username': resolved_username or canonical_id,
+                        'entitlement_key': 'Gold',
+                        'product_identifier': 'com.locket.gold.yearly',
+                        'status': effective_status,
+                        'expires_date': data.expires_date,
+                        'revoked_at': v2_doc['revoked_at'],
+                        'updated_at': now,
+                    },
+                    '$setOnInsert': {'purchase_date': now},
                 },
-                {'$set': v2_doc, '$setOnInsert': {'created_at': now, 'purchase_date': now}},
                 upsert=True,
+                **options,
             )
             if hasattr(res, '__await__'):
                 await res
-        except DuplicateKeyError:
-            raise HTTPException(409, 'UID hoặc tài khoản đã được liên kết đồng thời; vui lòng tra cứu lại (uid_conflict).') from None
-
-    try:
-        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc}, upsert=True)
-    except DuplicateKeyError:
-        await accounts.update_one({'locket_id': canonical_id}, {'$set': legacy_doc})
-
-    entitlements = getattr(request.app.state, 'entitlements', None)
-    if is_verified_uid and entitlements is not None and hasattr(entitlements, 'update_one'):
-        res = entitlements.update_one(
-            {'account_id': resolved_fb_uid, 'entitlement_key': 'Gold'},
-            {
-                '$set': {
-                    'account_id': resolved_fb_uid,
-                    'locket_id': canonical_id,
-                    'username': resolved_username or canonical_id,
-                    'entitlement_key': 'Gold',
-                    'product_identifier': 'com.locket.gold.yearly',
-                    'status': effective_status,
-                    'expires_date': data.expires_date,
-                    'revoked_at': v2_doc['revoked_at'],
-                    'updated_at': now,
-                },
-                '$setOnInsert': {'purchase_date': now},
-            },
-            upsert=True,
-        )
-        if hasattr(res, '__await__'):
-            await res
-        if canonical_id != resolved_fb_uid and hasattr(entitlements, 'delete_many'):
-            del_res = entitlements.delete_many({'account_id': canonical_id})
-            if hasattr(del_res, '__await__'):
-                await del_res
+            if canonical_id != resolved_fb_uid and hasattr(entitlements, 'delete_many'):
+                del_res = entitlements.delete_many({'account_id': canonical_id}, **options)
+                if hasattr(del_res, '__await__'):
+                    await del_res
 
     await record_audit(
         request,
@@ -889,11 +968,25 @@ async def list_accounts(
 
     all_ids = sorted(set(v1_map.keys()) | set(v2_map.keys()))
     page_ids = all_ids[skip: skip + limit]
+    device_counts = {}
+    devices = getattr(request.app.state, 'devices', None)
+    if devices is not None and hasattr(devices, 'aggregate'):
+        cursor = await devices.aggregate([
+            {'$match': {'status': 'active', '$or': [{'canonical_locket_id': {'$in': page_ids}},
+                                                    {'locket_id': {'$in': page_ids}}]}},
+            {'$group': {'_id': {'$ifNull': ['$canonical_locket_id', '$locket_id']}, 'count': {'$sum': 1}}},
+        ])
+        async for item in cursor:
+            device_counts[item['_id']] = item['count']
     result = []
     for lid in page_ids:
         merged = merge_canonical_and_legacy_account(v2_map.get(lid), v1_map.get(lid))
         if merged is not None:
-            result.append(format_account_record(merged, now))
+            row = format_account_record(merged, now)
+            row['active_devices'] = device_counts.get(lid, 0)
+            effective = await effective_gold_account(request, merged, row['firebase_uid'] or lid, now)
+            row['status'], _ = compute_entitlement_status(effective, now)
+            result.append(row)
     return result
 
 
@@ -917,53 +1010,57 @@ async def revoke_account(
     entitlement_uid = fb_uid if (uid_verified and fb_uid) else canonical_lid
 
     # Update canonical accounts_v2, legacy accounts, and entitlements (never swallow errors!)
-    await accounts.update_one(
-        {'locket_id': canonical_lid},
-        {'$set': {'status': 'revoked', 'revoked_at': now, 'revoke_reason': data.reason}},
-    )
-    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
-        res = accounts_v2.update_one(
+    async with account_write_options(request) as options:
+        await accounts.update_one(
             {'locket_id': canonical_lid},
-            {
-                '$set': {
-                    'locket_id': canonical_lid,
-                    'account_id': entitlement_uid,
-                    'status': 'revoked',
-                    'expires_date': eff_expiry,
-                    'revoked_at': now,
-                    'revoke_reason': data.reason,
-                    'updated_at': now,
-                    'updated_by': admin.get('email', 'superadmin'),
-                }
-            },
-            upsert=True,
+            {'$set': {'status': 'revoked', 'revoked_at': now, 'revoke_reason': data.reason}},
+            **options,
         )
-        if hasattr(res, '__await__'):
-            await res
+        accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
+        if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
+            res = accounts_v2.update_one(
+                {'locket_id': canonical_lid},
+                {
+                    '$set': {
+                        'locket_id': canonical_lid,
+                        'account_id': entitlement_uid,
+                        'status': 'revoked',
+                        'expires_date': eff_expiry,
+                        'revoked_at': now,
+                        'revoke_reason': data.reason,
+                        'updated_at': now,
+                        'updated_by': admin.get('email', 'superadmin'),
+                    }
+                },
+                upsert=True,
+                **options,
+            )
+            if hasattr(res, '__await__'):
+                await res
 
-    entitlements = getattr(request.app.state, 'entitlements', None)
-    if entitlements is not None and hasattr(entitlements, 'update_one'):
-        res = entitlements.update_one(
-            {'account_id': entitlement_uid, 'entitlement_key': 'Gold'},
-            {
-                '$set': {
-                    'account_id': entitlement_uid,
-                    'locket_id': canonical_lid,
-                    'entitlement_key': 'Gold',
-                    'status': 'revoked',
-                    'revoked_at': now,
-                    'updated_at': now,
-                }
-            },
-            upsert=True,
-        )
-        if hasattr(res, '__await__'):
-            await res
-        if canonical_lid != entitlement_uid and hasattr(entitlements, 'delete_many'):
-            del_res = entitlements.delete_many({'account_id': canonical_lid})
-            if hasattr(del_res, '__await__'):
-                await del_res
+        entitlements = getattr(request.app.state, 'entitlements', None)
+        if entitlements is not None and hasattr(entitlements, 'update_one'):
+            res = entitlements.update_one(
+                {'account_id': entitlement_uid, 'entitlement_key': 'Gold'},
+                {
+                    '$set': {
+                        'account_id': entitlement_uid,
+                        'locket_id': canonical_lid,
+                        'entitlement_key': 'Gold',
+                        'status': 'revoked',
+                        'revoked_at': now,
+                        'updated_at': now,
+                    }
+                },
+                upsert=True,
+                **options,
+            )
+            if hasattr(res, '__await__'):
+                await res
+            if canonical_lid != entitlement_uid and hasattr(entitlements, 'delete_many'):
+                del_res = entitlements.delete_many({'account_id': canonical_lid}, **options)
+                if hasattr(del_res, '__await__'):
+                    await del_res
 
     await record_audit(
         request,
@@ -1005,58 +1102,70 @@ async def activate_account(
         )
 
     now = datetime.now(timezone.utc)
-    new_expiry = data.expires_date or (now + timedelta(days=365))
-    if new_expiry <= now:
+    new_expiry = data.expires_date or existing.get('expires_date')
+    if new_expiry is None or new_expiry <= now:
         raise HTTPException(422, 'expires_date must be in the future')
+    if getattr(request.app.state, 'entitlements', None) is None:
+        raise HTTPException(503, 'Entitlement storage unavailable')
+    revision = {}
+    if getattr(request.app.state, 'transactions_supported', None) is False or existing.get('grant_revision'):
+        revision = {'grant_revision': str(uuid4())}
 
-    await accounts.update_one(
-        {'locket_id': canonical_lid},
-        {'$set': {'expires_date': new_expiry, 'status': 'active', 'revoked_at': None, 'revoke_reason': None}},
-    )
-    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
-        res = accounts_v2.update_one(
+    async with account_write_options(request) as options:
+        await accounts.update_one(
             {'locket_id': canonical_lid},
-            {
-                '$set': {
-                    'locket_id': canonical_lid,
-                    'account_id': fb_uid,
-                    'status': 'active',
-                    'expires_date': new_expiry,
-                    'revoked_at': None,
-                    'revoke_reason': None,
-                    'updated_at': now,
-                    'updated_by': admin.get('email', 'superadmin'),
-                }
-            },
-            upsert=True,
+            {'$set': {'expires_date': new_expiry, 'status': 'active', 'revoked_at': None, 'revoke_reason': None}},
+            **options,
         )
-        if hasattr(res, '__await__'):
-            await res
+        accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
+        if accounts_v2 is not None and hasattr(accounts_v2, 'update_one'):
+            res = accounts_v2.update_one(
+                {'locket_id': canonical_lid},
+                {
+                    '$set': {
+                        'locket_id': canonical_lid,
+                        'account_id': fb_uid,
+                        **revision,
+                        'status': 'active',
+                        'activated_at': now,
+                        'expires_date': new_expiry,
+                        'revoked_at': None,
+                        'revoke_reason': None,
+                        'updated_at': now,
+                        'updated_by': admin.get('email', 'superadmin'),
+                    }
+                },
+                upsert=True,
+                **options,
+            )
+            if hasattr(res, '__await__'):
+                await res
 
-    entitlements = getattr(request.app.state, 'entitlements', None)
-    if entitlements is not None and hasattr(entitlements, 'update_one'):
-        res = entitlements.update_one(
-            {'account_id': fb_uid, 'entitlement_key': 'Gold'},
-            {
-                '$set': {
-                    'account_id': fb_uid,
-                    'locket_id': canonical_lid,
-                    'entitlement_key': 'Gold',
-                    'status': 'active',
-                    'expires_date': new_expiry,
-                    'revoked_at': None,
-                    'updated_at': now,
-                }
-            },
-            upsert=True,
-        )
-        if hasattr(res, '__await__'):
-            await res
-        if canonical_lid != fb_uid and hasattr(entitlements, 'delete_many'):
-            del_res = entitlements.delete_many({'account_id': canonical_lid})
-            if hasattr(del_res, '__await__'):
-                await del_res
+        entitlements = getattr(request.app.state, 'entitlements', None)
+        if entitlements is not None and hasattr(entitlements, 'update_one'):
+            res = entitlements.update_one(
+                {'account_id': fb_uid, 'entitlement_key': 'Gold'},
+                {
+                    '$set': {
+                        'account_id': fb_uid,
+                        **revision,
+                        'locket_id': canonical_lid,
+                        'entitlement_key': 'Gold',
+                        'status': 'active',
+                        'expires_date': new_expiry,
+                        'revoked_at': None,
+                        'updated_at': now,
+                    }
+                },
+                upsert=True,
+                **options,
+            )
+            if hasattr(res, '__await__'):
+                await res
+            if canonical_lid != fb_uid and hasattr(entitlements, 'delete_many'):
+                del_res = entitlements.delete_many({'account_id': canonical_lid}, **options)
+                if hasattr(del_res, '__await__'):
+                    await del_res
 
     await record_audit(
         request,
@@ -1083,46 +1192,30 @@ async def delete_account(
     accounts: Accounts,
     admin: Annotated[dict, Depends(require_admin)],
 ):
-    existing = None
-    try:
-        existing = await find_canonical_account(request, account_id, accounts_col=accounts)
-    except Exception:
-        existing = None
-
-    canonical_lid = str(existing.get('locket_id') or account_id) if isinstance(existing, dict) else account_id
-    fb_uid = existing.get('firebase_uid') if isinstance(existing, dict) else None
-    acc_id = existing.get('account_id') if isinstance(existing, dict) else None
-    all_entitlement_keys = {k for k in (account_id, canonical_lid, fb_uid, acc_id) if isinstance(k, str) and k}
-
-    result_v1 = await accounts.delete_one({'locket_id': canonical_lid})
-    deleted_v1 = getattr(result_v1, 'deleted_count', 0) or 0
-    if not deleted_v1 and account_id != canonical_lid:
-        result_v1_alt = await accounts.delete_one({'locket_id': account_id})
-        deleted_v1 = getattr(result_v1_alt, 'deleted_count', 0) or 0
-
-    deleted_v2 = 0
-    accounts_v2 = getattr(request.app.state, 'accounts_v2', None)
-    if accounts_v2 is not None and hasattr(accounts_v2, 'delete_one'):
-        res_v2 = accounts_v2.delete_one({'locket_id': canonical_lid})
-        if hasattr(res_v2, '__await__'):
-            res_v2 = await res_v2
-        deleted_v2 = getattr(res_v2, 'deleted_count', 0) or 0
-        if not deleted_v2 and account_id != canonical_lid:
-            res_v2_alt = accounts_v2.delete_one({'locket_id': account_id})
-            if hasattr(res_v2_alt, '__await__'):
-                res_v2_alt = await res_v2_alt
-            deleted_v2 = getattr(res_v2_alt, 'deleted_count', 0) or 0
-
-    entitlements = getattr(request.app.state, 'entitlements', None)
-    if entitlements is not None and hasattr(entitlements, 'delete_many'):
-        for ent_key in sorted(all_entitlement_keys):
-            res_ent = entitlements.delete_many({'account_id': ent_key})
-            if hasattr(res_ent, '__await__'):
-                await res_ent
-
-    if not deleted_v1 and not deleted_v2:
+    existing = await find_canonical_account(request, account_id, accounts_col=accounts)
+    if existing is None:
         raise HTTPException(404, 'Account not found')
-    await record_audit(request, admin, 'ACCOUNT_DELETE', canonical_lid, {'firebase_uid': fb_uid})
+    lid = existing['locket_id']
+    uid, verified, *_ = extract_verified_uid_metadata(existing)
+    await record_audit(request, admin, 'ACCOUNT_DELETE_REQUESTED', lid)
+    async with account_write_options(request) as options:
+        devices = getattr(request.app.state, 'devices', None)
+        if devices is not None and hasattr(devices, 'update_many'):
+            await devices.update_many({'$or': [{'locket_id': lid}, {'canonical_locket_id': lid}]},
+                                      {'$set': {'status': 'revoked', 'revoked_at': datetime.now(timezone.utc)},
+                                       '$unset': {'slot_index': ''}}, **options)
+        grants = getattr(request.app.state, 'entitlements', None)
+        if grants is not None:
+            for key in {lid, uid if verified else lid}:
+                await grants.delete_many({'account_id': key, 'entitlement_key': 'Gold',
+                                          '$or': [{'locket_id': lid}, {'locket_id': {'$exists': False}}]}, **options)
+            await grants.delete_many({'locket_id': lid, 'entitlement_key': 'Gold'}, **options)
+        await accounts.delete_one({'locket_id': lid}, **options)
+        canonical = getattr(request.app.state, 'accounts_v2', None)
+        if canonical is not None:
+            await canonical.delete_one({'locket_id': lid}, **options)
+
+    await record_audit(request, admin, 'ACCOUNT_DELETE', lid, {'firebase_uid': uid})
     return Response(status_code=204)
 
 

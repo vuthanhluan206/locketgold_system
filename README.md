@@ -79,6 +79,13 @@ Khởi động sẽ kết nối MongoDB, tạo index và chỉ tạo superadmin 
 | DELETE | `/admin/accounts/{account_id}` | Bearer session |
 | GET | `/profile.mobileconfig` | Công khai |
 | GET | `/v1/subscribers/{account_id}` | Bearer phiên Admin hoặc token riêng cho server tin cậy |
+| GET | `/admin/overview` | Tổng số tài khoản, trạng thái Gold hiệu lực, thiết bị, profile và lỗi đã ghi nhận |
+| POST | `/admin/accounts/{account_id}/activate`, `/admin/accounts/{account_id}/revoke` | Kích hoạt theo thời hạn hoặc thu hồi có lý do |
+| GET, PUT | `/admin/accounts/{locket_id}/features` | Admin đọc và lưu cấu hình Lab trong `accounts_v2.lab_features` |
+| GET | `/api/lab/accounts/{verified_uid}/features` | Quyền hiệu lực của Lab Client, xác thực bằng phiên Admin, service token hoặc device token đúng tài khoản |
+| GET | `/api/lab/subscribers/{verified_uid}` | CustomerInfo mô phỏng của Lab |
+| GET, POST | `/admin/devices` | Liệt kê hoặc đăng ký thiết bị |
+| POST | `/admin/devices/{device_id}/revoke`, `/admin/devices/{device_id}/profile-ticket` | Thu hồi thiết bị hoặc phát hành ticket một lần |
 
 Đăng nhập:
 
@@ -89,14 +96,16 @@ Khởi động sẽ kết nối MongoDB, tạo index và chỉ tạo superadmin 
 Thêm/gia hạn, kèm `Authorization: Bearer ACCESS_TOKEN`:
 
 ```json
-{"locket_id":"example_user_123","expires_date":"2026-12-31T23:59:59Z"}
+{"locket_id":"vt.l","expires_date":"2027-12-31T23:59:59Z","public_only":true,"resolve_identity":true}
 ```
 
 ID là chuỗi 1–128 ký tự ASCII thuộc `[A-Za-z0-9_$:@.\-]`. Không chấp nhận object MongoDB, HTML hay đường dẫn. Thời hạn phải có múi giờ và ở tương lai; lưu/so sánh UTC. MongoDB dùng unique index chống trùng ID. Giao diện hiển thị dữ liệu bằng `textContent`, không dùng `innerHTML`.
 
 API subscriber từ chối tra cứu ẩn danh (401). Server tích hợp có thể dùng `Authorization: Bearer SUBSCRIBER_API_TOKEN` khi đã cấu hình biến tùy chọn này bằng token ngẫu nhiên 32–256 ký tự ASCII, không có khoảng trắng. Không đặt biến rỗng; bỏ biến nếu không dùng. Token này chỉ dành cho server tin cậy và có quyền tra cứu mọi ID, không phải token cho người dùng cuối. Không nhúng token server/Admin vào ứng dụng di động. Phiên Admin cũng có thể dùng để kiểm tra API.
 
-Luồng tích hợp ứng dụng do bạn kiểm soát: ứng dụng đăng nhập hệ thống của bạn → server xác minh danh tính và lấy ID nội bộ từ phiên → server gọi API thuê bao bằng token riêng → trả trạng thái được phép cho chính người dùng đó. Chưa có mã nguồn client/nhà cung cấp danh tính trong repo; không thể tự suy ra ID từ link chia sẻ hoặc bật Gold trong Locket chính thức bằng DNS/CA. Không coi username trong link là ID nội bộ nếu chưa xác minh.
+Add Account nhận username, @handle hoặc link chia sẻ. Resolver giữ invite token và lưu phần định danh trích được vào `firebase_uid` với nguồn `locket_public_share_link`. Tài khoản ở trạng thái Pending cho đến khi có bằng chứng độc lập. Admin có thể gia hạn ngay trên dòng tài khoản. Tài khoản đã thu hồi cần thao tác Activate riêng.
+
+Hai API Subscriber và API tính năng Lab kiểm tra cùng một quyền Gold theo UID. Khi quyền hết hạn hoặc bị thu hồi, các cờ hiệu lực đều tắt và thời lượng video Gold bằng 0. Cấu hình đã lưu vẫn có trong trang quản trị. Repository cung cấp hợp đồng API cho client do bạn kiểm soát. Quyền trong ứng dụng Locket chính thức do nhà cung cấp quản lý.
 
 ## Giới hạn và headers
 
