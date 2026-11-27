@@ -294,7 +294,7 @@ def test_problem7_mongodb_reconciliation_never_reactivates_revoked_accounts():
         # stale_mirror MUST have canonical future_v2 expiry across v1 and entitlements
         assert v1_store['stale_mirror']['expires_date'] == future_v2
         assert ent_store['stale_mirror']['expires_date'] == future_v2
-        assert ent_store['stale_mirror']['status'] == 'active'
+        assert ent_store['stale_mirror']['status'] == 'pending'
 
         # Second pass reports zero drift
         clean = await reconcile_collections(db, dry_run=True)

@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 import re
+from fastapi import HTTPException
 from ..models import (
     compute_entitlement_status,
     normalize_expiry,
@@ -14,7 +15,6 @@ SERVER_TRUSTED_UID_SOURCES = {
     'cryptographic_id_token',
     'authorized_identity_provider',
     'owner_localid_match',
-    'locket_public_share_link',
 }
 
 
@@ -106,7 +106,7 @@ def extract_verified_uid_metadata(record: dict) -> tuple[str | None, bool, str, 
     has_server_proof = record.get('_server_uid_proof') is True
 
     if (
-        candidate_uid is not None
+        candidate_uid is not None and FIREBASE_UID_RE.fullmatch(candidate_uid)
         and has_server_proof
         and rec_status == 'verified_uid'
         and rec_method == 'trusted_proof'
@@ -186,6 +186,7 @@ def format_account_record(record: dict, now: datetime | None = None) -> dict:
         'uid_resolution_source': record.get('uid_resolution_source'),
         'resolution_status': record.get('resolution_status'),
         'max_devices': int(record.get('max_devices') or 2),
+        'activated_at': record.get('activated_at'),
         'revoked_at': record.get('revoked_at'),
         'revoke_reason': record.get('revoke_reason'),
         'notes': record.get('notes'),
@@ -231,3 +232,47 @@ async def find_canonical_account(request, account_id: str, accounts_col=None) ->
             doc_v1 = res
 
     return merge_canonical_and_legacy_account(doc_v2, doc_v1)
+
+
+async def effective_gold_account(request, account, account_id: str, now: datetime):
+    """Resolve the Gold grant shared by the admin dashboard and lab APIs."""
+    if not account:
+        return None
+    uid, verified, *_ = extract_verified_uid_metadata(account)
+    grant = None
+    if verified:
+        collection = getattr(request.app.state, 'entitlements', None)
+        if collection is None:
+            raise HTTPException(503, 'Entitlement lookup unavailable')
+        try:
+            grant = await collection.find_one({'account_id': uid, 'entitlement_key': 'Gold'}, {'_id': 0})
+        except Exception as exc:
+            raise HTTPException(503, 'Entitlement lookup unavailable') from exc
+    return evaluate_gold_record(account, account_id, grant, now)
+
+
+def evaluate_gold_record(account, requested_id, grant, now):
+    """Intersect account and grant states and return a record usable by the lab response formatter."""
+    record = {**account, 'grace_period_expires_date': None}
+    uid, verified, *_ = extract_verified_uid_metadata(record)
+    if verified and requested_id != uid:
+        return None
+    account_status, account_expiry = compute_entitlement_status(record, now)
+    if account_status == 'revoked':
+        return record
+    if record.get('status') == 'expired' or account_status == 'expired':
+        return {**record, 'expires_date': min(account_expiry or now, now)}
+    if not verified or record.get('status') != 'active':
+        return {**record, 'status': 'pending'}
+    if (not isinstance(grant, dict) or grant.get('account_id') != uid or grant.get('entitlement_key') != 'Gold'
+            or grant.get('locket_id', record.get('locket_id')) != record.get('locket_id')
+            or grant.get('grant_revision') != record.get('grant_revision')):
+        return {**record, 'status': 'pending'}
+    grant_status, expiry = compute_entitlement_status({**grant, 'grace_period_expires_date': None}, now)
+    if grant_status == 'revoked':
+        return {**record, 'status': 'revoked', 'revoked_at': grant.get('revoked_at') or now}
+    if grant.get('status') == 'expired' or grant_status == 'expired':
+        return {**record, 'expires_date': min(expiry or now, now)}
+    if grant.get('status') != 'active' or grant_status != 'active' or account_status != 'active':
+        return {**record, 'status': 'pending'}
+    return {**record, 'expires_date': min(account_expiry, expiry)}

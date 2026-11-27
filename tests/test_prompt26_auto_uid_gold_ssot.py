@@ -448,7 +448,7 @@ def test_02_06_07_08_09_10_auto_public_resolver_and_verified_uid_preservation(pr
     assert ent_store[(verified_uid, 'Gold')]['status'] == 'active'
 
     # Real 44-char compound Locket invite token (`<28-char-Firebase-UID><16-char-hex-suffix>`, e.g. vt.l):
-    # Extracts 28-char `firebase_uid`, preserves full 44-char `invite_token`, and activates Gold immediately!
+    # The public prefix is retained as a candidate until independently verified.
     v2_store.clear()
     ent_store.clear()
     real_invite_44 = 'juNBPjHxRYeYXtMzPIy0YSjzIL83907433b66b8185cb'
@@ -486,17 +486,15 @@ def test_02_06_07_08_09_10_auto_public_resolver_and_verified_uid_preservation(pr
     assert saved_compound['username'] == 'vt.l'
     assert saved_compound['firebase_uid'] == real_uid_28
     assert saved_compound['invite_token'] == real_invite_44
-    assert saved_compound['verification_status'] == 'verified_uid'
-    assert saved_compound['status'] == 'active'
-    assert v2_store['vt.l']['account_id'] == real_uid_28
-    assert (real_uid_28, 'Gold') in ent_store
-    assert ent_store[(real_uid_28, 'Gold')]['status'] == 'active'
+    assert saved_compound['verification_status'] == 'unverified_uid'
+    assert saved_compound['status'] == 'pending'
+    assert saved_compound['verification_source'] == 'locket_public_share_link'
+    assert (real_uid_28, 'Gold') not in ent_store
 
     sub_real = http.get(f'/v1/subscribers/{real_uid_28}', headers=prompt26_env['service_headers'])
     assert sub_real.status_code == 200
-    assert sub_real.headers['x-lab-entitlement-status'] == 'active'
-    assert 'Gold' in sub_real.json()['subscriber']['entitlements'
-]
+    assert sub_real.headers['x-lab-entitlement-status'] == 'pending'
+    assert sub_real.json()['subscriber']['entitlements'] == {}
 
 
 # Tests 11, 12, 13, 14, 15, 16, 17, 18, 19, 23: Gold Management SSOT & CRUD Synchronized by Verified UID
@@ -751,6 +749,10 @@ def test_20_21_24_25_production_protection_devices_mobileconfig_and_migration(pr
     }
 
     fake_db = MagicMock()
+    ent_store[('user_with_verified_uid', 'Gold')] = {
+        'account_id': 'user_with_verified_uid', 'entitlement_key': 'Gold',
+        'status': 'active', 'expires_date': future_dt,
+    }
     fake_db.accounts_v2 = prompt26_env['mem_v2']
     fake_db.entitlements = prompt26_env['mem_ent']
 
@@ -771,6 +773,8 @@ def test_20_21_24_25_production_protection_devices_mobileconfig_and_migration(pr
     assert apply_rep['migrated_entitlements'] == 1
     assert apply_rep['downgraded_to_pending'] == 1
     assert v2_store['user_with_verified_uid']['account_id'] == uid_1
+    assert ent_store[('user_with_verified_uid', 'Gold')]['status'] == 'revoked'
+    assert ent_store[('orphan_ghost_key', 'Gold')]['status'] == 'revoked'
     assert (uid_1, 'Gold') in ent_store
     assert v2_store['username_only_user']['status'] == 'pending'
     assert v2_store['username_only_user']['verification_status'] == 'unverified_handle'  # Never auto-verified!

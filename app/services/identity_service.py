@@ -8,6 +8,7 @@ from typing import Any, Callable
 from urllib.parse import quote, unquote, urljoin, urlparse, urlsplit
 from httpx import AsyncClient, TimeoutException, TransportError
 from ..models import IdentityResolutionOutput, LinkVerifyOutput
+from .entitlement_service import extract_verified_uid_metadata
 
 logger = logging.getLogger(__name__)
 
@@ -418,9 +419,9 @@ def _build_public_token_resolution(
             invite_token=invite_token,
             firebase_uid=extracted_uid,
             source_link=share_url,
-            uid_verified=True,
-            verification_status='verified_uid',
-            verification_method='trusted_proof',
+            uid_verified=False,
+            verification_status='unverified_uid',
+            verification_method='format_only_uid',
             verification_source='locket_public_share_link',
             identity_lookup_source='public_share_link',
             identity_lookup_at=now,
@@ -958,8 +959,7 @@ async def resolve_locket_identity(
             str(existing_doc['firebase_uid']).strip()
             if (
                 isinstance(existing_doc, dict)
-                and existing_doc.get('_server_uid_proof') is True
-                and existing_doc.get('verification_status') == 'verified_uid'
+                and extract_verified_uid_metadata(existing_doc)[1]
                 and is_valid_firebase_uid(existing_doc.get('firebase_uid'))
             )
             else None

@@ -170,6 +170,7 @@ def test_one_time_download_ticket_security_and_url_token_rejection(monkeypatch, 
 
     password = secrets.token_urlsafe(20)
     encoded = hash_password(password)
+    monkeypatch.setenv('APP_ENV', 'test')
     monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
     monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
     monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
@@ -875,6 +876,7 @@ def test_prompt17_groups_a_b_c_d_and_real_mobileconfig_file_verification(monkeyp
     assert exc_info.value.status_code == 503
 
     # B12: HTTP endpoint /profile.mobileconfig?mode=lab_ca and ?mode=scoped_lab MUST return 503 when Root CA is not configured
+    monkeypatch.setenv('APP_ENV', 'test')
     monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
     monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
     monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
@@ -986,7 +988,7 @@ def test_prompt17_groups_a_b_c_d_and_real_mobileconfig_file_verification(monkeyp
     client = TestClient(app, base_url='http://localhost')
     try:
         # Group A (A01-A15) & Section XI: Download real .mobileconfig, save to disk, open in binary mode with plistlib.load
-        resp_mc = client.get('/profile.mobileconfig')
+        resp_mc = client.get('/profile.mobileconfig?mode=lab_ca')
         assert resp_mc.status_code == 200
         assert resp_mc.headers['content-type'].startswith('application/x-apple-aspen-config')
         assert resp_mc.headers['content-disposition'] == 'attachment; filename="locket.mobileconfig"'
@@ -1199,6 +1201,7 @@ def test_prompt18_automatic_locket_id_to_firebase_uid_resolution_all_16_cases(mo
     generate_ca_and_leaf_files(pub_dir, priv_dir, domains)
     ca_pem_path = pub_dir / 'lab_root_ca.pem'
 
+    monkeypatch.setenv('APP_ENV', 'test')
     monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
     monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
     monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
@@ -1501,7 +1504,7 @@ def test_prompt18_automatic_locket_id_to_firebase_uid_resolution_all_16_cases(mo
         assert uid_user_1 not in pub_res.text
 
         # Test 16: Root CA, DNS, and .mobileconfig remain 100% intact
-        mc_res = client.get('/profile.mobileconfig')
+        mc_res = client.get('/profile.mobileconfig?mode=lab_ca')
         assert mc_res.status_code == 200
         pl = plistlib.loads(mc_res.content)
         assert pl['PayloadIdentifier'] == 'bond.vuthanhluan.locketgold.profile'
@@ -1573,6 +1576,7 @@ def test_prompt19_public_link_resolver_invite_token_vs_uid_and_ssrf_protection(m
 
     password = secrets.token_urlsafe(20)
     encoded = hash_password(password)
+    monkeypatch.setenv('APP_ENV', 'test')
     monkeypatch.setenv('SUPERADMIN_EMAIL', 'admin@example.test')
     monkeypatch.setenv('SUPERADMIN_PASSWORD_HASH', encoded)
     monkeypatch.setenv('MONGODB_URI', 'mongodb://127.0.0.1:27017')
@@ -1837,7 +1841,7 @@ def test_prompt19_public_link_resolver_invite_token_vs_uid_and_ssrf_protection(m
         assert tr_res.invite_token == 'RedirectedInviteTok99'
 
         # Test 13 & 14: Root CA/mobileconfig and original UI remain intact
-        mc_res = client.get('/profile.mobileconfig')
+        mc_res = client.get('/profile.mobileconfig?mode=lab_ca')
         assert mc_res.status_code == 200
         assert len(plistlib.loads(mc_res.content)['PayloadContent']) == 2
         adm_html = client.get('/admin').text

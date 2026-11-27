@@ -299,6 +299,11 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
     app.dependency_overrides[get_accounts] = lambda: accounts
     app.state.accounts = accounts
     app.state.accounts_v2 = accounts_v2
+    grants = {}
+    app.state.entitlements = AsyncMock()
+    app.state.entitlements.update_one.side_effect = lambda q, u, upsert=False: grants.update({q['account_id']: u['$set']})
+    app.state.entitlements.find_one.side_effect = lambda q, projection: grants.get(q['account_id'])
+
     app.state.devices = devices
     app.state.admins = admins
     app.state.sessions = sessions
@@ -333,10 +338,6 @@ def test_check7_8_9_10_11_12_13_doh_resolver_tls_chain_and_automatic_processing(
         dev_res = http.post("/admin/devices", headers=admin_hdr, json={"locket_id": "auto_user", "device_name": "iPhone Lab", "ios_version": "18.2"}).json()
         dev_hdr = {"Authorization": "Bearer " + dev_res["device_token"]}
 
-        app.state.entitlements = AsyncMock()
-        app.state.entitlements.find_one.return_value = {
-            'account_id': verified_auto_uid, 'entitlement_key': 'Gold', 'status': 'active', 'expires_date': future_iso,
-        }
         sub_active = http.get(f"/v1/subscribers/{verified_auto_uid}", headers=dev_hdr)
         assert sub_active.status_code == 200
         assert "Gold" in sub_active.json()["subscriber"]["entitlements"]

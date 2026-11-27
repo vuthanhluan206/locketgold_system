@@ -15,6 +15,16 @@ from .profile import build_profile
 logger = logging.getLogger(__name__)
 
 
+@asynccontextmanager
+async def account_write_options(request):
+    if getattr(request.app.state, 'transactions_supported', False) is True:
+        async with request.app.state.mongo_client.start_session() as session:
+            async with await session.start_transaction():
+                yield {'session': session}
+    else:
+        yield {}
+
+
 def admin_document(settings):
     password_hash = settings.superadmin_password_hash.get_secret_value()
     return {
@@ -178,6 +188,10 @@ async def lifespan(app: FastAPI):
         await client.admin.command('ping')
         db = client[settings.mongodb_database]
         app.state.mongo_client = client
+        app.state.transactions_supported = client.topology_description.topology_type_name in ('ReplicaSetWithPrimary', 'Sharded')
+        if client.topology_description.topology_type_name == 'Single':
+            hello = await client.admin.command('hello')
+            app.state.transactions_supported = bool(hello.get('setName') or hello.get('msg') == 'isdbgrid')
         app.state.db = db
         app.state.accounts = db.accounts
         app.state.admins = db.admins

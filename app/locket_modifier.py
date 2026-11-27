@@ -3,7 +3,6 @@ import json
 import secrets
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
 from urllib.parse import quote
 from starlette.datastructures import Headers
 from fastapi.encoders import jsonable_encoder
@@ -11,14 +10,12 @@ from fastapi import APIRouter, HTTPException, Request, Response
 from fastapi.responses import JSONResponse
 
 from .config import get_settings
-from .models import subscriber_response
 from .routers.management import download_profile
 from .security import token_digest
-from .services.entitlement_service import find_canonical_account
 
 router = APIRouter(prefix="/proxy", tags=["Locket Proxy"])
 
-UPSTREAM_TARGET = "https://api.locketcamera.com"
+UPSTREAM_TARGET = "http://127.0.0.1:8081"
 FORBIDDEN_THIRD_PARTY_HOSTS = {
     "api.revenuecat.com",
     "buy.itunes.apple.com",
@@ -61,28 +58,6 @@ def _forward_upstream(url: str, body: bytes | None, headers: dict[str, str], met
         return response.code, dict(response.headers.items()), content
 
 
-def _extract_locket_id(path: str, data: dict) -> str:
-    if isinstance(data, dict):
-        sub = data.get('subscriber')
-        if isinstance(sub, dict) and isinstance(sub.get('original_app_user_id'), str) and sub['original_app_user_id']:
-            return sub['original_app_user_id']
-    parts = [p for p in path.split("/") if p]
-    if "subscribers" in parts:
-        idx = parts.index("subscribers")
-        if idx + 1 < len(parts):
-            return parts[idx + 1]
-    if isinstance(data, dict):
-        for key in ("locket_id", "uid", "user_id", "id"):
-            if isinstance(data.get(key), str) and data[key]:
-                return data[key]
-        user_obj = data.get("user") or data.get("data")
-        if isinstance(user_obj, dict):
-            for key in ("uid", "user_id", "id", "locket_id"):
-                if isinstance(user_obj.get(key), str) and user_obj[key]:
-                    return user_obj[key]
-    return ''
-
-
 @router.get("/install", response_class=Response)
 async def download_proxy_profile(request: Request):
     return await download_profile(request)
@@ -102,6 +77,14 @@ async def dynamic_reverse_proxy(request: Request, path: str):
     if (parsed_upstream.hostname or '').lower() in FORBIDDEN_THIRD_PARTY_HOSTS:
         raise HTTPException(403, 'Proxying third-party payment or receipt verification hosts is strictly prohibited.')
 
+    host = (parsed_upstream.hostname or '').lower()
+    if host not in {'127.0.0.1', 'localhost', '::1', *settings.lab_scoped_domains}:
+        raise HTTPException(403, 'Upstream must be a configured Lab host')
+    if parsed_upstream.username or parsed_upstream.password:
+        raise HTTPException(403, 'Upstream credentials are not permitted')
+    if parsed_upstream.scheme not in {'https', 'http'}:
+        raise HTTPException(403, 'Invalid Lab upstream scheme')
+
     url = configured_upstream + "/" + quote(path, safe="/:@!$&'()*+,;=-._~")
     query_params = str(request.url.query)
     if query_params:
@@ -111,7 +94,7 @@ async def dynamic_reverse_proxy(request: Request, path: str):
     for key in list(headers):
         if key in {'host', 'cookie', 'forwarded', 'accept-encoding'} or key.startswith(('x-forwarded-', 'cf-')):
             del headers[key]
-    headers['Host'] = parsed_upstream.hostname or 'api.locketcamera.com'
+    headers['Host'] = parsed_upstream.netloc
     headers['Accept-Encoding'] = 'identity'
 
     method = request.method
@@ -161,13 +144,12 @@ async def dynamic_reverse_proxy(request: Request, path: str):
         )
 
     content_type = upstream_headers.get("content-type", "")
-    accounts_col = getattr(request.app.state, "accounts", None)
-    accounts_v2_col = getattr(request.app.state, "accounts_v2", None)
     viewers_col = getattr(request.app.state, "viewers_history", None)
 
     if (
         200 <= upstream_status < 300
         and user_token
+        and set(path.split('/')) & {'moments', 'posts', 'viewers'}
         and 'application/json' in content_type.lower()
         and upstream_content
         and upstream_headers.get('content-encoding', 'identity').lower() == 'identity'
@@ -199,31 +181,6 @@ async def dynamic_reverse_proxy(request: Request, path: str):
                         for item in data:
                             if isinstance(item, dict):
                                 item["viewers"] = dynamic_viewers
-
-            elif segments & {'subscribers', 'user', 'users'}:
-                if isinstance(data, dict):
-                    candidate_id = _extract_locket_id(path, data)
-                    account_record = None
-                    if accounts_col is None and accounts_v2_col is None:
-                        raise HTTPException(503, 'Database unavailable')
-                    if candidate_id:
-                        account_record = await find_canonical_account(
-                            request, candidate_id, accounts_col=accounts_col
-                        )
-
-                    now = datetime.now(timezone.utc)
-                    sub_payload = subscriber_response(candidate_id or "locket_user", account_record, now)
-                    subscriber = data.get('subscriber')
-                    if subscriber is None:
-                        subscriber = data['subscriber'] = sub_payload['subscriber']
-                    if isinstance(subscriber, dict):
-                        for field, key in [('entitlements', 'Gold'), ('subscriptions', 'com.locket.gold.yearly')]:
-                            values = subscriber.get(field)
-                            if not isinstance(values, dict):
-                                values = {}
-                            values.pop(key, None)
-                            values.update(sub_payload['subscriber'][field])
-                            subscriber[field] = values
 
             for key in ('etag', 'content-md5', 'digest', 'content-encoding'):
                 response_headers.pop(key, None)

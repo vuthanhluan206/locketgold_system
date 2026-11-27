@@ -102,7 +102,7 @@ def test_upload_boundary_and_admin_limit(proxy):
     transport.assert_not_called()
 
 
-def test_proxy_uses_admin_account_expiry_and_preserves_other_entitlements(proxy):
+def test_proxy_preserves_upstream_subscription_response(proxy):
     http, app, transport, _ = proxy
     expiry = datetime.now(timezone.utc) + timedelta(days=10)
     verified_uid = '4Vee1rBLoJN9TDjql9xPzDEuf5D2'
@@ -110,9 +110,9 @@ def test_proxy_uses_admin_account_expiry_and_preserves_other_entitlements(proxy)
     response = http.get(f'/proxy/v1/subscribers/{verified_uid}', headers={'Authorization': 'Bearer upstream-token',
                         'Cookie': 'admin=secret', 'X-Forwarded-Host': 'attacker.example'})
     subscriber = response.json()['subscriber']
-    assert subscriber['entitlements']['Gold']['expires_date'] == expiry.isoformat().replace('+00:00', 'Z')
+    assert subscriber['entitlements'] == {'Other': {}}
     assert 'Other' in subscriber['entitlements']
-    app.state.accounts.find_one.assert_awaited_once_with({'locket_id': verified_uid}, {'_id': 0})
+    app.state.accounts.find_one.assert_not_awaited()
     headers = transport.call_args.args[2]
     assert headers['Host'] == 'mock.lab.vuthanhluan.bond'
     assert 'cookie' not in headers and 'x-forwarded-host' not in headers

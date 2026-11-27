@@ -4,6 +4,8 @@
 **Tài liệu gốc đối chiếu:** `cotloicualocketgold.txt` và `LocketGold_Clean_Unlocked.mobileconfig`
 **Ngày cập nhật:** 2026-11-25
 
+Lần rà soát Prompt 27 không tìm thấy hai tệp gốc trong repository. Phần nghiệm thu đối chiếu profile do mã hiện tại sinh ra với các yêu cầu trong tài liệu này. Endpoint mặc định trả DNS-only. Các chế độ nghiên cứu có Root CA yêu cầu chọn rõ `lab_ca` hoặc `scoped_lab` trong môi trường Lab.
+
 ---
 
 ## 1. BẢO TOÀN KIẾN TRÚC HAI PAYLOAD CỐT LÕI

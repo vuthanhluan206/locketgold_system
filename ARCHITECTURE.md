@@ -81,7 +81,7 @@ flowchart TD
 ### Module 3 — Entitlement Service (`app/services/entitlement_service.py`)
 - **Trách nhiệm:** Là **Nguồn dữ liệu duy nhất (Single Source of Truth - SSOT)** quyết định trạng thái thuê bao trong toàn hệ thống.
 - **Máy trạng thái (State Machine) rõ ràng:**
-  - `active`: Tài khoản tồn tại, không bị thu hồi (`revoked_at is None`), `status == "active"`, và `expires_date > now_utc`.
+  - `active` yêu cầu cả tài khoản và bản ghi Gold đúng Firebase UID đã xác minh có trạng thái active, chưa bị thu hồi và còn hạn UTC. Mốc hết hạn hiệu lực là mốc sớm hơn của hai bản ghi. UID trích từ invite token công khai 44 ký tự được lưu cùng nguồn và ở trạng thái `unverified_uid` cho đến khi có bằng chứng độc lập.
   - `expired`: Tài khoản tồn tại, không bị thu hồi, nhưng `expires_date <= now_utc`.
   - `revoked`: Tài khoản bị Admin chủ động thu hồi quyền (`status == "revoked"` hoặc `revoked_at is not None`), bất kể `expires_date` còn hạn hay không.
   - `pending`: Tài khoản mới thêm vào hệ thống để chờ xác minh thiết bị/UUID, chưa kích hoạt quyền (`status == "pending"`).
