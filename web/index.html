@@ -2050,9 +2050,14 @@
               </svg>
               <h3 id="directoryTitle">Accounts</h3>
             </div>
-            <button id="addAccount" type="button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">
-                <path d="M12 5v14M5 12h14" />
-              </svg>Add account</button>
+            <div class="row">
+              <input id="accountSearch" type="search" placeholder="Search username or UID…" maxlength="128" aria-label="Search accounts">
+              <button class="secondary" id="openPkiStatus" type="button">Root CA &amp; Mobileconfig</button>
+              <button class="secondary" id="openSystemHealth" type="button">Health &amp; Audit Logs</button>
+              <button id="addAccount" type="button"><svg class="ui-icon" viewBox="0 0 24 24" aria-hidden="true">
+                  <path d="M12 5v14M5 12h14" />
+                </svg>Add account</button>
+            </div>
           </div>
           <p class="status" id="adminMessage" role="status" aria-live="polite"></p>
           <div class="scroll">
@@ -2187,13 +2192,27 @@
         }
         async function load() {
           $('overview').textContent = '';
-          const [rows, totals] = await Promise.all([api('/admin/accounts?skip=' + skip + '&limit=' + limit), api('/admin/overview')]);
+          const searchQ = ($('accountSearch')?.value || '').trim();
+          const accUrl = '/admin/accounts?skip=' + skip + '&limit=' + limit + (searchQ ? '&search=' + encodeURIComponent(searchQ) : '');
+          const [rows, totals] = await Promise.all([api(accUrl), api('/admin/overview')]);
           if (!session) return;
-          for (const [key, title] of Object.entries({accounts:'Accounts',active:'Gold active',pending:'Pending',
-            expired:'Expired',revoked:'Revoked',verified_uid:'Verified UID',devices:'Active devices',entitlements:'Gold records',
-            downloads:'Profile downloads',uid_errors:'UID lookup errors',gold_errors:'Logged Gold write errors'})) {
+          const overviewMetrics = {
+            accounts: ['Total Accounts', totals.accounts ?? 0],
+            active: ['Gold Active', totals.active ?? 0],
+            expired: ['Expired', totals.expired ?? 0],
+            revoked: ['Revoked', totals.revoked ?? 0],
+            uid_found: ['UID Found', totals.uid_found ?? totals.verified_uid ?? 0],
+            verified_uid: ['Verified UID', totals.verified_uid ?? 0],
+            uid_conflicts: ['UID Conflict', totals.uid_conflicts ?? 0],
+            devices: ['Devices', totals.devices ?? 0],
+            downloads: ['Profile Downloads', totals.downloads ?? 0],
+            root_ca: ['Root CA Status', totals.root_ca_loaded ? 'Loaded' : 'Not Configured'],
+            mongodb: ['MongoDB Status', totals.mongodb_connected ? ('Connected (' + (totals.mongodb_database || 'ok') + ')') : 'Offline'],
+            nextdns: ['NextDNS Status', totals.nextdns_configured ? ('Ready (' + totals.nextdns_id + ')') : 'Not Configured'],
+          };
+          for (const [, [title, val]] of Object.entries(overviewMetrics)) {
             const metric = document.createElement('div'), label = document.createElement('dt'), value = document.createElement('dd');
-            label.textContent = title; value.textContent = totals[key]; metric.append(label, value); $('overview').append(metric);
+            label.textContent = title; value.textContent = String(val); metric.append(label, value); $('overview').append(metric);
           }
           const body = $('accounts'); body.replaceChildren();
           for (const [rowIndex, row] of rows.entries()) {
@@ -2201,7 +2220,9 @@
             const number = document.createElement('td');
             number.className = 'row-number'; number.textContent = String(skip + rowIndex + 1); tr.append(number);
             const isVerifiedUid = row.verification_status === 'verified_uid' && Boolean(row.firebase_uid);
-            const statusText = ({ active: 'Gold', expired: 'Expired', pending: 'Pending', revoked: 'Revoked' })[row.status] || 'Unauthorized';
+            const isPublicDerivedUid = Boolean(row.firebase_uid) && (row.uid_assurance === 'public_derived' || row.verification_source === 'locket_public_share_link');
+            const canGrantUid = isVerifiedUid || isPublicDerivedUid;
+            const statusText = ({ active: 'Gold', expired: 'Expired', pending: 'Not Granted', revoked: 'Revoked' })[row.status] || 'Unauthorized';
             for (const [index, value] of [row.locket_id, new Date(row.expires_date).toLocaleString('en-US'), statusText].entries()) {
               const td = document.createElement('td');
               const label = document.createElement('span'); label.textContent = value;
@@ -2218,25 +2239,43 @@
                 name.append(crown, label);
                 const uidMeta = document.createElement('div'); uidMeta.className = 'account-uid-meta';
                 const verMeta = document.createElement('div'); verMeta.className = 'account-uid-meta';
-                if (isVerifiedUid) {
-                  uidMeta.textContent = 'Firebase UID: ' + row.firebase_uid;
-                  verMeta.textContent = 'Verification: Verified (Firebase UID đã xác minh) · Gold: ' + (statusText === 'Gold' ? 'Active' : statusText);
-                } else if (row.firebase_uid) {
-                  uidMeta.textContent = 'Firebase UID: ' + row.firebase_uid;
-                  verMeta.textContent = 'Verification: Unverified (Đã tìm được UID — cần xác minh) · Gold: Pending (Chờ xác minh UID)';
+                const grantMeta = document.createElement('div'); grantMeta.className = 'account-uid-meta';
+                const sourceLabel = row.uid_source === 'public_share_link' ? 'Public Locket Share Link'
+                  : row.uid_source === 'verified_provider' ? 'Verified Provider'
+                  : row.uid_source === 'verified_cache' ? 'Verified Cache'
+                  : row.verification_source || 'None';
+                const assuranceLabel = isVerifiedUid ? 'Independently Verified'
+                  : isPublicDerivedUid ? 'Public Derived'
+                  : row.firebase_uid ? 'Unverified Manual'
+                  : 'None';
+                const grantBasisLabel = row.grant_basis === 'independently_verified' ? 'Independently Verified'
+                  : row.grant_basis === 'admin_authorized_public_uid' ? 'Admin Authorized Internal'
+                  : 'Not issued';
+                if (row.firebase_uid) {
+                  uidMeta.textContent = 'UID: ' + row.firebase_uid + ' · UID Resolution: Found';
+                  verMeta.textContent = 'UID Source: ' + sourceLabel + ' · UID Assurance: ' + assuranceLabel;
+                  if (row.status === 'active') {
+                    grantMeta.textContent = 'Gold: Active · Grant Basis: ' + grantBasisLabel;
+                  } else if (row.status === 'revoked') {
+                    grantMeta.textContent = 'Gold: Revoked · Grant Basis: ' + grantBasisLabel;
+                  } else if (row.status === 'expired') {
+                    grantMeta.textContent = 'Gold: Expired · Grant Basis: ' + grantBasisLabel;
+                  } else {
+                    grantMeta.textContent = 'UID: FOUND · Grant: Not issued · Reason: ' + (row.grant_reason || 'Admin public-UID grant policy disabled');
+                  }
                 } else if (row.invite_token) {
-                  uidMeta.textContent = 'Firebase UID: Chưa xác minh (Invite token: ' + row.invite_token + ')';
-                  verMeta.textContent = 'Verification: unverified_handle (Đã lấy invite token — chưa xác minh Firebase UID) · Gold: Pending (Chờ xác minh UID)';
+                  uidMeta.textContent = 'UID: Not Found (Invite token: ' + row.invite_token + ' · Đã lấy invite token — chưa xác minh Firebase UID)';
+                  verMeta.textContent = 'UID Source: Public Locket Share Link · UID Resolution: Not Found';
+                  grantMeta.textContent = 'Gold: Not Granted';
                 } else {
-                  uidMeta.textContent = 'Firebase UID: Chưa xác minh (Chưa liên kết Firebase UID)';
-                  verMeta.textContent = 'Verification: Unverified · Gold: Pending (Chờ xác minh UID)';
+                  uidMeta.textContent = 'UID: Not Found (Chưa liên kết Firebase UID)';
+                  verMeta.textContent = 'UID Source: ' + sourceLabel + ' · UID Resolution: ' + (row.uid_resolution_status || 'Not Found');
+                  grantMeta.textContent = 'Gold: Not Granted';
                 }
-                verMeta.textContent = 'Verification: ' + row.verification_status + ' · ' + row.verification_source;
-                if (row.status === 'pending') verMeta.textContent += isVerifiedUid ? ' · Chờ cấp quyền Gold' : ' · Chờ xác minh UID';
                 const deviceInfo = document.createElement('div'); deviceInfo.className = 'account-uid-meta';
-                deviceInfo.textContent = 'Devices: ' + row.active_devices + '/' + row.max_devices +
+                deviceInfo.textContent = 'Device Count: ' + row.active_devices + '/' + row.max_devices +
                   ' · Activated: ' + (row.activated_at ? new Date(row.activated_at).toLocaleString() : '—');
-                stack.append(name, uidMeta, verMeta, deviceInfo);
+                stack.append(name, uidMeta, verMeta, grantMeta, deviceInfo);
                 td.append(stack);
               } else {
                 label.className = index === 1 ? 'account-expiry' : 'account-status' + (value === 'Gold' ? ' is-gold' : '');
@@ -2264,9 +2303,9 @@
             check.onclick = async () => {
               check.disabled = true;
               try {
-                const targetId = isVerifiedUid ? row.firebase_uid : row.locket_id;
+                const targetId = row.firebase_uid || row.locket_id;
                 const result = await api('/v1/subscribers/' + encodeURIComponent(targetId));
-                $('adminMessage').textContent = 'API result for ' + targetId + ': ' + (result.subscriber.entitlements.Gold ? 'access is active.' : 'no access or expired.');
+                $('adminMessage').textContent = 'API result for ' + targetId + ': ' + (result.subscriber.entitlements.Gold ? 'Gold access is ACTIVE.' : 'no active Gold entitlement.');
               } catch (error) { $('adminMessage').textContent = error.message; }
               finally { check.disabled = false; }
             };
@@ -2287,7 +2326,7 @@
               await api(path + '/activate', {method: 'POST', body: JSON.stringify({expires_date: row.expires_date})});
               await load();
             });
-            activate.disabled = !isVerifiedUid || row.status === 'active' || Date.parse(row.expires_date) <= Date.now();
+            activate.disabled = !canGrantUid || row.status === 'active' || Date.parse(row.expires_date) <= Date.now();
             const revoke = actionButton('Revoke Gold', async () => {
               const reason = prompt('Lý do thu hồi Gold');
               if (!reason?.trim()) return;
@@ -2296,7 +2335,7 @@
             });
             revoke.disabled = row.status === 'revoked';
             edit.title = 'Edit / Renew';
-            actions.append(edit, check, activate, revoke, actionButton('Lab features', () => features(row)),
+            actions.append(edit, check, activate, revoke, actionButton('Gold Features', () => features(row)),
               actionButton('Devices', () => devices(row)), remove);
             tr.append(actions); body.append(tr);
           }
@@ -2326,12 +2365,20 @@
         async function features(row) {
           const path = '/admin/accounts/' + encodeURIComponent(row.locket_id) + '/features';
           const config = await api(path);
-          const panel = detailPanel('Gold features · Lab Client · ' + row.locket_id);
+          const panel = detailPanel('GOLD FEATURE MANAGEMENT · ' + row.locket_id);
+          const metaLine = document.createElement('p');
+          metaLine.className = 'note';
+          const basisText = row.grant_basis === 'independently_verified' ? 'Independently Verified'
+            : row.grant_basis === 'admin_authorized_public_uid' ? 'Admin Authorized Lab'
+            : 'Not Granted';
+          metaLine.textContent = 'Account: ' + row.locket_id + (row.firebase_uid ? ' (UID: ' + row.firebase_uid + ')' : '') +
+            ' · Gold Status: ' + (row.grant_status_label || row.status) + ' · Grant Basis: ' + basisText;
+          panel.append(metaLine);
           const fields = [];
           for (const [key, title] of Object.entries({
-            max_video_duration_seconds: 'Video duration (0–60 seconds)', enable_private_posts: 'Private posts',
-            unlocked_filters: 'Unlocked filters', camera_filters_enabled: 'Camera filters',
-            holiday_effects_enabled: 'Holiday effects', unlocked_all_filters: 'All filters',
+            max_video_duration_seconds: 'Video Duration (0–60 seconds)', enable_private_posts: 'Private Posts',
+            unlocked_filters: 'Unlocked Filters', camera_filters_enabled: 'Camera Filters',
+            holiday_effects_enabled: 'Holiday Effects', unlocked_all_filters: 'All Filters',
           })) {
             const label = document.createElement('label'); label.className = 'field'; label.textContent = title;
             const input = document.createElement('input');
@@ -2340,42 +2387,167 @@
             } else { input.type = 'checkbox'; input.checked = config[key]; }
             label.append(input); panel.append(label); fields.push([key, input]);
           }
-          panel.append(actionButton('Save feature configuration', async () => {
-            const flags = {};
-            for (const [key, input] of fields) {
-              if (!input.reportValidity()) return;
-              flags[key] = input.type === 'checkbox' ? input.checked : input.valueAsNumber;
-            }
-            await api(path, {method: 'PUT', body: JSON.stringify(flags)});
-            $('detailsMessage').textContent = 'Đã lưu cấu hình Lab Client.';
-          }));
+          const btnRow = document.createElement('div'); btnRow.className = 'row';
+          btnRow.append(
+            actionButton('Enable All (60s)', async () => {
+              for (const [key, input] of fields) {
+                if (key === 'max_video_duration_seconds') input.value = '60';
+                else input.checked = true;
+              }
+            }),
+            actionButton('Save Changes', async () => {
+              const flags = {};
+              for (const [key, input] of fields) {
+                if (!input.reportValidity()) return;
+                flags[key] = input.type === 'checkbox' ? input.checked : input.valueAsNumber;
+              }
+              await api(path, {method: 'PUT', body: JSON.stringify(flags)});
+              $('detailsMessage').textContent = 'Đã lưu cấu hình Gold Features cho Lab Client.';
+            })
+          );
+          panel.append(btnRow);
         }
         async function devices(row) {
-          const list = await api('/admin/devices?locket_id=' + encodeURIComponent(row.locket_id));
-          const panel = detailPanel('Devices · ' + row.locket_id);
+          const [list, pki] = await Promise.all([
+            api('/admin/devices?locket_id=' + encodeURIComponent(row.locket_id)),
+            api('/admin/pki/status'),
+          ]);
+          const panel = detailPanel('DEVICE & PROFILE MANAGEMENT · ' + row.locket_id);
+          const summaryP = document.createElement('p');
+          summaryP.className = 'note';
+          summaryP.textContent = 'NextDNS: ' + (pki.nextdns_id || 'Not configured') +
+            ' · Root CA: ' + (pki.valid ? 'Loaded' : (pki.configured ? 'Invalid' : 'Not loaded')) +
+            (pki.sha256_fingerprint ? ' · CA Fingerprint: SHA256: ' + pki.sha256_fingerprint : '');
+          panel.append(summaryP);
           panel.append(actionButton('Add device', async () => {
-            const device_name = prompt('Device name'); if (!device_name) return;
-            const ios_version = prompt('iOS version'); if (!ios_version) return;
+            const device_name = prompt('Device name', 'iPhone Lab'); if (!device_name) return;
+            const ios_version = prompt('iOS version', '18.2'); if (!ios_version) return;
             const device = await api('/admin/devices', {method: 'POST',
               body: JSON.stringify({locket_id: row.locket_id, device_name, ios_version})});
             await devices(row);
             $('detailsMessage').textContent = 'Device token (shown once): ' + device.device_token;
           }));
+          const modeDefs = [
+            ['dns_only', 'DNS only (NextDNS DoH — 1 payload)'],
+            ['lab_ca', 'Root CA + DNS — Research Lab (2 payloads)'],
+            ['scoped_lab', 'Scoped Lab DNS + Root CA (Split-DNS + CA)'],
+          ];
           for (const device of list) {
+            const card = document.createElement('div');
+            card.className = 'editor-panel';
             const p = document.createElement('p');
-            p.textContent = [device.device_name, device.device_id, 'iOS ' + device.ios_version, device.status,
-              device.last_seen_at ? new Date(device.last_seen_at).toLocaleString() : 'Never seen'].join(' · ');
-            panel.append(p);
-            if (device.status !== 'active') continue;
-            const path = '/admin/devices/' + encodeURIComponent(device.device_id);
-            panel.append(actionButton('Revoke device', async () => {
-              if (!confirm('Revoke ' + device.device_name + '?')) return;
-              await api(path + '/revoke', {method: 'POST'}); await devices(row);
-            }), actionButton('Download DNS profile', async () => {
-              const ticket = await api(path + '/profile-ticket?mode=dns_only', {method: 'POST'});
-              window.location.assign(ticket.download_url);
-            }));
+            p.textContent = ['Device: ' + device.device_name, device.device_id, 'iOS ' + device.ios_version, device.status,
+              device.last_seen_at ? 'Last seen: ' + new Date(device.last_seen_at).toLocaleString() : 'Never seen'].join(' · ');
+            card.append(p);
+            if (device.status === 'active') {
+              const radioGroupName = 'profile_mode_' + device.device_id;
+              let selectedMode = pki.lab_ca_ready ? 'lab_ca' : 'dns_only';
+              for (const [mKey, mLabel] of modeDefs) {
+                const optInfo = (pki.profile_options && pki.profile_options[mKey]) || { available: mKey === 'dns_only' };
+                const rLabel = document.createElement('label');
+                rLabel.className = 'field';
+                const radio = document.createElement('input');
+                radio.type = 'radio';
+                radio.name = radioGroupName;
+                radio.value = mKey;
+                radio.disabled = !optInfo.available;
+                radio.checked = (mKey === selectedMode && optInfo.available) || (mKey === 'dns_only' && !pki.lab_ca_ready);
+                radio.onchange = () => { if (radio.checked) selectedMode = mKey; };
+                const span = document.createElement('span');
+                span.textContent = ' ' + mLabel + (optInfo.available ? '' : ' — Không khả dụng: ' + (optInfo.reason || 'Unavailable'));
+                rLabel.append(radio, span);
+                card.append(rLabel);
+              }
+              const path = '/admin/devices/' + encodeURIComponent(device.device_id);
+              const actRow = document.createElement('div'); actRow.className = 'row';
+              actRow.append(
+                actionButton('Generate Profile', async () => {
+                  const ticket = await api(path + '/profile-ticket?mode=' + encodeURIComponent(selectedMode), {
+                    method: 'POST',
+                    body: JSON.stringify({ mode: selectedMode }),
+                  });
+                  $('detailsMessage').textContent = 'Generated ' + selectedMode + ' profile ticket (' + ticket.device_id + '): ' + ticket.download_url;
+                }),
+                actionButton('Download Profile', async () => {
+                  const ticket = await api(path + '/profile-ticket?mode=' + encodeURIComponent(selectedMode), {
+                    method: 'POST',
+                    body: JSON.stringify({ mode: selectedMode }),
+                  });
+                  window.location.assign(ticket.download_url);
+                }),
+                actionButton('Revoke device', async () => {
+                  if (!confirm('Revoke ' + device.device_name + '?')) return;
+                  await api(path + '/revoke', {method: 'POST'}); await devices(row);
+                })
+              );
+              card.append(actRow);
+            }
+            panel.append(card);
           }
+        }
+        async function showPkiStatusPanel() {
+          const pki = await api('/admin/pki/status');
+          const panel = detailPanel('ROOT CA STATUS & MOBILECONFIG');
+          const lines = [
+            'CA Configured: ' + (pki.configured ? 'YES' : 'NO'),
+            'CA Valid: ' + (pki.valid ? 'YES' : 'NO'),
+            'Common Name: ' + (pki.common_name || (pki.certificate && pki.certificate.subject) || '—'),
+            'Issuer: ' + (pki.issuer_common_name || (pki.certificate && pki.certificate.issuer) || '—'),
+            'SHA256 Fingerprint: ' + (pki.sha256_fingerprint || (pki.certificate && pki.certificate.sha256_fingerprint) || '—'),
+            'Valid From: ' + (pki.valid_from || (pki.certificate && pki.certificate.not_valid_before_utc) || '—'),
+            'Valid Until: ' + (pki.valid_until || (pki.certificate && pki.certificate.not_valid_after_utc) || '—'),
+            'NextDNS ID: ' + (pki.nextdns_id || '—') + (pki.doh_server_url ? ' (' + pki.doh_server_url + ')' : ''),
+            'DNS-only Profile: ' + (pki.dns_only_ready ? 'Ready' : 'Unavailable'),
+            'CA + DNS Lab Profile: ' + (pki.lab_ca_ready ? 'Ready' : 'Unavailable' + (pki.profile_options?.lab_ca?.reason ? ' (' + pki.profile_options.lab_ca.reason + ')' : '')),
+          ];
+          for (const text of lines) {
+            const p = document.createElement('p');
+            p.textContent = text;
+            panel.append(p);
+          }
+          const btnCert = actionButton('Download Public CA Certificate', async () => {
+            window.location.assign('/api/lab/ca.cer');
+          });
+          btnCert.disabled = !pki.valid;
+          const btnGenLab = actionButton('Generate Lab Profile', async () => {
+            $('detailsMessage').textContent = 'Lab CA + DNS Profile ready: /profile.mobileconfig?mode=lab_ca (SHA256: ' + pki.sha256_fingerprint + ')';
+          });
+          btnGenLab.disabled = !pki.lab_ca_ready;
+          const btnDlLab = actionButton('Download Lab Profile', async () => {
+            window.location.assign('/profile.mobileconfig?mode=lab_ca');
+          });
+          btnDlLab.disabled = !pki.lab_ca_ready;
+          const btnDlDns = actionButton('Download DNS-only Profile', async () => {
+            window.location.assign('/profile.mobileconfig?mode=dns_only');
+          });
+          btnDlDns.disabled = !pki.dns_only_ready;
+          const row = document.createElement('div'); row.className = 'row';
+          row.append(btnCert, btnGenLab, btnDlLab, btnDlDns);
+          panel.append(row);
+        }
+        async function showSystemHealthAndLogs() {
+          const [health, logs] = await Promise.all([api('/api/health', {}, false), api('/admin/logs?limit=20')]);
+          const panel = detailPanel('SYSTEM HEALTH, NEXTDNS & AUDIT LOGS');
+          const hp = document.createElement('p');
+          hp.textContent = 'System: ' + health.status + ' · Database: ' + health.database +
+            ' · NextDNS: ' + (health.nextdns_id || 'None') +
+            ' · Root CA Loaded: ' + (health.root_ca_loaded ? 'YES (' + health.root_ca_sha256 + ')' : 'NO');
+          panel.append(hp);
+          for (const entry of (logs.audit_logs || [])) {
+            const item = document.createElement('p');
+            item.className = 'note';
+            item.textContent = [entry.timestamp, entry.action, 'Target: ' + entry.target_id, 'Actor: ' + entry.actor].join(' · ');
+            panel.append(item);
+          }
+        }
+        if ($('openPkiStatus')) $('openPkiStatus').onclick = () => showPkiStatusPanel().catch(e => { $('adminMessage').textContent = e.message; });
+        if ($('openSystemHealth')) $('openSystemHealth').onclick = () => showSystemHealthAndLogs().catch(e => { $('adminMessage').textContent = e.message; });
+        if ($('accountSearch')) {
+          let searchTimer;
+          $('accountSearch').addEventListener('input', () => {
+            clearTimeout(searchTimer);
+            searchTimer = setTimeout(() => { skip = 0; load().catch(e => { $('adminMessage').textContent = e.message; }); }, 220);
+          });
         }
         async function enter() {
           if (!session || !Number.isFinite(Date.parse(session.expires_at)) || Date.parse(session.expires_at) <= Date.now()) { clearSession(); return; }
@@ -2418,13 +2590,13 @@
                 public_only: true,
               }),
             });
-            const summary = saved && saved.firebase_uid && saved.verification_status === 'verified_uid'
-              ? 'Firebase UID đã xác minh: ' + saved.firebase_uid + ' · Gold: ' + saved.status
+            const summary = saved && saved.firebase_uid && saved.status === 'active'
+              ? 'UID Found: ' + saved.firebase_uid + ' (' + (saved.uid_assurance === 'independently_verified' ? 'Independently Verified' : 'Public Derived') + ') · Gold: Active (' + (saved.grant_basis || 'admin_authorized_public_uid') + ')'
               : saved && saved.firebase_uid
-                ? 'Đã tìm được UID — cần xác minh: ' + saved.firebase_uid + ' · Gold: Pending (Chờ xác minh UID)'
+                ? 'UID: FOUND (' + saved.firebase_uid + ') · Grant: Not issued · Reason: ' + (saved.grant_reason || 'Admin public-UID grant policy disabled')
                 : saved && saved.invite_token
-                  ? 'Đã lấy invite token — chưa xác minh Firebase UID · Gold: Pending (Chờ xác minh UID)'
-                  : 'Đã lưu tài khoản; chưa có Firebase UID từ dữ liệu công khai · Gold: Pending';
+                  ? 'UID: Not Found (Invite token: ' + saved.invite_token + ') · Gold: Not Granted'
+                  : 'Đã lưu tài khoản; UID: Not Found · Gold: Not Granted';
             $('accountMessage').textContent = summary;
             accountDialog.close();
             $('adminMessage').textContent = 'Đã thêm tài khoản · ' + summary;

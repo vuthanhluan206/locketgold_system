@@ -487,14 +487,21 @@ def test_02_06_07_08_09_10_auto_public_resolver_and_verified_uid_preservation(pr
     assert saved_compound['firebase_uid'] == real_uid_28
     assert saved_compound['invite_token'] == real_invite_44
     assert saved_compound['verification_status'] == 'unverified_uid'
-    assert saved_compound['status'] == 'pending'
     assert saved_compound['verification_source'] == 'locket_public_share_link'
-    assert (real_uid_28, 'Gold') not in ent_store
+    assert saved_compound['uid_resolution_status'] == 'found'
+    assert saved_compound['uid_source'] == 'public_share_link'
+    assert saved_compound['uid_assurance'] == 'public_derived'
+    assert saved_compound['grant_basis'] == 'admin_authorized_public_uid'
+    assert saved_compound['result_code'] == 'GOLD_GRANTED'
+    assert saved_compound['status'] == 'active'
+    assert v2_store['vt.l']['_server_uid_proof'] is False
+    assert (real_uid_28, 'Gold') in ent_store
+    assert ent_store[(real_uid_28, 'Gold')]['grant_basis'] == 'admin_authorized_public_uid'
 
     sub_real = http.get(f'/v1/subscribers/{real_uid_28}', headers=prompt26_env['service_headers'])
     assert sub_real.status_code == 200
-    assert sub_real.headers['x-lab-entitlement-status'] == 'pending'
-    assert sub_real.json()['subscriber']['entitlements'] == {}
+    assert sub_real.headers['x-lab-entitlement-status'] == 'active'
+    assert 'Gold' in sub_real.json()['subscriber']['entitlements']
 
 
 # Tests 11, 12, 13, 14, 15, 16, 17, 18, 19, 23: Gold Management SSOT & CRUD Synchronized by Verified UID

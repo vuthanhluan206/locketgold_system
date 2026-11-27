@@ -73,6 +73,10 @@ class Settings(BaseSettings):
     trusted_proxy_cidrs: Annotated[list[str], NoDecode] = Field(default_factory=list)
     locket_identity_timeout_seconds: float = Field(default=5.0, ge=0.5, le=30.0)
     locket_identity_max_retries: int = Field(default=2, ge=1, le=5)
+    allow_admin_public_uid_grant: bool = Field(
+        default=True,
+        validation_alias=AliasChoices('allow_admin_public_uid_grant', 'ALLOW_ADMIN_PUBLIC_UID_GRANT'),
+    )
 
     @model_validator(mode='before')
     @classmethod

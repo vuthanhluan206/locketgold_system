@@ -85,6 +85,7 @@ async def _resolve_account_and_build_response(
 
 
 @router.get('/v1/subscribers/{account_id}', dependencies=[Depends(require_subscriber_access)])
+@router.post('/v1/subscribers/{account_id}', dependencies=[Depends(require_subscriber_access)])
 async def subscriber(account_id: AccountId, request: Request, accounts: Accounts):
     return await _resolve_account_and_build_response(
         account_id, request, accounts, inspect_source='v1_subscribers'
@@ -92,10 +93,65 @@ async def subscriber(account_id: AccountId, request: Request, accounts: Accounts
 
 
 @router.get('/api/lab/subscribers/{account_id}', dependencies=[Depends(require_subscriber_access)])
+@router.post('/api/lab/subscribers/{account_id}', dependencies=[Depends(require_subscriber_access)])
 async def lab_subscriber_inspect(account_id: AccountId, request: Request, accounts: Accounts):
     """Controlled HTTPS Research Lab endpoint for testing subscription entitlement states and logging."""
     return await _resolve_account_and_build_response(
         account_id, request, accounts, inspect_source='https_research_lab'
+    )
+
+
+@router.post('/v1/receipts', dependencies=[Depends(require_subscriber_access)])
+@router.post('/api/lab/receipts', dependencies=[Depends(require_subscriber_access)])
+async def subscriber_receipts(request: Request, accounts: Accounts):
+    """
+    RevenueCat-compatible `/v1/receipts` endpoint for Research Lab testing.
+    Strictly evaluates the requested `app_user_id` against the MongoDB Single Source of Truth
+    (never grants Gold to unknown, expired, or revoked accounts).
+    """
+    import json
+    import re
+    from ..models import ACCOUNT_ID_REGEX
+
+    raw_body = await request.body()
+    parsed_body = {}
+    if raw_body:
+        try:
+            parsed_body = json.loads(raw_body.decode('utf-8'))
+        except Exception:
+            parsed_body = {}
+
+    candidate_id = ''
+    if isinstance(parsed_body, dict):
+        candidate_id = str(
+            parsed_body.get('app_user_id')
+            or parsed_body.get('locket_id')
+            or parsed_body.get('uid')
+            or ''
+        ).strip()
+    if not candidate_id:
+        candidate_id = (
+            request.headers.get('X-RevenueCat-User-Id')
+            or request.headers.get('x-revenuecat-user-id')
+            or request.query_params.get('app_user_id')
+            or ''
+        ).strip()
+
+    if not candidate_id or not re.fullmatch(ACCOUNT_ID_REGEX, candidate_id):
+        raise HTTPException(422, 'Valid app_user_id is required in receipt payload or X-RevenueCat-User-Id header')
+
+    device_doc = getattr(request.state, 'device_doc', None)
+    if getattr(request.state, 'caller_kind', None) == 'device_token' and isinstance(device_doc, dict):
+        allowed_ids = {
+            device_doc.get('locket_id'),
+            device_doc.get('firebase_uid'),
+            device_doc.get('canonical_locket_id'),
+        } - {None, ''}
+        if candidate_id not in allowed_ids:
+            raise HTTPException(403, 'Device token is not authorized to query receipts for another account')
+
+    return await _resolve_account_and_build_response(
+        candidate_id, request, accounts, inspect_source='v1_receipts'
     )
 
 

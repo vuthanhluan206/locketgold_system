@@ -34,6 +34,26 @@ IdentityResolutionStatus = Literal[
     'conflict',
     'unverified',
 ]
+UidResolutionStatus = Literal['found', 'not_found', 'lookup_error', 'conflict', 'pending']
+UidSource = Literal['public_share_link', 'verified_provider', 'verified_cache', 'admin_manual_input', 'none']
+UidAssurance = Literal['public_derived', 'independently_verified', 'unverified_manual', 'none']
+GrantBasis = Literal['independently_verified', 'admin_authorized_public_uid', 'none']
+AccountResultCode = Literal[
+    'UID_FOUND',
+    'UID_NOT_FOUND',
+    'UID_CONFLICT',
+    'UID_LOOKUP_ERROR',
+    'GOLD_GRANTED',
+    'GOLD_NOT_GRANTED',
+]
+
+
+def _is_public_uid_grant_policy_enabled() -> bool:
+    try:
+        from .config import get_settings
+        return bool(get_settings().allow_admin_public_uid_grant)
+    except Exception:
+        return True
 
 
 def normalize_expiry(value) -> datetime:
@@ -97,8 +117,21 @@ def compute_entitlement_status(account: dict | None, now: datetime | None = None
     if explicit_status == 'pending':
         return 'pending', eff_expiry
 
-    if 'verification_status' in account or '_server_uid_proof' in account:
-        if account.get('verification_status') != 'verified_uid' or account.get('_server_uid_proof') is not True:
+    if 'verification_status' in account or '_server_uid_proof' in account or 'grant_basis' in account:
+        is_indep_verified = (
+            account.get('verification_status') == 'verified_uid'
+            and account.get('_server_uid_proof') is True
+        )
+        fb_val = account.get('firebase_uid')
+        is_admin_public_grant = (
+            _is_public_uid_grant_policy_enabled()
+            and account.get('grant_basis') == 'admin_authorized_public_uid'
+            and account.get('verification_source') == 'locket_public_share_link'
+            and isinstance(fb_val, str)
+            and len(fb_val.strip()) == 28
+            and fb_val.strip().isalnum()
+        )
+        if not (is_indep_verified or is_admin_public_grant):
             return 'pending', eff_expiry
 
     return 'active', eff_expiry
@@ -187,6 +220,13 @@ class AccountOutput(BaseModel):
     uid_resolved_at: AwareDatetime | None = None
     uid_resolution_source: str | None = None
     resolution_status: str | None = None
+    uid_resolution_status: UidResolutionStatus = 'not_found'
+    uid_source: UidSource = 'none'
+    uid_assurance: UidAssurance = 'none'
+    grant_basis: str | None = None
+    grant_status_label: str = 'Not Granted'
+    grant_reason: str | None = None
+    result_code: AccountResultCode | None = None
     max_devices: int = 2
     active_devices: int = 0
     activated_at: AwareDatetime | None = None
@@ -212,6 +252,10 @@ class IdentityResolutionOutput(BaseModel):
     identity_lookup_at: AwareDatetime | None = None
     uid_resolved_at: AwareDatetime | None = None
     uid_resolution_source: str | None = None
+    uid_resolution_status: UidResolutionStatus = 'not_found'
+    uid_source: UidSource = 'none'
+    uid_assurance: UidAssurance = 'none'
+    result_code: AccountResultCode = 'UID_NOT_FOUND'
     message: str
 
 

@@ -5,6 +5,7 @@
 .pytest_cache
 **/__pycache__/**
 tests
+Tai_lieu_thiet_ke
 SOURCE.md
 source-code.zip
 *.pem

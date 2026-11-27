@@ -19,6 +19,7 @@ __pycache__/
 certs_private/
 certs_public/
 backups/
+Tai_lieu_thiet_ke/
 cotloicualocketgold.txt
 locket_gold_mitm_server*.js
 SOURCE.md

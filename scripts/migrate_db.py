@@ -22,7 +22,10 @@ from pymongo import AsyncMongoClient
 from app.config import get_settings
 from app.database import _fetch_all_documents, run_controlled_migration
 from app.models import compute_entitlement_status, normalize_expiry
-from app.services.entitlement_service import extract_verified_uid_metadata
+from app.services.entitlement_service import (
+    extract_grant_eligibility_metadata,
+    extract_verified_uid_metadata,
+)
 from app.services.identity_service import is_valid_firebase_uid
 
 
@@ -304,8 +307,11 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
 
         # Check entitlements projection drift
         if getattr(db, 'entitlements', None) is not None:
-            fb_uid, uid_ver, *_ = extract_verified_uid_metadata(v2_doc)
-            target_ent_id = fb_uid if (uid_ver and fb_uid) else lid
+            meta = extract_grant_eligibility_metadata(v2_doc)
+            fb_uid = meta['firebase_uid']
+            can_grant = meta['can_grant_gold']
+            grant_basis_val = meta['grant_basis']
+            target_ent_id = fb_uid if (can_grant and fb_uid) else lid
             ent_doc = ent_map.get(target_ent_id) or ent_map.get(lid)
             ent_exp = None
             if isinstance(ent_doc, dict) and ent_doc.get('expires_date') is not None:
@@ -315,13 +321,19 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
                     ent_exp = None
             ent_status = str(ent_doc.get('status') or '').lower() if isinstance(ent_doc, dict) else ''
             if auth_status == 'active':
-                if not uid_ver or not ent_doc or ent_doc.get('account_id') != fb_uid:
+                if not can_grant or not ent_doc or ent_doc.get('account_id') != fb_uid:
                     auth_status = 'pending'
                 elif ent_status != 'active' or ent_doc.get('revoked_at'):
                     auth_status = 'revoked' if ent_doc.get('revoked_at') or ent_status == 'revoked' else 'pending'
-                if uid_ver and ent_exp is not None:
+                if can_grant and ent_exp is not None:
                     auth_expiry = min(auth_expiry, ent_exp)
-            if ent_doc is None or ent_doc.get('account_id') != target_ent_id or ent_exp != auth_expiry or ent_status != auth_status:
+            if (
+                ent_doc is None
+                or ent_doc.get('account_id') != target_ent_id
+                or ent_exp != auth_expiry
+                or ent_status != auth_status
+                or (can_grant and ent_doc.get('grant_basis') != grant_basis_val)
+            ):
                 drifts.append({'locket_id': lid, 'target': 'entitlements', 'reason': 'Entitlement projection out of sync with accounts_v2'})
                 if not dry_run:
                     await db.entitlements.update_one(
@@ -332,6 +344,7 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
                                 'entitlement_key': 'Gold',
                                 'product_identifier': 'com.locket.gold.yearly',
                                 'status': auth_status,
+                                'grant_basis': grant_basis_val,
                                 'expires_date': auth_expiry,
                                 'revoked_at': auth_revoked_at,
                                 'updated_at': now,
@@ -462,8 +475,9 @@ async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True, chan
             status, expiry = compute_entitlement_status(old, now)
             if account.get('status') != 'active' or old.get('status') != 'active':
                 status = 'revoked' if 'revoked' in (account.get('status'), old.get('status')) else 'pending'
+            basis = old.get('grant_basis') or account.get('grant_basis') or 'independently_verified'
             fields = {**old, 'account_id': uid, 'locket_id': lid, 'status': status,
-                      'expires_date': expiry, 'updated_at': now}
+                      'grant_basis': basis, 'expires_date': expiry, 'updated_at': now}
             change('entitlements', {'account_id': uid, 'entitlement_key': 'Gold'}, None, fields)
             migrated_entitlements += 1
 
