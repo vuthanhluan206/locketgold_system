@@ -280,7 +280,8 @@ async def download_profile(
         eff_mode = 'dns_only'
     if eff_mode != 'default' or device_label:
         try:
-            scoped = settings.lab_scoped_domains if eff_mode == 'scoped_lab' else None
+            has_custom_doh = bool((getattr(settings, 'doh_server_url', '') or '').strip())
+            scoped = settings.lab_scoped_domains if (eff_mode == 'scoped_lab' or (eff_mode == 'lab_ca' and has_custom_doh)) else None
             if eff_mode == 'dns_only':
                 s_copy = settings.model_copy(update={'root_ca_path': '', 'root_ca_pem': ''})
                 profile_bytes = build_profile(s_copy, scoped_domains=None, device_label=device_label)
