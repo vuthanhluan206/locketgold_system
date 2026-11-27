@@ -14,6 +14,7 @@ from ..models import (
     AccountOutput,
     ActivateAccountInput,
     AdminAccountLookupOutput,
+    DEFAULT_ACTIVE_GOLD_FEATURES,
     DeviceCreateInput,
     DeviceOutput,
     LinkVerifyInput,
@@ -279,7 +280,7 @@ async def download_profile(
         eff_mode = 'dns_only'
     if eff_mode != 'default' or device_label:
         try:
-            scoped = settings.lab_scoped_domains if eff_mode in {'scoped_lab', 'lab_ca'} else None
+            scoped = settings.lab_scoped_domains if eff_mode == 'scoped_lab' else None
             if eff_mode == 'dns_only':
                 s_copy = settings.model_copy(update={'root_ca_path': '', 'root_ca_pem': ''})
                 profile_bytes = build_profile(s_copy, scoped_domains=None, device_label=device_label)
@@ -1130,6 +1131,11 @@ async def upsert_account(
         'revoked_at': legacy_doc['revoked_at'],
         'revoke_reason': ((existing_v2 or {}).get('revoke_reason') or 'Set to revoked on save') if effective_status == 'revoked' else None,
         'activated_at': ((existing_v2 or {}).get('activated_at') or now) if effective_status == 'active' else (existing_v2 or {}).get('activated_at'),
+        'lab_features': (
+            (existing_v2 or {}).get('lab_features') or dict(DEFAULT_ACTIVE_GOLD_FEATURES)
+            if effective_status == 'active'
+            else (existing_v2 or {}).get('lab_features', {})
+        ),
         'max_devices': data.max_devices if 'max_devices' in data.model_fields_set else (existing_v2 or {}).get('max_devices', data.max_devices),
         'notes': data.notes,
         'updated_at': now,
@@ -1481,6 +1487,7 @@ async def activate_account(
                         'status': 'active',
                         'grant_basis': grant_basis_val,
                         'result_code': 'GOLD_GRANTED',
+                        'lab_features': existing.get('lab_features') or dict(DEFAULT_ACTIVE_GOLD_FEATURES),
                         'activated_at': now,
                         'expires_date': new_expiry,
                         'revoked_at': None,

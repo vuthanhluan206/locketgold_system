@@ -1358,10 +1358,33 @@
     }
 
     .admin #dashboard td button {
-      border-color: transparent;
-      background: transparent;
-      margin: 0 1px;
+      border-color: var(--line);
+      background: var(--field);
+      margin: 2px;
       border-radius: 10px;
+      padding: 6px 10px;
+      font-size: 12px;
+      font-weight: 600;
+    }
+
+    .admin #dashboard td button.gold-action-pill {
+      border-color: var(--gold);
+      color: var(--gold);
+    }
+
+    .admin .expiry-presets {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin: -8px 0 16px;
+    }
+
+    .admin .expiry-presets button {
+      width: auto;
+      min-height: 34px;
+      padding: 6px 12px;
+      font-size: 12px;
+      border-radius: 8px;
     }
 
     .admin #dashboard td button:hover:not(:disabled) {
@@ -1856,8 +1879,11 @@
         <p id="lookupDescription"></p>
         <div id="downloadResult" hidden>
         <div class="features-list">
-          <strong>Không dùng chung link cho nhiều tài khoản.</strong>
-          <p class="note note-spacing">Nếu mất tài khoản hoặc thiết bị gặp vấn đề, nhà phát triển không chịu trách nhiệm.</p>
+          <strong>Quyền lợi Locket Gold đã kích hoạt cho tài khoản:</strong>
+          <div><span aria-hidden="true">👑</span> Huy hiệu Locket Gold &amp; Mở khóa gói Pro (Gold + Pro)</div>
+          <div><span aria-hidden="true">🎬</span> Quay &amp; đăng video khoảnh khắc dài tới 60 giây</div>
+          <div><span aria-hidden="true">🔒</span> Đăng khoảnh khắc riêng tư &amp; Mở khóa toàn bộ bộ lọc, hiệu ứng</div>
+          <p class="note note-spacing">Không dùng chung link cho nhiều tài khoản. Nếu mất tài khoản hoặc thiết bị gặp vấn đề, nhà phát triển không chịu trách nhiệm.</p>
         </div>
         <div id="publicLabCaGroup" class="public-install-stack">
           <a href="/profile.mobileconfig?mode=lab_ca" id="installLabCaBtn" class="button gold-btn">Tải cấu hình Root CA + DNS (.mobileconfig)</a>
@@ -2117,8 +2143,15 @@
               <div class="field"><label for="accountId">Locket ID / Username</label><input id="accountId" required maxlength="256"
                   autocomplete="off" placeholder="username hoặc https://locket.cam/username"></div>
               <div class="field"><label for="expiry">Expires at · local time</label><input id="expiry"
-                  type="datetime-local" required></div>
+                  type="datetime-local" required>
+                <div class="expiry-presets">
+                  <button class="secondary" type="button" data-expiry-days="30">+30 Ngày (1 Tháng)</button>
+                  <button class="secondary" type="button" data-expiry-days="365">+365 Ngày (1 Năm)</button>
+                  <button class="secondary" type="button" data-expiry-days="3650">Vĩnh Viễn (10 Năm)</button>
+                </div>
+              </div>
             </div>
+            <p class="note">Khi bấm Save account, hệ thống tự động lấy Firebase UID 28 ký tự, cấp quyền Gold + Pro và bật sẵn Full tính năng Gold (Video 60s, Private Posts, Full Filters).</p>
             <p class="status" id="accountMessage" role="status" aria-live="polite"></p>
             <div class="dialog-actions">
               <button class="secondary" id="cancelAccount" type="button">Cancel</button>
@@ -2201,9 +2234,20 @@
         const key = 'locket_admin_session';
         const $ = id => document.getElementById(id);
         const accountDialog = $('accountDialog');
+        function setExpiryDaysFromNow(days) {
+          const target = new Date(Date.now() + days * 86400000);
+          target.setHours(23, 59, 0, 0);
+          $('expiry').value = new Date(target - target.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+        }
+        document.querySelectorAll('[data-expiry-days]').forEach(btn => {
+          btn.addEventListener('click', () => setExpiryDaysFromNow(Number(btn.dataset.expiryDays) || 365));
+        });
         function openAccountDialog(editing = false) {
           $('accountId').readOnly = editing;
-          if (!editing) $('accountForm').reset();
+          if (!editing) {
+            $('accountForm').reset();
+            setExpiryDaysFromNow(365);
+          }
           $('editorTitle').textContent = editing ? 'Edit / renew account' : 'Add account';
           $('accountMessage').textContent = '';
           accountDialog.showModal();
@@ -2367,7 +2411,8 @@
                 }
                 const deviceInfo = document.createElement('div'); deviceInfo.className = 'account-uid-meta';
                 deviceInfo.textContent = 'Device Count: ' + row.active_devices + '/' + row.max_devices +
-                  ' · Activated: ' + (row.activated_at ? new Date(row.activated_at).toLocaleString() : '—');
+                  ' · Activated: ' + (row.activated_at ? new Date(row.activated_at).toLocaleString() : '—') +
+                  (row.status === 'active' ? ' · Gold Features: Video 60s, Private Posts, All Filters (Active)' : '');
                 stack.append(name, uidMeta, verMeta, grantMeta, deviceInfo);
                 td.append(stack);
               } else {
@@ -2428,8 +2473,11 @@
             });
             revoke.disabled = row.status === 'revoked';
             edit.title = 'Edit / Renew';
-            actions.append(edit, check, activate, revoke, actionButton('Gold Features', () => features(row)),
-              actionButton('Devices', () => devices(row)), remove);
+            const featBtn = actionButton('Gold Features', () => features(row));
+            featBtn.classList.add('gold-action-pill');
+            const devBtn = actionButton('Devices', () => devices(row));
+            devBtn.classList.add('gold-action-pill');
+            actions.append(edit, check, activate, revoke, featBtn, devBtn, remove);
             tr.append(actions); body.append(tr);
           }
           if (!rows.length) { const tr = document.createElement('tr'); const td = document.createElement('td'); td.colSpan = 5; td.textContent = 'No accounts yet.'; tr.append(td); body.append(tr); }

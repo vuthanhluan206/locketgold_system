@@ -73,6 +73,11 @@ async def require_subscriber_access(
                     request.state.caller_kind = "admin_session"
                     return
 
+    # Support RevenueCat iOS SDK public API key format (`appl_<alphanumeric>`) from Locket iOS client
+    if raw_cred.startswith("appl_") and re.fullmatch(r"appl_[A-Za-z0-9_]{8,64}", raw_cred):
+        request.state.caller_kind = "ios_revenuecat_sdk"
+        return
+
     raise unauthorized
 
 

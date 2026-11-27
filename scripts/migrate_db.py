@@ -343,6 +343,14 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
                                 'uid_resolution_status': 'found',
                                 'uid_source': 'public_share_link',
                                 'uid_assurance': 'public_derived',
+                                'lab_features': v2_doc.get('lab_features') or {
+                                    'max_video_duration_seconds': 60,
+                                    'enable_private_posts': True,
+                                    'unlocked_filters': True,
+                                    'camera_filters_enabled': True,
+                                    'holiday_effects_enabled': True,
+                                    'unlocked_all_filters': True,
+                                },
                                 'updated_at': now,
                             }
                         },
