@@ -690,7 +690,19 @@ def test_prompt28_edge_cases_conflicts_revision_tickets_and_admin_ui(prompt28_en
         assert http.get('/profile.mobileconfig?mode=dns_only').status_code == 200
     get_settings.cache_clear()
 
-    # 7. Admin UI HTML contains all required Prompt 28 elements and zero forbidden legacy token inputs
+    # 7. Admin UI & Public UI HTML contain all required Prompt 28 elements and zero forbidden legacy token inputs
+    pub_html = http.get('/').text
+    for expected_pub in (
+        'id="installLabCaBtn"',
+        'id="installScopedLabBtn"',
+        'id="installCaCertBtn"',
+        'id="installBtn"',
+        'id="publicCaGuide"',
+        '/profile.mobileconfig?mode=lab_ca',
+        '/api/lab/ca.cer?format=der',
+    ):
+        assert expected_pub in pub_html, f'Missing Public UI snippet: {expected_pub}'
+
     adm_html = http.get('/admin').text
     for expected_snippet in (
         'id="accountSearch"',

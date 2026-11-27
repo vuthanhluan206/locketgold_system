@@ -272,7 +272,8 @@ async def download_profile(
                 raise HTTPException(401, 'Device token không hợp lệ hoặc đã bị thu hồi.')
             device_label = device_doc.get('device_id')
 
-    if settings.app_env == 'production' and eff_mode in {'lab_ca', 'scoped_lab'}:
+    is_prod_restricted = settings.app_env == 'production' and not getattr(settings, 'allow_lab_ca_profile', False)
+    if is_prod_restricted and eff_mode in {'lab_ca', 'scoped_lab'}:
         raise HTTPException(403, 'Lab CA profiles require a research environment')
     if eff_mode == 'default' and (settings.root_ca_path or settings.root_ca_pem):
         eff_mode = 'dns_only'
@@ -1733,7 +1734,7 @@ async def get_pki_status(request: Request):
             doh_url = resolve_doh_server_url(settings)
         except Exception:
             doh_url = None
-    is_prod = settings.app_env == 'production'
+    is_prod = settings.app_env == 'production' and not getattr(settings, 'allow_lab_ca_profile', False)
 
     try:
         cert = load_validated_root_ca(settings)

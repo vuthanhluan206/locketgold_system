@@ -1695,6 +1695,44 @@
       width: 100%;
     }
 
+    .public-install-stack {
+      display: flex;
+      flex-direction: column;
+      gap: 10px;
+      margin: 14px 0;
+    }
+
+    .public-ca-guide {
+      margin: 14px 0;
+      padding: 14px;
+      border-radius: 14px;
+      border: 1px solid var(--line);
+      background: var(--field);
+      font-size: 13px;
+      line-height: 1.55;
+      text-align: left;
+    }
+
+    .public-ca-guide ol {
+      margin: 8px 0 0;
+      padding-left: 18px;
+    }
+
+    .public-ca-guide li {
+      margin-bottom: 6px;
+    }
+
+    .public-ca-fp {
+      margin-top: 8px;
+      padding: 8px 10px;
+      border-radius: 10px;
+      border: 1px dashed var(--line);
+      font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+      font-size: 11px;
+      color: var(--muted);
+      overflow-wrap: anywhere;
+    }
+
     @media (max-height: 600px) {
       .card.public .logo-wrapper {
         width: 48px;
@@ -1821,7 +1859,24 @@
           <strong>Không dùng chung link cho nhiều tài khoản.</strong>
           <p class="note note-spacing">Nếu mất tài khoản hoặc thiết bị gặp vấn đề, nhà phát triển không chịu trách nhiệm.</p>
         </div>
-        <a href="/profile.mobileconfig" id="installBtn" class="button gold-btn">Tải về cấu hình ngay</a>
+        <div id="publicLabCaGroup" class="public-install-stack">
+          <a href="/profile.mobileconfig?mode=lab_ca" id="installLabCaBtn" class="button gold-btn">Tải cấu hình Root CA + DNS (.mobileconfig)</a>
+          <a href="/profile.mobileconfig?mode=scoped_lab" id="installScopedLabBtn" class="button secondary">Tải cấu hình Root CA + Split-DNS (.mobileconfig)</a>
+          <a href="/api/lab/ca.cer?format=der" id="installCaCertBtn" class="button secondary">Tải riêng chứng chỉ Root CA (.cer)</a>
+        </div>
+        <div class="public-install-stack">
+          <a href="/profile.mobileconfig" id="installBtn" class="button secondary">Tải cấu hình chỉ DNS (Không kèm Root CA)</a>
+        </div>
+        <div id="publicCaGuide" class="public-ca-guide">
+          <strong>Hướng dẫn cài đặt Root CA + DNS trên iPhone:</strong>
+          <ol>
+            <li>Mở trang này bằng trình duyệt <strong>Safari</strong> trên iPhone, nhấn <strong>Tải cấu hình Root CA + DNS</strong> và chọn <strong>Cho phép (Allow)</strong>.</li>
+            <li>Mở <strong>Cài đặt (Settings)</strong> → <strong>Đã tải về hồ sơ (Profile Downloaded)</strong> → nhấn <strong>Cài đặt (Install)</strong> và nhập mật mã màn hình.</li>
+            <li>Vào <strong>Cài đặt</strong> → <strong>Cài đặt chung (General)</strong> → <strong>Giới thiệu (About)</strong> → kéo xuống cuối chọn <strong>Cài đặt tin cậy chứng nhận (Certificate Trust Settings)</strong> → gạt bật công tắc cho <strong>LocketGold Research Lab Root CA</strong> → chọn <strong>Tiếp tục</strong>.</li>
+            <li>Mở lại ứng dụng Locket để áp dụng cấu hình.</li>
+          </ol>
+          <div id="publicCaFingerprint" class="public-ca-fp">Root CA: LocketGold Research Lab Root CA (2 payloads: com.apple.security.root + com.apple.dnsSettings.managed)</div>
+        </div>
         <p class="note note-spacing">Lưu ý: Bắt buộc mở bằng trình duyệt Safari trên iPhone để cài đặt chính xác.</p>
         </div>
         <form method="dialog">
@@ -1841,10 +1896,44 @@
         const lookupTitle = document.getElementById('lookupTitle');
         const lookupDescription = document.getElementById('lookupDescription');
         const installBtn = document.getElementById('installBtn');
+        const installLabCaBtn = document.getElementById('installLabCaBtn');
+        const installScopedLabBtn = document.getElementById('installScopedLabBtn');
+        const installCaCertBtn = document.getElementById('installCaCertBtn');
+        const publicLabCaGroup = document.getElementById('publicLabCaGroup');
+        const publicCaGuide = document.getElementById('publicCaGuide');
+        const publicCaFingerprint = document.getElementById('publicCaFingerprint');
         const pageTicket = new URLSearchParams(window.location.search).get('ticket');
-        const profileDownloadHref = pageTicket && pageTicket.startsWith('lkg_dl_')
+        const hasValidTicket = Boolean(pageTicket && pageTicket.startsWith('lkg_dl_'));
+        const profileDownloadHref = hasValidTicket
           ? '/profile.mobileconfig?ticket=' + encodeURIComponent(pageTicket)
           : '/profile.mobileconfig';
+        const labCaDownloadHref = hasValidTicket
+          ? '/profile.mobileconfig?mode=lab_ca&ticket=' + encodeURIComponent(pageTicket)
+          : '/profile.mobileconfig?mode=lab_ca';
+        const scopedLabDownloadHref = hasValidTicket
+          ? '/profile.mobileconfig?mode=scoped_lab&ticket=' + encodeURIComponent(pageTicket)
+          : '/profile.mobileconfig?mode=scoped_lab';
+
+        async function refreshPublicCaState() {
+          try {
+            const hRes = await fetch('/api/health', { cache: 'no-store', credentials: 'omit' });
+            if (!hRes.ok) return;
+            const hData = await hRes.json();
+            const caLoaded = Boolean(hData && hData.root_ca_loaded);
+            if (publicLabCaGroup) publicLabCaGroup.hidden = !caLoaded;
+            if (publicCaGuide) publicCaGuide.hidden = !caLoaded;
+            if (installBtn) {
+              installBtn.className = caLoaded ? 'button secondary' : 'button gold-btn';
+              installBtn.textContent = caLoaded
+                ? 'Tải cấu hình chỉ DNS (Không kèm Root CA)'
+                : 'Tải về cấu hình ngay';
+            }
+            if (caLoaded && publicCaFingerprint && hData.root_ca_sha256) {
+              publicCaFingerprint.textContent = 'Root CA SHA-256: ' + hData.root_ca_sha256;
+            }
+          } catch { }
+        }
+        refreshPublicCaState();
         function showLookupResult(title, description) {
           lookupMessage.textContent = '';
           lookupTitle.textContent = title;
@@ -1881,7 +1970,11 @@
             downloadResult.hidden = result.exists !== true;
             if (result.exists === true) {
               installBtn.href = profileDownloadHref;
-              showLookupResult('Đã tìm thấy tài khoản', 'Tài khoản của bạn đã có trong hệ thống. Bạn có thể tải cấu hình bên dưới.');
+              if (installLabCaBtn) installLabCaBtn.href = labCaDownloadHref;
+              if (installScopedLabBtn) installScopedLabBtn.href = scopedLabDownloadHref;
+              if (installCaCertBtn) installCaCertBtn.href = '/api/lab/ca.cer?format=der';
+              await refreshPublicCaState();
+              showLookupResult('Đã tìm thấy tài khoản', 'Tài khoản của bạn đã có trong hệ thống. Chọn cấu hình Root CA + DNS (khuyên dùng) hoặc chỉ DNS bên dưới.');
             } else {
               showLookupResult('Không tìm thấy tài khoản', 'Tài khoản của bạn hiện chưa có trong hệ thống. Vui lòng liên hệ với nhà phát triển vuthanhluan.bond để được thêm tài khoản.');
             }

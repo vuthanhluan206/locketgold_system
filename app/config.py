@@ -77,6 +77,10 @@ class Settings(BaseSettings):
         default=True,
         validation_alias=AliasChoices('allow_admin_public_uid_grant', 'ALLOW_ADMIN_PUBLIC_UID_GRANT'),
     )
+    allow_lab_ca_profile: bool = Field(
+        default=False,
+        validation_alias=AliasChoices('allow_lab_ca_profile', 'ALLOW_LAB_CA_PROFILE'),
+    )
 
     @model_validator(mode='before')
     @classmethod
