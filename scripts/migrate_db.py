@@ -311,6 +311,44 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
             fb_uid = meta['firebase_uid']
             can_grant = meta['can_grant_gold']
             grant_basis_val = meta['grant_basis']
+
+            # Upgrade pre-Prompt-28 public-derived UID accounts that were stuck in 'pending' without grant_basis
+            from app.models import _is_public_uid_grant_policy_enabled
+            if (
+                not can_grant
+                and auth_status != 'revoked'
+                and auth_expiry > now
+                and fb_uid
+                and is_valid_firebase_uid(fb_uid)
+                and v2_doc.get('verification_source') == 'locket_public_share_link'
+                and not v2_doc.get('grant_basis')
+                and _is_public_uid_grant_policy_enabled()
+            ):
+                can_grant = True
+                grant_basis_val = 'admin_authorized_public_uid'
+                auth_status = 'active'
+                drifts.append({
+                    'locket_id': lid,
+                    'target': 'accounts_v2',
+                    'reason': 'Backfill admin_authorized_public_uid grant_basis for public-derived Firebase UID',
+                })
+                if not dry_run:
+                    await db.accounts_v2.update_one(
+                        {'locket_id': lid},
+                        {
+                            '$set': {
+                                'account_id': fb_uid,
+                                'status': 'active',
+                                'grant_basis': 'admin_authorized_public_uid',
+                                'uid_resolution_status': 'found',
+                                'uid_source': 'public_share_link',
+                                'uid_assurance': 'public_derived',
+                                'updated_at': now,
+                            }
+                        },
+                    )
+                    repaired += 1
+
             target_ent_id = fb_uid if (can_grant and fb_uid) else lid
             ent_doc = ent_map.get(target_ent_id) or ent_map.get(lid)
             ent_exp = None
@@ -321,10 +359,10 @@ async def reconcile_collections(db, *, dry_run: bool = True) -> dict:
                     ent_exp = None
             ent_status = str(ent_doc.get('status') or '').lower() if isinstance(ent_doc, dict) else ''
             if auth_status == 'active':
-                if not can_grant or not ent_doc or ent_doc.get('account_id') != fb_uid:
+                if not can_grant:
                     auth_status = 'pending'
-                elif ent_status != 'active' or ent_doc.get('revoked_at'):
-                    auth_status = 'revoked' if ent_doc.get('revoked_at') or ent_status == 'revoked' else 'pending'
+                elif ent_doc and (ent_doc.get('revoked_at') or ent_status == 'revoked'):
+                    auth_status = 'revoked'
                 if can_grant and ent_exp is not None:
                     auth_expiry = min(auth_expiry, ent_exp)
             if (
@@ -404,7 +442,14 @@ async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True, chan
             uid_owners.setdefault(raw_uid.strip(), []).append(lid)
 
         fb_uid, uid_verified, ver_status, _, ver_source = extract_verified_uid_metadata(doc)
-        if uid_verified and fb_uid and is_valid_firebase_uid(fb_uid):
+        grant_meta = extract_grant_eligibility_metadata(doc)
+        is_authorized_public_uid = bool(
+            grant_meta['can_grant_gold']
+            and grant_meta['grant_basis'] == 'admin_authorized_public_uid'
+            and fb_uid
+            and is_valid_firebase_uid(fb_uid)
+        )
+        if (uid_verified or is_authorized_public_uid) and fb_uid and is_valid_firebase_uid(fb_uid):
             known_verified_uids.add(fb_uid)
             verified_uid_accounts.append({
                 'locket_id': lid,
@@ -412,6 +457,7 @@ async def inspect_and_migrate_uid_entitlements(db, *, dry_run: bool = True, chan
                 'firebase_uid': fb_uid,
                 'account_id': doc.get('account_id'),
                 'verification_source': ver_source,
+                'grant_basis': grant_meta['grant_basis'],
                 'status': doc.get('status'),
             })
             if doc.get('account_id') != fb_uid or (lid != fb_uid and lid in active_keys):

@@ -230,6 +230,7 @@ async def create_profile_ticket_from_device_bearer(
 
 
 @router.get('/profile.mobileconfig')
+@router.head('/profile.mobileconfig')
 async def download_profile(
     request: Request,
     mode: Literal['default', 'dns_only', 'lab_ca', 'scoped_lab'] = Query('default'),
@@ -336,6 +337,7 @@ async def download_profile(
 
 
 @router.get('/api/lab/ca.cer')
+@router.head('/api/lab/ca.cer')
 async def download_public_lab_root_ca(
     format: Literal['der', 'pem'] = Query('der'),
 ):
