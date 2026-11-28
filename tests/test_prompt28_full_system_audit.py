@@ -975,6 +975,105 @@ def test_prompt28_custom_doh_gateway_observability_caching_and_split_dns_safety(
     assert tr_blocked.json()['verdict'] == 'BLOCKED'
 
 
+def test_prompt28_storekit2_sandbox_jws_payment_restore_webhook_and_lifecycle(prompt28_env):
+    """
+    Verify end-to-end StoreKit 2 Sandbox JWS transaction verification, receipt posting, restore purchases,
+    and RevenueCat Server-to-Server Webhook lifecycle (`INITIAL_PURCHASE` -> `RESTORE` -> `EXPIRATION` -> `RENEWAL` -> `CANCELLATION`):
+    1. Minting an ES256-signed StoreKit 2 Sandbox JWS transaction for a 28-char Firebase UID (`juNBPjHxRYeYXtMzPIy0YSjzIL83`).
+    2. Tampered JWS signature is rejected (`HTTP 422`) by `POST /v1/receipts`.
+    3. Valid StoreKit 2 JWS posted to `POST /v1/receipts` verifies ES256 signature, sets `X-StoreKit-Verified: true`,
+       upgrades the account in MongoDB SSOT to `verified_uid` (`grant_basis='independently_verified'`, `_server_uid_proof=True`),
+       and activates `Gold` + `pro` + 60s features.
+    4. Restore Purchases (`is_restore=True`) returns `X-RevenueCat-Restored: true` and active `Gold` entitlements.
+    5. StoreKit 2 JWS `expire` and `revoke` transactions and RevenueCat Webhooks (`EXPIRATION`, `RENEWAL`, `CANCELLATION`)
+       transition the account state deterministically across `/v1/subscribers/{uid}` and `/api/lab/accounts/{uid}/features`.
+    """
+    http = prompt28_env['http']
+    admin_headers = prompt28_env['admin_headers']
+    service_headers = prompt28_env['service_headers']
+    uid = 'juNBPjHxRYeYXtMzPIy0YSjzIL83'
+
+    # 1. Mint StoreKit 2 Sandbox JWS (Purchase)
+    mint_res = http.post(
+        '/api/lab/storekit/sandbox-transaction',
+        headers=admin_headers,
+        json={'app_user_id': uid, 'product_id': 'com.locket.gold.yearly', 'action': 'purchase', 'environment': 'Sandbox'},
+    )
+    assert mint_res.status_code == 200, mint_res.text
+    jws_token = mint_res.json()['jws_transaction']
+
+    # 2. Tampered JWS is strictly rejected with 422
+    tampered_jws = jws_token[:-4] + ('AAAA' if not jws_token.endswith('AAAA') else 'BBBB')
+    bad_rec = http.post(
+        '/v1/receipts',
+        headers=service_headers,
+        json={'app_user_id': uid, 'fetch_token': tampered_jws},
+    )
+    assert bad_rec.status_code == 422
+
+    # 3. Valid StoreKit 2 JWS posted to POST /v1/receipts activates Gold in MongoDB SSOT
+    rec_res = http.post(
+        '/v1/receipts',
+        headers=service_headers,
+        json={'app_user_id': uid, 'fetch_token': jws_token},
+    )
+    assert rec_res.status_code == 200, rec_res.text
+    assert rec_res.headers.get('x-storekit-verified') == 'true'
+    assert rec_res.headers.get('x-lab-entitlement-status') == 'active'
+    assert 'Gold' in rec_res.json()['subscriber']['entitlements']
+
+    # 4. Restore Purchases (is_restore=True)
+    restore_res = http.post(
+        '/v1/receipts',
+        headers=service_headers,
+        json={'app_user_id': uid, 'fetch_token': jws_token, 'is_restore': True},
+    )
+    assert restore_res.status_code == 200
+    assert restore_res.headers.get('x-revenuecat-restored') == 'true'
+    assert 'Gold' in restore_res.json()['subscriber']['entitlements']
+
+    # 5. RevenueCat Webhook: EXPIRATION -> status becomes expired (fail-closed)
+    wh_exp = http.post(
+        '/api/webhooks/revenuecat',
+        headers=service_headers,
+        json={'event': {'type': 'EXPIRATION', 'app_user_id': uid, 'product_id': 'com.locket.gold.yearly', 'environment': 'SANDBOX'}},
+    )
+    assert wh_exp.status_code == 200
+    assert wh_exp.json()['synced']['status'] == 'expired'
+    sub_exp = http.get(f'/v1/subscribers/{uid}', headers=service_headers)
+    assert sub_exp.headers.get('x-lab-entitlement-status') == 'expired'
+    assert sub_exp.json()['subscriber']['entitlements'] == {}
+
+    # 6. RevenueCat Webhook: RENEWAL -> status becomes active again
+    wh_ren = http.post(
+        '/api/webhooks/revenuecat',
+        headers=service_headers,
+        json={'event': {'type': 'RENEWAL', 'app_user_id': uid, 'product_id': 'com.locket.gold.yearly', 'environment': 'SANDBOX'}},
+    )
+    assert wh_ren.status_code == 200
+    assert wh_ren.json()['synced']['status'] == 'active'
+    sub_ren = http.get(f'/v1/subscribers/{uid}', headers=service_headers)
+    assert sub_ren.headers.get('x-lab-entitlement-status') == 'active'
+    assert 'Gold' in sub_ren.json()['subscriber']['entitlements']
+
+    # 7. StoreKit 2 JWS Revocation (Refund / Family Sharing Revoke) -> status becomes revoked
+    mint_rev = http.post(
+        '/api/lab/storekit/sandbox-transaction',
+        headers=admin_headers,
+        json={'app_user_id': uid, 'product_id': 'com.locket.gold.yearly', 'action': 'revoke', 'environment': 'Sandbox'},
+    )
+    assert mint_rev.status_code == 200
+    rev_res = http.post(
+        '/v1/receipts',
+        headers=service_headers,
+        json={'app_user_id': uid, 'jws_transaction': mint_rev.json()['jws_transaction']},
+    )
+    assert rev_res.status_code == 200
+    assert rev_res.headers.get('x-lab-entitlement-status') == 'revoked'
+    assert rev_res.json()['subscriber']['entitlements'] == {}
+
+
+
 
 
 

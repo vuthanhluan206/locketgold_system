@@ -106,12 +106,20 @@ async def lab_subscriber_inspect(account_id: AccountId, request: Request, accoun
 async def subscriber_receipts(request: Request, accounts: Accounts):
     """
     RevenueCat-compatible `/v1/receipts` endpoint for Research Lab testing.
-    Strictly evaluates the requested `app_user_id` against the MongoDB Single Source of Truth
-    (never grants Gold to unknown, expired, or revoked accounts).
+    - When a signed StoreKit 2 JWS transaction (`jws_transaction`, `signed_transaction_info`, or 3-part JWS `fetch_token`)
+      is supplied, cryptographically verifies its ES256 signature and synchronizes the verified transaction state
+      (`active`, `expired`, or `revoked`) into the MongoDB Single Source of Truth.
+    - Supports `is_restore: true` (Restore Purchases) and evaluates `app_user_id` against MongoDB SSOT.
     """
+    from datetime import timedelta
     import json
     import re
     from ..models import ACCOUNT_ID_REGEX
+    from ..services.payment_service import (
+        apply_verified_payment_state_to_ssot,
+        get_or_create_sandbox_storekit_key,
+        verify_storekit2_sandbox_jws,
+    )
 
     raw_body = await request.body()
     parsed_body = {}
@@ -121,6 +129,33 @@ async def subscriber_receipts(request: Request, accounts: Accounts):
         except Exception:
             parsed_body = {}
 
+    jws_candidate = ''
+    is_restore = False
+    if isinstance(parsed_body, dict):
+        is_restore = bool(parsed_body.get('is_restore'))
+        raw_jws = (
+            parsed_body.get('jws_transaction')
+            or parsed_body.get('signed_transaction_info')
+            or ''
+        )
+        if isinstance(raw_jws, str) and raw_jws.strip():
+            jws_candidate = raw_jws.strip()
+        else:
+            ft = parsed_body.get('fetch_token')
+            if isinstance(ft, str) and ft.strip().count('.') == 2:
+                jws_candidate = ft.strip()
+
+    jws_payload = None
+    if jws_candidate:
+        sk_key = get_or_create_sandbox_storekit_key(request.app.state)
+        try:
+            jws_payload = verify_storekit2_sandbox_jws(
+                jws_candidate,
+                trusted_public_key=sk_key.public_key(),
+            )
+        except ValueError as exc:
+            raise HTTPException(422, f'Invalid StoreKit 2 JWS transaction: {exc}') from exc
+
     candidate_id = ''
     if isinstance(parsed_body, dict):
         candidate_id = str(
@@ -129,6 +164,8 @@ async def subscriber_receipts(request: Request, accounts: Accounts):
             or parsed_body.get('uid')
             or ''
         ).strip()
+    if not candidate_id and isinstance(jws_payload, dict):
+        candidate_id = str(jws_payload.get('app_user_id') or jws_payload.get('appAccountToken') or '').strip()
     if not candidate_id:
         candidate_id = (
             request.headers.get('X-RevenueCat-User-Id')
@@ -150,9 +187,178 @@ async def subscriber_receipts(request: Request, accounts: Accounts):
         if candidate_id not in allowed_ids:
             raise HTTPException(403, 'Device token is not authorized to query receipts for another account')
 
-    return await _resolve_account_and_build_response(
-        candidate_id, request, accounts, inspect_source='v1_receipts'
+    if isinstance(jws_payload, dict):
+        jws_uid = str(jws_payload.get('app_user_id') or jws_payload.get('appAccountToken') or candidate_id).strip()
+        if jws_uid != candidate_id:
+            raise HTTPException(422, 'StoreKit 2 JWS appAccountToken does not match requested app_user_id')
+        p_ms = int(jws_payload['purchaseDate'])
+        e_ms = int(jws_payload['expiresDate'])
+        r_ms = jws_payload.get('revocationDate')
+        await apply_verified_payment_state_to_ssot(
+            request,
+            accounts,
+            app_user_id=candidate_id,
+            product_id=str(jws_payload.get('productId') or 'com.locket.gold.yearly'),
+            transaction_id=str(jws_payload.get('transactionId') or ''),
+            purchase_dt=datetime.fromtimestamp(p_ms / 1000.0, tz=timezone.utc),
+            expires_dt=datetime.fromtimestamp(e_ms / 1000.0, tz=timezone.utc),
+            revoked_dt=datetime.fromtimestamp(int(r_ms) / 1000.0, tz=timezone.utc) if r_ms is not None else None,
+            environment=str(jws_payload.get('environment') or 'Sandbox'),
+            event_source='STOREKIT2_JWS_RESTORE' if is_restore else 'STOREKIT2_JWS_RECEIPT',
+        )
+
+    resp = await _resolve_account_and_build_response(
+        candidate_id,
+        request,
+        accounts,
+        inspect_source='v1_receipts_restore' if is_restore else 'v1_receipts',
     )
+    if is_restore:
+        resp.headers['X-RevenueCat-Restored'] = 'true'
+    if jws_payload is not None:
+        resp.headers['X-StoreKit-Verified'] = 'true'
+    return resp
+
+
+@router.post('/api/lab/storekit/sandbox-transaction', dependencies=[Depends(require_subscriber_access)])
+async def create_storekit2_sandbox_transaction(request: Request, accounts: Accounts):
+    """
+    Generate an ES256-signed StoreKit 2 Sandbox/Xcode JWS transaction for authorized payment & subscription lifecycle testing:
+    Supports `action`: `'purchase'`, `'renew'`, `'expire'`, `'revoke'`.
+    """
+    from datetime import timedelta
+    import json
+    from ..services.payment_service import (
+        get_or_create_sandbox_storekit_key,
+        sign_storekit2_sandbox_jws,
+    )
+
+    if getattr(request.state, 'caller_kind', None) not in {'admin_session', 'service_token'}:
+        raise HTTPException(403, 'Sandbox StoreKit transaction minting requires admin session or service token')
+
+    raw_body = await request.body()
+    body = json.loads(raw_body.decode('utf-8')) if raw_body else {}
+    app_user_id = str(body.get('app_user_id') or body.get('firebase_uid') or '').strip()
+    product_id = str(body.get('product_id') or 'com.locket.gold.yearly').strip()
+    action = str(body.get('action') or 'purchase').strip().lower()
+    environment = 'Xcode' if str(body.get('environment') or '').strip() == 'Xcode' else 'Sandbox'
+    duration_days = int(body.get('duration_days') or 365)
+
+    now = datetime.now(timezone.utc)
+    if action == 'expire':
+        purchase_dt = now - timedelta(days=duration_days + 5)
+        expires_dt = now - timedelta(seconds=60)
+        revoked_dt = None
+    elif action == 'revoke':
+        purchase_dt = now - timedelta(days=1)
+        expires_dt = now + timedelta(days=duration_days)
+        revoked_dt = now
+    else:
+        purchase_dt = now
+        expires_dt = now + timedelta(days=duration_days)
+        revoked_dt = None
+
+    sk_key = get_or_create_sandbox_storekit_key(request.app.state)
+    jws_token, payload = sign_storekit2_sandbox_jws(
+        sk_key,
+        app_user_id=app_user_id,
+        product_id=product_id,
+        purchase_date=purchase_dt,
+        expires_date=expires_dt,
+        revocation_date=revoked_dt,
+        environment=environment,
+    )
+    return {
+        'jws_transaction': jws_token,
+        'decoded_payload': payload,
+        'action': action,
+        'environment': environment,
+    }
+
+
+@router.post('/api/webhooks/revenuecat', dependencies=[Depends(require_subscriber_access)])
+async def revenuecat_server_webhook(request: Request, accounts: Accounts):
+    """
+    Authenticated RevenueCat Server-to-Server Webhook receiver for synchronizing subscription lifecycle events:
+    `INITIAL_PURCHASE`, `RENEWAL`, `UNCANCELLATION`, `EXPIRATION`, `CANCELLATION`, `BILLING_ISSUE`.
+    """
+    from datetime import timedelta
+    import json
+    from ..services.payment_service import apply_verified_payment_state_to_ssot
+
+    if getattr(request.state, 'caller_kind', None) not in {'admin_session', 'service_token'}:
+        raise HTTPException(403, 'RevenueCat server webhook requires service token or admin authorization')
+
+    started = time.perf_counter()
+    raw_body = await request.body()
+    try:
+        body = json.loads(raw_body.decode('utf-8')) if raw_body else {}
+    except Exception as exc:
+        raise HTTPException(400, 'Malformed webhook JSON payload') from exc
+
+    event = body.get('event') if isinstance(body.get('event'), dict) else body
+    if not isinstance(event, dict):
+        raise HTTPException(422, 'Missing RevenueCat event object')
+
+    event_type = str(event.get('type') or '').strip().upper()
+    valid_types = {'INITIAL_PURCHASE', 'RENEWAL', 'UNCANCELLATION', 'EXPIRATION', 'CANCELLATION', 'BILLING_ISSUE'}
+    if event_type not in valid_types:
+        raise HTTPException(422, f"Unsupported RevenueCat webhook event type '{event_type}'")
+
+    app_user_id = str(event.get('app_user_id') or event.get('original_app_user_id') or '').strip()
+    product_id = str(event.get('product_id') or 'com.locket.gold.yearly').strip()
+    tx_id = str(event.get('transaction_id') or event.get('id') or f'rc_{uuid4().hex[:12]}').strip()
+    env_raw = str(event.get('environment') or 'SANDBOX').strip().upper()
+    environment = 'Sandbox' if env_raw == 'SANDBOX' else 'Production'
+
+    now = datetime.now(timezone.utc)
+    p_ms = event.get('purchased_at_ms')
+    e_ms = event.get('expiration_at_ms')
+    purchase_dt = datetime.fromtimestamp(int(p_ms) / 1000.0, tz=timezone.utc) if p_ms else now
+    if e_ms:
+        expires_dt = datetime.fromtimestamp(int(e_ms) / 1000.0, tz=timezone.utc)
+    elif event_type == 'EXPIRATION':
+        expires_dt = now - timedelta(seconds=10)
+    else:
+        expires_dt = now + timedelta(days=365)
+
+    revoked_dt = now if event_type == 'CANCELLATION' else None
+
+    synced = await apply_verified_payment_state_to_ssot(
+        request,
+        accounts,
+        app_user_id=app_user_id,
+        product_id=product_id,
+        transaction_id=tx_id,
+        purchase_dt=purchase_dt,
+        expires_dt=expires_dt,
+        revoked_dt=revoked_dt,
+        environment=environment,
+        event_source=f'REVENUECAT_WEBHOOK_{event_type}',
+    )
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+
+    lab_requests = getattr(request.app.state, 'lab_requests', None)
+    if lab_requests is not None and hasattr(lab_requests, 'insert_one'):
+        try:
+            res = lab_requests.insert_one({
+                'request_id': str(uuid4()),
+                'timestamp': now,
+                'source': 'revenuecat_webhook',
+                'endpoint': request.url.path,
+                'method': 'POST',
+                'account_id': app_user_id,
+                'event_type': event_type,
+                'computed_status': synced['status'],
+                'http_status': 200,
+                'latency_ms': latency_ms,
+            })
+            if hasattr(res, '__await__'):
+                await res
+        except Exception:
+            pass
+
+    return {'received': True, 'event_type': event_type, 'synced': synced}
 
 
 @router.post('/api/lab/inspect', dependencies=[Depends(require_subscriber_access)])
