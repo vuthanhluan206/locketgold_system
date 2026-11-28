@@ -951,6 +951,30 @@ def test_prompt28_custom_doh_gateway_observability_caching_and_split_dns_safety(
     assert recorded_doh_reqs[1]['rcode'] == 'REFUSED'
     assert recorded_doh_reqs[1]['answer_ip'] is None
 
+    # 4. Verify Acceptance Guard on POST /admin/test-results:
+    # Cannot claim VERIFIED from Mock API / MongoDB alone when real-app functional_gold_authorized is False
+    admin_headers = prompt28_env['admin_headers']
+    tr_blocked = http.post(
+        '/admin/test-results',
+        headers=admin_headers,
+        json={
+            'scenario': 'E2E Real Locket iOS App Acceptance',
+            'locket_id': 'vt.l',
+            'dns_verified': True,
+            'tls_verified': True,
+            'mock_entitlement_active': True,
+            'normal_features_intact': True,
+            'ui_gold_displayed': False,
+            'functional_gold_authorized': False,
+            'blocker_reason': 'Requires real Apple StoreKit / RevenueCat production subscription or LocketLabs sandbox environment',
+            'observed_client_state': 'DoH & normal Locket app messaging work; real Gold features blocked pending valid StoreKit entitlement',
+            'verdict': 'VERIFIED',
+        },
+    )
+    assert tr_blocked.status_code == 200
+    assert tr_blocked.json()['verdict'] == 'BLOCKED'
+
+
 
 
 

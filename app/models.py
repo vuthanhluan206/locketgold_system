@@ -384,8 +384,12 @@ class TestResultInput(BaseModel):
     dns_verified: bool = False
     tls_verified: bool = False
     mock_entitlement_active: bool = False
+    normal_features_intact: bool = False
+    ui_gold_displayed: bool = False
+    functional_gold_authorized: bool = False
+    blocker_reason: str | None = Field(default=None, max_length=512)
     observed_client_state: str = Field(min_length=1, max_length=512)
-    verdict: Literal['VERIFIED', 'PARTIALLY_VERIFIED', 'NOT_VERIFIED', 'FAILED'] = 'NOT_VERIFIED'
+    verdict: Literal['VERIFIED', 'PARTIALLY_VERIFIED', 'NOT_VERIFIED', 'FAILED', 'BLOCKED'] = 'NOT_VERIFIED'
 
 
 def subscriber_response(account_id: str, account: dict | None, now: datetime | None = None) -> dict:

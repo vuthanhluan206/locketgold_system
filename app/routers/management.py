@@ -1726,8 +1726,18 @@ async def record_test_result(
     admin: Annotated[dict, Depends(require_admin)],
 ):
     now = datetime.now(timezone.utc)
+    dump = data.model_dump()
+    # Acceptance Invariant: Never allow Mock API / MongoDB state alone (`mock_entitlement_active=True`)
+    # to record a false-positive `VERIFIED` verdict for real Locket app Gold functionality when
+    # `functional_gold_authorized` or `ui_gold_displayed` is False or a `blocker_reason` is present.
+    if dump['verdict'] == 'VERIFIED' and (
+        dump.get('blocker_reason')
+        or (dump.get('mock_entitlement_active') and not dump.get('functional_gold_authorized'))
+    ):
+        dump['verdict'] = 'BLOCKED' if dump.get('blocker_reason') else 'PARTIALLY_VERIFIED'
+
     entry = {
-        **data.model_dump(),
+        **dump,
         'timestamp': now,
         'recorded_by': admin.get('email', 'superadmin'),
     }
@@ -1736,7 +1746,7 @@ async def record_test_result(
         res = test_res_col.insert_one(entry.copy())
         if hasattr(res, '__await__'):
             await res
-    await record_audit(request, admin, 'TEST_RESULT_RECORD', data.locket_id or data.scenario, {'verdict': data.verdict})
+    await record_audit(request, admin, 'TEST_RESULT_RECORD', data.locket_id or data.scenario, {'verdict': dump['verdict']})
     return entry
 
 
