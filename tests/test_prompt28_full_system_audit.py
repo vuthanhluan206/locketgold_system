@@ -872,6 +872,87 @@ def test_prompt28_gold_interactive_catalog_invite_activation_and_customization(p
     assert not any(i['code'] == 'VIP-2026' for i in inv_del.json()['invites'])
 
 
+def test_prompt28_custom_doh_gateway_observability_caching_and_split_dns_safety(prompt28_env, monkeypatch):
+    """
+    Verify Custom DoH Gateway (`/dns-query`) architecture:
+    1. When `DOH_SERVER_URL=https://locketgold.vuthanhluan.bond/dns-query` is active:
+       - `/api/health` reports `doh_mode='custom_doh'`, `doh_server_url`, `lab_mode='real_device'`, `lab_dns_target_ip='103.118.29.159'`.
+       - All `.mobileconfig` modes (`dns_only`, `lab_ca`, `scoped_lab`) include `SupplementalMatchDomains`
+         scoped strictly to `lab_scoped_domains` so external domains (`locketcamera.com`, `apple.com`, etc.)
+         bypass `/dns-query` and the official Locket app continues functioning normally.
+    2. `/dns-query` (RFC 8484 GET wireformat, POST wireformat, and GET JSON):
+       - Returns `Cache-Control: max-age=60`, `X-DoH-Rcode: NOERROR`, and `X-DoH-Latency-Ms` for authorized lab domains.
+       - Returns `Cache-Control: no-store` and `X-DoH-Rcode: REFUSED` for external domains.
+       - Logs DoH queries into `app.state.lab_requests` (`source='doh_gateway'`) with `qname`, `qtype`, `rcode`, `answer_ip`, `latency_ms`.
+    """
+    import base64
+    from unittest.mock import AsyncMock
+    from app.config import get_settings
+    from app.services.doh_service import build_dns_query_packet
+
+    http = prompt28_env['http']
+    app = prompt28_env['app']
+
+    monkeypatch.setenv('DOH_SERVER_URL', 'https://locketgold.vuthanhluan.bond/dns-query')
+    monkeypatch.setenv('LAB_MODE', 'real_device')
+    monkeypatch.setenv('LAB_DNS_TARGET_IP', '103.118.29.159')
+    get_settings.cache_clear()
+
+    recorded_doh_reqs = []
+    lab_req_mock = AsyncMock()
+    lab_req_mock.insert_one.side_effect = lambda d: recorded_doh_reqs.append(d.copy())
+    app.state.lab_requests = lab_req_mock
+
+    # 1. Verify /api/health reports custom_doh mode
+    h_res = http.get('/api/health')
+    assert h_res.status_code == 200
+    h_body = h_res.json()
+    assert h_body['doh_mode'] == 'custom_doh'
+    assert h_body['doh_server_url'] == 'https://locketgold.vuthanhluan.bond/dns-query'
+    assert h_body['lab_mode'] == 'real_device'
+    assert h_body['lab_dns_target_ip'] == '103.118.29.159'
+
+    # 2. Verify all mobileconfig modes include SupplementalMatchDomains when Custom DoH is active
+    for mode in ('dns_only', 'lab_ca', 'scoped_lab'):
+        prof_res = http.get(f'/profile.mobileconfig?mode={mode}')
+        assert prof_res.status_code == 200
+        plist_data = plistlib.loads(prof_res.content)
+        dns_payload = plist_data['PayloadContent'][0]['DNSSettings']
+        assert dns_payload['ServerURL'] == 'https://locketgold.vuthanhluan.bond/dns-query'
+        assert dns_payload['SupplementalMatchDomains'] == [
+            'mock.lab.vuthanhluan.bond',
+            'sub.lab.vuthanhluan.bond',
+            'locketgold.vuthanhluan.bond',
+        ]
+
+    # 3. Verify RFC 8484 Wireformat GET & POST + Caching + Observability
+    q_pkt = build_dns_query_packet('locketgold.vuthanhluan.bond', qtype=1)
+    q_b64 = base64.urlsafe_b64encode(q_pkt).decode('ascii').rstrip('=')
+    get_wf = http.get(f'/dns-query/iphone_lab?dns={q_b64}')
+    assert get_wf.status_code == 200
+    assert get_wf.headers['cache-control'] == 'max-age=60'
+    assert get_wf.headers['x-doh-rcode'] == 'NOERROR'
+    assert float(get_wf.headers['x-doh-latency-ms']) >= 0.0
+
+    # External domain query -> REFUSED + no-store
+    ext_pkt = build_dns_query_packet('api.locketcamera.com', qtype=1)
+    post_wf = http.post('/dns-query/iphone_lab', content=ext_pkt, headers={'Content-Type': 'application/dns-message'})
+    assert post_wf.status_code == 200
+    assert post_wf.headers['cache-control'] == 'no-store'
+    assert post_wf.headers['x-doh-rcode'] == 'REFUSED'
+
+    assert len(recorded_doh_reqs) == 2
+    assert recorded_doh_reqs[0]['source'] == 'doh_gateway'
+    assert recorded_doh_reqs[0]['qname'] == 'locketgold.vuthanhluan.bond'
+    assert recorded_doh_reqs[0]['rcode'] == 'NOERROR'
+    assert recorded_doh_reqs[0]['answer_ip'] == '103.118.29.159'
+    assert recorded_doh_reqs[0]['device_id'] == 'iphone_lab'
+    assert recorded_doh_reqs[1]['qname'] == 'api.locketcamera.com'
+    assert recorded_doh_reqs[1]['rcode'] == 'REFUSED'
+    assert recorded_doh_reqs[1]['answer_ip'] is None
+
+
+
 
 
 

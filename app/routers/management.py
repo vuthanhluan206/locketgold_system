@@ -153,9 +153,16 @@ async def health_check(request: Request):
             ca_fp = inspect_certificate_metadata(cert)['sha256_fingerprint']
     except Exception:
         ca_loaded = False
+    custom_doh = (getattr(settings, 'doh_server_url', '') or '').strip()
+    doh_mode = 'custom_doh' if custom_doh else ('nextdns' if settings.nextdns_id else 'unconfigured')
     return {
         'status': 'ok',
         'database': settings.mongodb_database,
+        'doh_mode': doh_mode,
+        'doh_server_url': custom_doh or (f'https://dns.nextdns.io/{settings.nextdns_id}' if settings.nextdns_id else None),
+        'lab_mode': getattr(settings, 'lab_mode', 'local'),
+        'lab_dns_target_ip': getattr(settings, 'lab_dns_target_ip', '127.0.0.1'),
+        'lab_scoped_domains': getattr(settings, 'lab_scoped_domains', []),
         'nextdns_configured': bool(settings.nextdns_id),
         'nextdns_id': settings.nextdns_id or None,
         'profile_ready': profile_ready,
@@ -289,10 +296,10 @@ async def download_profile(
     if eff_mode != 'default' or device_label:
         try:
             has_custom_doh = bool((getattr(settings, 'doh_server_url', '') or '').strip())
-            scoped = settings.lab_scoped_domains if (eff_mode == 'scoped_lab' or (eff_mode == 'lab_ca' and has_custom_doh)) else None
+            scoped = settings.lab_scoped_domains if (eff_mode == 'scoped_lab' or has_custom_doh) else None
             if eff_mode == 'dns_only':
                 s_copy = settings.model_copy(update={'root_ca_path': '', 'root_ca_pem': ''})
-                profile_bytes = build_profile(s_copy, scoped_domains=None, device_label=device_label)
+                profile_bytes = build_profile(s_copy, scoped_domains=scoped, device_label=device_label)
             elif eff_mode in {'lab_ca', 'scoped_lab'}:
                 cert = load_validated_root_ca(settings)
                 if cert is None:

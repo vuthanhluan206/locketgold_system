@@ -229,6 +229,37 @@ async def lab_echo_inspect(request: Request):
     return JSONResponse(content=resp_payload)
 
 
+async def _record_doh_lab_request(
+    request: Request,
+    *,
+    method: str,
+    device_label: str | None,
+    meta: dict,
+    latency_ms: float,
+) -> None:
+    lab_requests = getattr(request.app.state, 'lab_requests', None)
+    if lab_requests is not None and hasattr(lab_requests, 'insert_one'):
+        try:
+            res = lab_requests.insert_one({
+                'request_id': str(uuid4()),
+                'timestamp': datetime.now(timezone.utc),
+                'source': 'doh_gateway',
+                'endpoint': request.url.path,
+                'method': method,
+                'device_id': device_label,
+                'qname': meta.get('qname'),
+                'qtype': meta.get('qtype'),
+                'rcode': meta.get('rcode'),
+                'answer_ip': meta.get('answer_ip'),
+                'http_status': 200,
+                'latency_ms': latency_ms,
+            })
+            if hasattr(res, '__await__'):
+                await res
+        except Exception:
+            pass
+
+
 @router.get('/dns-query')
 @router.get('/dns-query/{device_label}')
 async def doh_get_query(
@@ -243,19 +274,35 @@ async def doh_get_query(
     Only resolves domains explicitly listed in `settings.lab_scoped_domains`.
     Refuses all external/third-party domains (`REFUSED`) so it never acts as an open DNS proxy.
     """
+    started = time.perf_counter()
     settings = get_settings()
+    ttl = 60
     if dns is not None:
         try:
             packet = decode_base64url_dns_param(dns)
-            resp_bytes, _ = resolve_lab_dns_wireformat(
+            resp_bytes, meta = resolve_lab_dns_wireformat(
                 packet,
                 allowed_domains=settings.lab_scoped_domains,
                 target_ipv4=settings.lab_dns_target_ip,
                 target_ipv6=getattr(settings, 'lab_dns_target_ipv6', ''),
+                ttl=ttl,
             )
         except Exception as exc:
             raise HTTPException(400, 'Malformed RFC 8484 DNS query packet') from exc
-        return Response(content=resp_bytes, media_type='application/dns-message')
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        await _record_doh_lab_request(
+            request, method='GET', device_label=device_label, meta=meta, latency_ms=latency_ms
+        )
+        cache_hdr = f'max-age={ttl}' if meta.get('rcode') == 'NOERROR' else 'no-store'
+        return Response(
+            content=resp_bytes,
+            media_type='application/dns-message',
+            headers={
+                'Cache-Control': cache_hdr,
+                'X-DoH-Rcode': str(meta.get('rcode') or 'UNKNOWN'),
+                'X-DoH-Latency-Ms': str(latency_ms),
+            },
+        )
 
     if name is not None:
         qname = name.strip().lower().rstrip('.')
@@ -275,19 +322,45 @@ async def doh_get_query(
         qtype_num = type_map[qtype_upper]
         allowed_set = {d.strip().lower().rstrip('.') for d in settings.lab_scoped_domains if d.strip()}
         if qname not in allowed_set:
+            latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+            await _record_doh_lab_request(
+                request,
+                method='GET_JSON',
+                device_label=device_label,
+                meta={'qname': qname, 'qtype': qtype_num, 'rcode': 'REFUSED', 'answer_ip': None},
+                latency_ms=latency_ms,
+            )
             return JSONResponse(
                 status_code=200,
+                headers={'Cache-Control': 'no-store', 'X-DoH-Rcode': 'REFUSED', 'X-DoH-Latency-Ms': str(latency_ms)},
                 content={'Status': 5, 'Comment': 'REFUSED: Domain outside controlled Research Lab scope', 'Question': [{'name': qname, 'type': qtype_num}], 'Answer': []},
             )
         target_v6 = getattr(settings, 'lab_dns_target_ipv6', '').strip()
+        answer_ip = None
         if qtype_num == 1:
-            answers = [{'name': qname, 'type': 1, 'TTL': 60, 'data': settings.lab_dns_target_ip}]
+            answer_ip = settings.lab_dns_target_ip
+            answers = [{'name': qname, 'type': 1, 'TTL': ttl, 'data': settings.lab_dns_target_ip}]
         elif qtype_num == 28 and target_v6:
-            answers = [{'name': qname, 'type': 28, 'TTL': 60, 'data': target_v6}]
+            answer_ip = target_v6
+            answers = [{'name': qname, 'type': 28, 'TTL': ttl, 'data': target_v6}]
         else:
             answers = []
+        latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+        rcode_str = 'NOERROR' if answers else 'NOERROR_NODATA'
+        await _record_doh_lab_request(
+            request,
+            method='GET_JSON',
+            device_label=device_label,
+            meta={'qname': qname, 'qtype': qtype_num, 'rcode': rcode_str, 'answer_ip': answer_ip},
+            latency_ms=latency_ms,
+        )
         return JSONResponse(
             status_code=200,
+            headers={
+                'Cache-Control': f'max-age={ttl}' if answers else 'no-store',
+                'X-DoH-Rcode': rcode_str,
+                'X-DoH-Latency-Ms': str(latency_ms),
+            },
             content={
                 'Status': 0,
                 'TC': False,
@@ -296,6 +369,7 @@ async def doh_get_query(
                 'AD': False,
                 'CD': False,
                 'LabMode': getattr(settings, 'lab_mode', 'local'),
+                'LatencyMs': latency_ms,
                 'Question': [{'name': qname, 'type': qtype_num}],
                 'Answer': answers,
             },
@@ -307,15 +381,31 @@ async def doh_get_query(
 @router.post('/dns-query/{device_label}')
 async def doh_post_query(request: Request, device_label: str | None = None):
     """Controlled Research Lab DNS-over-HTTPS (RFC 8484 POST `application/dns-message`) Endpoint."""
+    started = time.perf_counter()
     settings = get_settings()
+    ttl = 60
     body = await request.body()
     try:
-        resp_bytes, _ = resolve_lab_dns_wireformat(
+        resp_bytes, meta = resolve_lab_dns_wireformat(
             body,
             allowed_domains=settings.lab_scoped_domains,
             target_ipv4=settings.lab_dns_target_ip,
             target_ipv6=getattr(settings, 'lab_dns_target_ipv6', ''),
+            ttl=ttl,
         )
     except Exception as exc:
         raise HTTPException(400, 'Malformed RFC 8484 DNS query packet') from exc
-    return Response(content=resp_bytes, media_type='application/dns-message')
+    latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
+    await _record_doh_lab_request(
+        request, method='POST', device_label=device_label, meta=meta, latency_ms=latency_ms
+    )
+    cache_hdr = f'max-age={ttl}' if meta.get('rcode') == 'NOERROR' else 'no-store'
+    return Response(
+        content=resp_bytes,
+        media_type='application/dns-message',
+        headers={
+            'Cache-Control': cache_hdr,
+            'X-DoH-Rcode': str(meta.get('rcode') or 'UNKNOWN'),
+            'X-DoH-Latency-Ms': str(latency_ms),
+        },
+    )

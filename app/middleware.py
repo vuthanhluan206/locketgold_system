@@ -109,7 +109,11 @@ class SecurityMiddleware:
 
         async def secured_send(message):
             if message['type'] == 'http.response.start':
-                MutableHeaders(scope=message).update(security_headers(nonce, https))
+                resp_hdrs = MutableHeaders(scope=message)
+                existing_cc = resp_hdrs.get('cache-control')
+                resp_hdrs.update(security_headers(nonce, https))
+                if existing_cc:
+                    resp_hdrs['Cache-Control'] = existing_cc
             await send(message)
 
         async def reject(status, detail, retry=False):

@@ -2959,7 +2959,7 @@
           const panel = detailPanel('DEVICE & PROFILE MANAGEMENT · ' + row.locket_id);
           const summaryP = document.createElement('p');
           summaryP.className = 'note';
-          summaryP.textContent = 'NextDNS: ' + (pki.nextdns_id || 'Not configured') +
+          summaryP.textContent = 'DoH Endpoint: ' + (pki.doh_server_url || pki.nextdns_id || 'Not configured') +
             ' · Root CA: ' + (pki.valid ? 'Loaded' : (pki.configured ? 'Invalid' : 'Not loaded')) +
             (pki.sha256_fingerprint ? ' · CA Fingerprint: SHA256: ' + pki.sha256_fingerprint : '');
           panel.append(summaryP);
@@ -2972,9 +2972,9 @@
             $('detailsMessage').textContent = 'Device token (shown once): ' + device.device_token;
           }));
           const modeDefs = [
-            ['dns_only', 'DNS only (NextDNS DoH — 1 payload)'],
-            ['lab_ca', 'Root CA + DNS — Research Lab (2 payloads)'],
-            ['scoped_lab', 'Scoped Lab DNS + Root CA (Split-DNS + CA)'],
+            ['dns_only', 'DNS only (DoH Gateway — 1 payload)'],
+            ['lab_ca', 'Root CA + DoH — Research Lab (2 payloads)'],
+            ['scoped_lab', 'Scoped Lab DoH + Root CA (Split-DNS + CA)'],
           ];
           for (const device of list) {
             const card = document.createElement('div');
@@ -3040,7 +3040,8 @@
             'SHA256 Fingerprint: ' + (pki.sha256_fingerprint || (pki.certificate && pki.certificate.sha256_fingerprint) || '—'),
             'Valid From: ' + (pki.valid_from || (pki.certificate && pki.certificate.not_valid_before_utc) || '—'),
             'Valid Until: ' + (pki.valid_until || (pki.certificate && pki.certificate.not_valid_after_utc) || '—'),
-            'NextDNS ID: ' + (pki.nextdns_id || '—') + (pki.doh_server_url ? ' (' + pki.doh_server_url + ')' : ''),
+            'DoH Server URL: ' + (pki.doh_server_url || '—') + (pki.nextdns_id ? ' (Legacy NextDNS ID: ' + pki.nextdns_id + ')' : ''),
+            'Lab Scoped Domains: ' + ((pki.lab_scoped_domains || []).join(', ') || '—'),
             'DNS-only Profile: ' + (pki.dns_only_ready ? 'Ready' : 'Unavailable'),
             'CA + DNS Lab Profile: ' + (pki.lab_ca_ready ? 'Ready' : 'Unavailable' + (pki.profile_options?.lab_ca?.reason ? ' (' + pki.profile_options.lab_ca.reason + ')' : '')),
           ];
@@ -3071,12 +3072,23 @@
         }
         async function showSystemHealthAndLogs() {
           const [health, logs] = await Promise.all([api('/api/health', {}, false), api('/admin/logs?limit=20')]);
-          const panel = detailPanel('SYSTEM HEALTH, NEXTDNS & AUDIT LOGS');
+          const panel = detailPanel('SYSTEM HEALTH, DOH GATEWAY & AUDIT LOGS');
           const hp = document.createElement('p');
           hp.textContent = 'System: ' + health.status + ' · Database: ' + health.database +
-            ' · NextDNS: ' + (health.nextdns_id || 'None') +
+            ' · DoH Mode: ' + (health.doh_mode || 'unknown') + ' (' + (health.doh_server_url || health.nextdns_id || 'None') + ')' +
+            ' · Target IP: ' + (health.lab_dns_target_ip || '127.0.0.1') +
             ' · Root CA Loaded: ' + (health.root_ca_loaded ? 'YES (' + health.root_ca_sha256 + ')' : 'NO');
           panel.append(hp);
+          for (const req of (logs.lab_requests || [])) {
+            const item = document.createElement('p');
+            item.className = 'note';
+            if (req.source === 'doh_gateway') {
+              item.textContent = ['[DoH]', req.timestamp, req.method, 'qname=' + req.qname, 'rcode=' + req.rcode, 'ip=' + (req.answer_ip || '—'), (req.latency_ms || 0) + 'ms'].join(' · ');
+            } else {
+              item.textContent = ['[Lab API]', req.timestamp, req.method, req.endpoint, 'status=' + req.computed_status, (req.latency_ms || 0) + 'ms'].join(' · ');
+            }
+            panel.append(item);
+          }
           for (const entry of (logs.audit_logs || [])) {
             const item = document.createElement('p');
             item.className = 'note';
