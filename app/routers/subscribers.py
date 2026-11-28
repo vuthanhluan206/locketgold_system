@@ -148,10 +148,12 @@ async def subscriber_receipts(request: Request, accounts: Accounts):
     jws_payload = None
     if jws_candidate:
         sk_key = get_or_create_sandbox_storekit_key(request.app.state)
+        trusted_root_ca = getattr(request.app.state, 'storekit_trusted_root_ca', None)
         try:
             jws_payload = verify_storekit2_sandbox_jws(
                 jws_candidate,
                 trusted_public_key=sk_key.public_key(),
+                trusted_root_ca_cert=trusted_root_ca,
             )
         except ValueError as exc:
             raise HTTPException(422, f'Invalid StoreKit 2 JWS transaction: {exc}') from exc
@@ -194,17 +196,22 @@ async def subscriber_receipts(request: Request, accounts: Accounts):
         p_ms = int(jws_payload['purchaseDate'])
         e_ms = int(jws_payload['expiresDate'])
         r_ms = jws_payload.get('revocationDate')
+        s_ms = jws_payload.get('signedDate')
         await apply_verified_payment_state_to_ssot(
             request,
             accounts,
             app_user_id=candidate_id,
             product_id=str(jws_payload.get('productId') or 'com.locket.gold.yearly'),
             transaction_id=str(jws_payload.get('transactionId') or ''),
+            original_transaction_id=str(jws_payload.get('originalTransactionId') or ''),
             purchase_dt=datetime.fromtimestamp(p_ms / 1000.0, tz=timezone.utc),
             expires_dt=datetime.fromtimestamp(e_ms / 1000.0, tz=timezone.utc),
             revoked_dt=datetime.fromtimestamp(int(r_ms) / 1000.0, tz=timezone.utc) if r_ms is not None else None,
             environment=str(jws_payload.get('environment') or 'Sandbox'),
             event_source='STOREKIT2_JWS_RESTORE' if is_restore else 'STOREKIT2_JWS_RECEIPT',
+            trust_anchor=str(jws_payload.get('_trust_anchor') or 'lab_internal_sandbox_key'),
+            payment_trust_level=str(jws_payload.get('_payment_trust_level') or 'lab_simulated_jws'),
+            event_timestamp_ms=int(s_ms) if s_ms is not None else None,
         )
 
     resp = await _resolve_account_and_build_response(
@@ -217,6 +224,7 @@ async def subscriber_receipts(request: Request, accounts: Accounts):
         resp.headers['X-RevenueCat-Restored'] = 'true'
     if jws_payload is not None:
         resp.headers['X-StoreKit-Verified'] = 'true'
+        resp.headers['X-StoreKit-Trust-Level'] = str(jws_payload.get('_payment_trust_level') or 'lab_simulated_jws')
     return resp
 
 
@@ -284,7 +292,10 @@ async def revenuecat_server_webhook(request: Request, accounts: Accounts):
     """
     from datetime import timedelta
     import json
-    from ..services.payment_service import apply_verified_payment_state_to_ssot
+    from ..services.payment_service import (
+        _get_webhook_event_registry,
+        apply_verified_payment_state_to_ssot,
+    )
 
     if getattr(request.state, 'caller_kind', None) not in {'admin_session', 'service_token'}:
         raise HTTPException(403, 'RevenueCat server webhook requires service token or admin authorization')
@@ -305,15 +316,28 @@ async def revenuecat_server_webhook(request: Request, accounts: Accounts):
     if event_type not in valid_types:
         raise HTTPException(422, f"Unsupported RevenueCat webhook event type '{event_type}'")
 
+    explicit_event_id = str(event.get('id') or '').strip()
+    wh_reg = _get_webhook_event_registry(request.app.state)
+    if explicit_event_id and explicit_event_id in wh_reg:
+        return {
+            'received': True,
+            'duplicate': True,
+            'event_id': explicit_event_id,
+            'event_type': event_type,
+            'synced': wh_reg[explicit_event_id],
+        }
+
     app_user_id = str(event.get('app_user_id') or event.get('original_app_user_id') or '').strip()
     product_id = str(event.get('product_id') or 'com.locket.gold.yearly').strip()
-    tx_id = str(event.get('transaction_id') or event.get('id') or f'rc_{uuid4().hex[:12]}').strip()
+    tx_id = str(event.get('transaction_id') or explicit_event_id or f'rc_{uuid4().hex[:12]}').strip()
+    orig_tx_id = str(event.get('original_transaction_id') or tx_id).strip()
     env_raw = str(event.get('environment') or 'SANDBOX').strip().upper()
     environment = 'Sandbox' if env_raw == 'SANDBOX' else 'Production'
 
     now = datetime.now(timezone.utc)
     p_ms = event.get('purchased_at_ms')
     e_ms = event.get('expiration_at_ms')
+    evt_ts_ms = event.get('event_timestamp_ms')
     purchase_dt = datetime.fromtimestamp(int(p_ms) / 1000.0, tz=timezone.utc) if p_ms else now
     if e_ms:
         expires_dt = datetime.fromtimestamp(int(e_ms) / 1000.0, tz=timezone.utc)
@@ -330,12 +354,18 @@ async def revenuecat_server_webhook(request: Request, accounts: Accounts):
         app_user_id=app_user_id,
         product_id=product_id,
         transaction_id=tx_id,
+        original_transaction_id=orig_tx_id,
         purchase_dt=purchase_dt,
         expires_dt=expires_dt,
         revoked_dt=revoked_dt,
         environment=environment,
         event_source=f'REVENUECAT_WEBHOOK_{event_type}',
+        trust_anchor='revenuecat_webhook_token',
+        payment_trust_level='webhook_authenticated',
+        event_timestamp_ms=int(evt_ts_ms) if evt_ts_ms is not None else None,
     )
+    if explicit_event_id:
+        wh_reg[explicit_event_id] = synced
     latency_ms = round((time.perf_counter() - started) * 1000.0, 2)
 
     lab_requests = getattr(request.app.state, 'lab_requests', None)

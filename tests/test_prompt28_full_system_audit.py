@@ -1072,6 +1072,95 @@ def test_prompt28_storekit2_sandbox_jws_payment_restore_webhook_and_lifecycle(pr
     assert rev_res.headers.get('x-lab-entitlement-status') == 'revoked'
     assert rev_res.json()['subscriber']['entitlements'] == {}
 
+    # 8. Verify Lab self-signed JWS is honestly tagged `lab_simulated_jws` and never forges `_server_uid_proof = True`
+    assert rev_res.headers.get('x-storekit-trust-level') == 'lab_simulated_jws'
+    v2_doc = prompt28_env['v2_store'].get(uid)
+    assert v2_doc is not None
+    assert v2_doc['payment_trust_level'] == 'lab_simulated_jws'
+    assert v2_doc['payment_trust_anchor'] == 'lab_internal_sandbox_key'
+    assert v2_doc['_server_uid_proof'] is False
+    assert v2_doc['verification_status'] == 'unverified_uid'
+
+    # 9. Verify X.509 `x5c` 3-certificate chain validation (`Leaf -> Intermediate -> Pinned Root CA`)
+    from app.services.payment_service import generate_storekit2_x5c_test_chain, sign_storekit2_sandbox_jws
+    chain_bundle = generate_storekit2_x5c_test_chain('Pinned StoreKit Root CA')
+    rogue_bundle = generate_storekit2_x5c_test_chain('Attacker Self-Signed Root CA')
+    prompt28_env['app'].state.storekit_trusted_root_ca = chain_bundle['root_cert']
+
+    # Rogue x5c chain signed by an untrusted Root CA is rejected with 422
+    rogue_jws, _ = sign_storekit2_sandbox_jws(
+        rogue_bundle['leaf_key'],
+        app_user_id=uid,
+        product_id='com.locket.gold.yearly',
+        x5c_chain=rogue_bundle['x5c'],
+    )
+    rogue_res = http.post('/v1/receipts', headers=service_headers, json={'app_user_id': uid, 'jws_transaction': rogue_jws})
+    assert rogue_res.status_code == 422
+    assert 'Untrusted x5c Root CA' in rogue_res.text
+
+    # Valid x5c chain signed by the pinned Root CA succeeds with `x5c_chain_verified`
+    valid_x5c_jws, valid_x5c_payload = sign_storekit2_sandbox_jws(
+        chain_bundle['leaf_key'],
+        app_user_id=uid,
+        product_id='com.locket.gold.yearly',
+        transaction_id='2000000999888777',
+        x5c_chain=chain_bundle['x5c'],
+    )
+    x5c_res = http.post('/v1/receipts', headers=service_headers, json={'app_user_id': uid, 'jws_transaction': valid_x5c_jws})
+    assert x5c_res.status_code == 200, x5c_res.text
+    assert x5c_res.headers.get('x-storekit-trust-level') == 'x5c_chain_verified'
+    assert 'Gold' in x5c_res.json()['subscriber']['entitlements']
+
+    # 10. Anti-Replay / Cross-Account Transaction Theft Prevention:
+    # Account B (`other_uid`) cannot replay `transactionId = '2000000999888777'` already bound to `uid`
+    other_uid = '4Vee1rBLoJN9TDjql9xPzDEuf5D2'
+    stolen_jws, _ = sign_storekit2_sandbox_jws(
+        chain_bundle['leaf_key'],
+        app_user_id=other_uid,
+        product_id='com.locket.gold.yearly',
+        transaction_id='2000000999888777',
+        x5c_chain=chain_bundle['x5c'],
+    )
+    theft_res = http.post('/v1/receipts', headers=service_headers, json={'app_user_id': other_uid, 'jws_transaction': stolen_jws})
+    assert theft_res.status_code == 409
+    assert 'already bound to another account' in theft_res.text
+
+    # 11. Webhook Event Idempotency (`event.id`) & Out-of-Order Stale Event Rejection (`409`)
+    now_ms = int(datetime.now(timezone.utc).timestamp() * 1000) + 5000
+    wh_idem1 = http.post(
+        '/api/webhooks/revenuecat',
+        headers=service_headers,
+        json={'event': {'id': 'evt_unique_001', 'type': 'RENEWAL', 'app_user_id': uid, 'event_timestamp_ms': now_ms}},
+    )
+    assert wh_idem1.status_code == 200
+    rev_after_1 = wh_idem1.json()['synced']['grant_revision']
+
+    wh_idem2 = http.post(
+        '/api/webhooks/revenuecat',
+        headers=service_headers,
+        json={'event': {'id': 'evt_unique_001', 'type': 'RENEWAL', 'app_user_id': uid, 'event_timestamp_ms': now_ms}},
+    )
+    assert wh_idem2.status_code == 200
+    assert wh_idem2.json().get('duplicate') is True
+    assert wh_idem2.json()['synced']['grant_revision'] == rev_after_1
+
+    # Stale webhook with older timestamp (`now_ms - 100000`) is rejected with 409
+    wh_stale = http.post(
+        '/api/webhooks/revenuecat',
+        headers=service_headers,
+        json={'event': {'id': 'evt_stale_002', 'type': 'CANCELLATION', 'app_user_id': uid, 'event_timestamp_ms': now_ms - 100000}},
+    )
+    assert wh_stale.status_code == 409
+
+    # Non-service caller (`appl_*` public iOS SDK key) cannot forge server-to-server webhooks (`403`)
+    wh_unauth = http.post(
+        '/api/webhooks/revenuecat',
+        headers={'Authorization': 'Bearer appl_locket_ios_sdk_key'},
+        json={'event': {'id': 'evt_forged_003', 'type': 'RENEWAL', 'app_user_id': uid}},
+    )
+    assert wh_unauth.status_code == 403
+
+
 
 
 
